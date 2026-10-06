@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ClipRay live translation fixture</title>
+  <style>
+    :root { font-family: Arial, sans-serif; color: #17212e; background: #eef2f6; }
+    body { margin: 0; }
+    .controls { position: fixed; top: 24px; right: 24px; z-index: 1; width: 200px; padding: 16px; background: white; border: 1px solid #aab4c0; border-radius: 10px; }
+    .controls button { display: block; width: 100%; margin: 10px 0; padding: 10px; font-size: 15px; }
+    .controls output { display: block; margin-top: 12px; font-weight: bold; }
+    main { width: min(720px, calc(100% - 280px)); min-width: 420px; margin: 32px auto 80px; }
+    article { min-height: 170px; margin-bottom: 22px; padding: 26px; background: white; border: 1px solid #c7d0da; border-radius: 10px; }
+    article h2 { margin: 0 0 18px; font-size: 25px; }
+    article p { margin: 0; font-size: 21px; line-height: 1.55; }
+    #changing { position: relative; overflow: hidden; background: #fffdf5; }
+    #changing > * { position: relative; z-index: 1; }
+    #changing.animating::before {
+      content: "";
+      position: absolute;
+      inset: -50px;
+      z-index: 0;
+      background: repeating-linear-gradient(90deg, #fffdf5 0 14px, #f4e5a5 14px 26px, #fffdf5 26px 38px);
+      animation: backdrop-drift 650ms linear infinite;
+    }
+    @keyframes backdrop-drift { to { transform: translateX(38px); } }
+    #changing p:empty::before { content: ""; }
+  </style>
+</head>
+<body>
+  <aside class="controls" aria-label="Fixture controls">
+    <strong>Test controls</strong>
+    <button id="show-a" type="button">Show A</button>
+    <button id="show-b" type="button">Show B</button>
+    <button id="clear" type="button">Clear first card</button>
+    <button id="toggle-animation" type="button">Start background animation</button>
+    <output id="state" aria-live="polite">A</output>
+    <output id="animation-state" aria-live="polite">Animation off</output>
+    <output id="change-time" aria-label="Last fixture change time"></output>
+  </aside>
+  <main aria-label="Translation source column">
+    <article id="changing">
+      <h2>Departure notice</h2>
+      <p id="changing-text">The blue train leaves at eight. Keep ticket XR-17 until arrival.</p>
+    </article>
+    <article><h2>Library notice</h2><p>Return the borrowed book before Friday. The library closes at six.</p></article>
+    <article><h2>Travel notice</h2><p>Platform four is closed today. Please use the stairs near the south entrance.</p></article>
+    <article><h2>Safety notice</h2><p>Do not leave bags unattended. Ask a member of staff if you need help.</p></article>
+    <article><h2>Meeting notice</h2><p>The meeting starts at nine in room B-12. Bring the printed schedule.</p></article>
+    <article><h2>Delivery notice</h2><p>Your package will arrive on Tuesday. Check the address before confirming delivery.</p></article>
+    <article><h2>Weather notice</h2><p>Heavy rain is expected tonight. The footbridge may close after sunset.</p></article>
+    <article><h2>Final notice</h2><p>The last bus leaves at ten. Keep your receipt until the end of the journey.</p></article>
+  </main>
+  <script>
+    const states = Object.freeze({
+      A: 'The blue train leaves at eight. Keep ticket XR-17 until arrival.',
+      B: 'The red train leaves at nine. Keep ticket XR-17 until arrival.',
+      EMPTY: ''
+    });
+    function setState(name) {
+      document.getElementById('changing-text').textContent = states[name];
+      document.getElementById('state').textContent = name;
+      document.body.dataset.fixtureState = name;
+      document.getElementById('change-time').textContent = new Date().toISOString();
+    }
+    document.getElementById('show-a').addEventListener('click', () => setState('A'));
+    document.getElementById('show-b').addEventListener('click', () => setState('B'));
+    document.getElementById('clear').addEventListener('click', () => setState('EMPTY'));
+    document.getElementById('toggle-animation').addEventListener('click', () => {
+      const active = document.getElementById('changing').classList.toggle('animating');
+      document.getElementById('animation-state').textContent = active ? 'Animation on' : 'Animation off';
+      document.getElementById('toggle-animation').textContent = active
+        ? 'Stop background animation' : 'Start background animation';
+      document.getElementById('change-time').textContent = new Date().toISOString();
+    });
+    setState('A');
+  </script>
+</body>
+</html>

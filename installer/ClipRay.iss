@@ -1,0 +1,313 @@
+#ifndef StagingDir
+  #error StagingDir must be defined
+#endif
+#ifndef OutputDir
+  #error OutputDir must be defined
+#endif
+#ifndef SetupFlavor
+  #define SetupFlavor "Full"
+#endif
+#define AppVersion "1.0.6"
+#define AppExeName "ClipRay.App.exe"
+#define AppUninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{C5C7914B-7566-4912-A9E0-4D09E724BDA1}_is1"
+
+[Setup]
+AppId={{C5C7914B-7566-4912-A9E0-4D09E724BDA1}
+AppName=ClipRay 截光
+AppVersion={#AppVersion}
+AppVerName=ClipRay 截光 {#AppVersion}
+AppPublisher=落花
+UninstallDisplayName=ClipRay 截光
+DefaultDirName={localappdata}\Programs\ClipRay
+DefaultGroupName=ClipRay 截光
+DisableProgramGroupPage=yes
+PrivilegesRequired=lowest
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+OutputDir={#OutputDir}
+OutputBaseFilename=ClipRay-{#SetupFlavor}-Setup-{#AppVersion}-win-x64
+SetupIconFile={#StagingDir}\Assets\ClipRay-v2.ico
+UninstallDisplayIcon={app}\app\Assets\ClipRay-v2.ico
+LicenseFile={#StagingDir}\LICENSE
+Compression=lzma2/fast
+SolidCompression=no
+WizardStyle=modern
+CloseApplications=yes
+RestartApplications=no
+UsePreviousAppDir=yes
+UsePreviousTasks=yes
+VersionInfoVersion={#AppVersion}.0
+VersionInfoCompany=落花
+VersionInfoProductName=ClipRay 截光
+VersionInfoDescription=ClipRay 截图、长截图、录屏与本地翻译工具
+
+[Languages]
+Name: "en"; MessagesFile: "compiler:Default.isl"
+Name: "chinesesimp"; MessagesFile: "{#SourcePath}\Languages\ChineseSimplified.isl"
+
+[CustomMessages]
+en.DesktopShortcut=Create a desktop shortcut
+chinesesimp.DesktopShortcut=创建桌面快捷方式
+en.ShortcutsGroup=Shortcuts:
+chinesesimp.ShortcutsGroup=快捷方式：
+en.StartupTask=Start ClipRay when signing in to Windows
+chinesesimp.StartupTask=登录 Windows 后自动启动 ClipRay
+en.StartupGroup=Startup settings:
+chinesesimp.StartupGroup=启动设置：
+en.CleanupTask=Enable Windows scheduled cleanup (after 30 days, daily at 21:00)
+chinesesimp.CleanupTask=启用 Windows 自动清理（30 天、每天 21:00）
+en.CleanupGroup=Cleanup settings:
+chinesesimp.CleanupGroup=清理设置：
+en.LaunchSettings=Launch ClipRay and open Settings
+chinesesimp.LaunchSettings=启动 ClipRay 并打开设置
+en.AlreadyInstalled=ClipRay is already installed. To avoid replacing a running installation, uninstall it from Windows Settings before running this setup again.%n%nDeveloper directories are not treated as installed releases.
+chinesesimp.AlreadyInstalled=已安装正式版 ClipRay。为避免覆盖正在使用的安装，请先在 Windows 设置中卸载它，再运行此安装程序。%n%n开发者目录不会被识别为正式安装。
+en.DeveloperCaption=ClipRay · Developer: 落花 φ(>ω<*)
+chinesesimp.DeveloperCaption=ClipRay 截光 · 开发者：落花 φ(>ω<*)
+en.ChooseInstallDirectory=Choose installation folder
+chinesesimp.ChooseInstallDirectory=选择安装目录
+en.CleanupSetupFailed=ClipRay was installed, but Windows scheduled cleanup could not be enabled. The option remains off. Open ClipRay Settings to try again.
+chinesesimp.CleanupSetupFailed=ClipRay 已安装，但 Windows 自动清理未能启用。设置保持为未启用，请打开 ClipRay 设置后重试。
+en.UninstallTitle=Uninstall ClipRay
+chinesesimp.UninstallTitle=卸载 ClipRay
+en.UninstallSummary=Before uninstalling ClipRay, confirm the following:%n%nChoose Yes to uninstall or No to cancel.%nThe running ClipRay process will close before removal.%nThe app, settings, cost statistics, temporary data, scheduled tasks, startup entry, and Windows credentials will be removed.%nScreenshots, long captures, and recordings are kept by default.
+chinesesimp.UninstallSummary=卸载 ClipRay 前，请确认以下内容。%n%n点击“是”卸载 ClipRay；点击“否”取消。%n卸载开始时会先关闭正在运行的 ClipRay。%n程序、应用设置、费用统计、临时数据、计划任务、开机启动项和 Windows 凭据将被删除。%n截图、长截图和录屏默认保留。
+en.RecycleOutputs=Move the entire default ClipRay Outputs folder to the Recycle Bin (custom folders are unaffected)
+chinesesimp.RecycleOutputs=将 ClipRay 默认 Outputs 文件夹整体移到回收站（自定义目录不受影响）
+en.YesButton=Yes (Y)
+chinesesimp.YesButton=是(Y)
+en.NoButton=No (N)
+chinesesimp.NoButton=否(N)
+en.CleanupStartFailed=ClipRay uninstall cleanup could not start. Uninstallation has stopped. Try again.
+chinesesimp.CleanupStartFailed=无法启动 ClipRay 卸载清理，卸载已停止。请重试。
+en.OutputsRecycleFailed=The default ClipRay Outputs folder could not be moved to the Recycle Bin. Uninstallation has stopped. Close programs using its files and try again.
+chinesesimp.OutputsRecycleFailed=ClipRay 默认 Outputs 文件夹未能整体移入回收站，卸载已停止。请关闭正在使用其中文件的程序后重试。
+en.UninstallCleanupFailed=ClipRay uninstall cleanup did not finish. Uninstallation has stopped. Restart Windows and try again; if it still fails, keep this message and contact the developer.
+chinesesimp.UninstallCleanupFailed=ClipRay 卸载清理未能完成，卸载已停止。请重新启动电脑后重试；若仍失败，请保留此提示并联系开发者。
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:DesktopShortcut}"; GroupDescription: "{cm:ShortcutsGroup}"; Flags: unchecked
+Name: "startup"; Description: "{cm:StartupTask}"; GroupDescription: "{cm:StartupGroup}"; Flags: unchecked
+Name: "cleanup"; Description: "{cm:CleanupTask}"; GroupDescription: "{cm:CleanupGroup}"; Flags: unchecked
+
+[Files]
+Source: "{#StagingDir}\*"; DestDir: "{app}\app"; Excludes: "licenses\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StagingDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Dirs]
+Name: "{app}\Outputs\Screenshots"
+Name: "{app}\Outputs\LongCaptures"
+Name: "{app}\Outputs\Recordings"
+
+[Icons]
+Name: "{group}\ClipRay 截光"; Filename: "{app}\app\{#AppExeName}"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\Assets\ClipRay-v2.ico"
+Name: "{autodesktop}\ClipRay 截光"; Filename: "{app}\app\{#AppExeName}"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\Assets\ClipRay-v2.ico"; Tasks: desktopicon
+
+[Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ClipRay"; ValueData: """{app}\app\{#AppExeName}"" --startup"; Flags: uninsdeletevalue; Tasks: startup
+
+[Run]
+Filename: "{app}\app\{#AppExeName}"; Parameters: "--open-settings"; Description: "{cm:LaunchSettings}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+const
+  ErrorAlreadyExists = 183;
+
+function CreateMutex(lpMutexAttributes: Longint; bInitialOwner: Boolean; lpName: String): Longint;
+  external 'CreateMutexW@kernel32.dll stdcall';
+function GetLastError: Cardinal;
+  external 'GetLastError@kernel32.dll stdcall';
+
+var
+  RecycleOutputs: Boolean;
+  SetupMutexHandle: Longint;
+  DeveloperLabel: TNewStaticText;
+  LicenseDescriptionLabel: TNewStaticText;
+
+procedure BrowseDirectoryButtonClick(Sender: TObject); forward;
+procedure BrowseInstallationDirectory; forward;
+
+function IsAnotherClipRaySetupRunning: Boolean;
+begin
+  SetupMutexHandle := CreateMutex(0, False, 'Local\ClipRaySetup-C5C7914B-7566-4912-A9E0-4D09E724BDA1');
+  Result := GetLastError = ErrorAlreadyExists;
+end;
+
+function ExistingInstallLocation: String;
+var
+  InstallLocation: String;
+begin
+  Result := '';
+  if RegQueryStringValue(HKCU, '{#AppUninstallKey}', 'InstallLocation', InstallLocation) and
+     FileExists(AddBackslash(InstallLocation) + 'app\{#AppExeName}') then
+    Result := InstallLocation;
+end;
+
+function InitializeSetup(): Boolean;
+var
+  ExistingInstall: String;
+begin
+  if IsAnotherClipRaySetupRunning then
+  begin
+    Result := False;
+    exit;
+  end;
+
+  ExistingInstall := ExistingInstallLocation;
+  Result := ExistingInstall = '';
+  if not Result then
+    MsgBox(CustomMessage('AlreadyInstalled'), mbError, MB_OK);
+end;
+
+procedure InitializeWizard;
+begin
+  LicenseDescriptionLabel := TNewStaticText(WizardForm.FindComponent('LicenseLabel3'));
+  if LicenseDescriptionLabel <> nil then LicenseDescriptionLabel.Visible := False;
+
+  DeveloperLabel := TNewStaticText.Create(WizardForm);
+  DeveloperLabel.Parent := WizardForm;
+  DeveloperLabel.Caption := CustomMessage('DeveloperCaption');
+  DeveloperLabel.Font.Size := 17;
+  DeveloperLabel.Font.Style := [fsBold];
+  DeveloperLabel.AutoSize := True;
+  DeveloperLabel.Left := 68;
+  DeveloperLabel.Top := 70;
+  DeveloperLabel.Visible := True;
+
+  WizardForm.DirBrowseButton.OnClick := @BrowseDirectoryButtonClick;
+
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if DeveloperLabel <> nil then DeveloperLabel.Visible := CurPageID = wpLicense;
+end;
+
+procedure BrowseDirectoryButtonClick(Sender: TObject);
+begin
+  BrowseInstallationDirectory;
+end;
+
+procedure BrowseInstallationDirectory;
+var
+  SelectedPath: String;
+begin
+  SelectedPath := '';
+  if BrowseForFolder(CustomMessage('ChooseInstallDirectory'), SelectedPath, True) then
+    WizardForm.DirEdit.Text := SelectedPath;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ConfigurationExitCode: Integer;
+begin
+  if (CurStep = ssPostInstall) and WizardIsTaskSelected('cleanup') then
+  begin
+    if (not Exec(
+      ExpandConstant('{app}\app\{#AppExeName}'),
+      '--configure-install-cleanup',
+      ExpandConstant('{app}\app'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ConfigurationExitCode)) or (ConfigurationExitCode <> 0) then
+    begin
+      MsgBox(CustomMessage('CleanupSetupFailed'), mbError, MB_OK);
+    end;
+  end;
+end;
+
+function InitializeUninstall(): Boolean;
+var
+  Dialog: TSetupForm;
+  Description: TNewStaticText;
+  RecycleOutputsCheck: TNewCheckBox;
+  YesButton, NoButton: TNewButton;
+begin
+  Dialog := CreateCustomForm(ScaleX(660), ScaleY(360), False, False);
+  try
+    Dialog.Caption := CustomMessage('UninstallTitle');
+    Description := TNewStaticText.Create(Dialog);
+    Description.Parent := Dialog;
+    Description.Caption := CustomMessage('UninstallSummary');
+    Description.Left := ScaleX(22);
+    Description.Top := ScaleY(22);
+    Description.Width := Dialog.ClientWidth - ScaleX(44);
+    Description.Height := ScaleY(200);
+    Description.WordWrap := True;
+
+    RecycleOutputsCheck := TNewCheckBox.Create(Dialog);
+    RecycleOutputsCheck.Parent := Dialog;
+    RecycleOutputsCheck.Caption := CustomMessage('RecycleOutputs');
+    RecycleOutputsCheck.Left := Description.Left;
+    RecycleOutputsCheck.Top := Description.Top + Description.Height + ScaleY(10);
+    RecycleOutputsCheck.Width := Description.Width;
+    RecycleOutputsCheck.Height := ScaleY(34);
+    RecycleOutputsCheck.Checked := False;
+
+    YesButton := TNewButton.Create(Dialog);
+    YesButton.Parent := Dialog;
+    YesButton.Caption := CustomMessage('YesButton');
+    YesButton.ModalResult := mrYes;
+    YesButton.Left := Dialog.ClientWidth - ScaleX(196);
+    YesButton.Top := Dialog.ClientHeight - ScaleY(48);
+    YesButton.Width := ScaleX(82);
+
+    NoButton := TNewButton.Create(Dialog);
+    NoButton.Parent := Dialog;
+    NoButton.Caption := CustomMessage('NoButton');
+    NoButton.ModalResult := mrNo;
+    NoButton.Left := Dialog.ClientWidth - ScaleX(102);
+    NoButton.Top := YesButton.Top;
+    NoButton.Width := YesButton.Width;
+    NoButton.Default := True;
+
+    Result := Dialog.ShowModal = mrYes;
+    RecycleOutputs := Result and RecycleOutputsCheck.Checked;
+  finally
+    Dialog.Free;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  TerminateExitCode: Integer;
+  CleanupExitCode: Integer;
+  CleanupArguments: String;
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    { 卸载时才读取复选框；[UninstallRun] 中的 scripted constant 会在安装时固化。 }
+    Exec(
+      ExpandConstant('{sys}\taskkill.exe'),
+      '/F /T /IM "{#AppExeName}"',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      TerminateExitCode);
+
+    CleanupArguments := '--uninstall-cleanup';
+    if RecycleOutputs then
+      CleanupArguments := CleanupArguments + ' --recycle-outputs';
+
+    if not Exec(
+      ExpandConstant('{app}\app\{#AppExeName}'),
+      CleanupArguments,
+      ExpandConstant('{app}\app'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      CleanupExitCode) then
+    begin
+      MsgBox(CustomMessage('CleanupStartFailed'), mbError, MB_OK);
+      Abort;
+    end;
+
+    if CleanupExitCode <> 0 then
+    begin
+      if CleanupExitCode = 2 then
+        MsgBox(CustomMessage('OutputsRecycleFailed'), mbError, MB_OK)
+      else
+        MsgBox(CustomMessage('UninstallCleanupFailed'), mbError, MB_OK);
+      Abort;
+    end;
+  end;
+end;

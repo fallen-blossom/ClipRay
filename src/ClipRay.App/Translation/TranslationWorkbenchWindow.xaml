@@ -1,0 +1,107 @@
+<Window x:Class="ClipRay.App.Translation.TranslationWorkbenchWindow"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ Title="{DynamicResource WorkbenchText0}" Width="1180" Height="780" MinWidth="760" MinHeight="560"
+ Background="#10141C" Foreground="#EDF1F7" FontFamily="Segoe UI, Microsoft YaHei UI">
+ <Window.Resources>
+  <Style TargetType="Button"><Setter Property="Margin" Value="0,0,8,8"/><Setter Property="Padding" Value="12,7"/></Style>
+  <Style TargetType="TextBox"><Setter Property="Background" Value="#1A2230"/><Setter Property="Foreground" Value="#EDF1F7"/><Setter Property="Padding" Value="10"/><Setter Property="TextWrapping" Value="Wrap"/></Style>
+  <Style TargetType="TextBlock"><Setter Property="Foreground" Value="#EDF1F7"/></Style>
+  <Style TargetType="ComboBox">
+   <Setter Property="Foreground" Value="#111827"/><Setter Property="Background" Value="#F3F4F6"/>
+   <Setter Property="ItemTemplate"><Setter.Value><DataTemplate><TextBlock Text="{Binding Label}" Foreground="#111827"/></DataTemplate></Setter.Value></Setter>
+  </Style>
+ </Window.Resources>
+ <Grid Margin="20" Background="#10141C">
+  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <DockPanel Margin="0,0,0,12">
+   <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+    <TextBlock Text="{DynamicResource WorkbenchText78}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+    <ComboBox x:Name="InterfaceLanguageBox" Width="145" SelectionChanged="InterfaceLanguageChanged" AutomationProperties.Name="{DynamicResource WorkbenchText78}"/>
+   </StackPanel>
+   <TextBlock Text="{DynamicResource WorkbenchText1}" FontSize="24"/>
+  </DockPanel>
+  <WrapPanel Grid.Row="1">
+   <TextBlock Text="{DynamicResource WorkbenchText2}" VerticalAlignment="Center" Margin="0,0,6,8"/>
+   <ComboBox x:Name="OcrLanguageBox" MinWidth="190" Margin="0,0,8,8" SelectionChanged="OcrLanguageChanged" AutomationProperties.Name="{DynamicResource WorkbenchText3}" ToolTip="{DynamicResource WorkbenchText4}"/>
+   <Button x:Name="RecognizeButton" Content="{DynamicResource WorkbenchText5}" Click="RecognizeClick"/>
+   <Button x:Name="StopOcrButton" Content="{DynamicResource WorkbenchText6}" Click="StopOcrClick"/>
+   <Button x:Name="TranslateAllButton" Content="{DynamicResource WorkbenchText7}" Click="TranslateAllClick"/>
+   <Button x:Name="CopyAllButton" Content="{DynamicResource WorkbenchText8}" Click="CopyAllClick"/>
+   <Button x:Name="CopyAllSourceButton" Content="{DynamicResource WorkbenchText9}" Click="CopyAllSourceClick" ToolTip="{DynamicResource WorkbenchText28}"/>
+   <Button x:Name="ExportButton" Content="{DynamicResource WorkbenchText10}" Click="ExportClick"/>
+   <CheckBox x:Name="TranslatedView" Content="{DynamicResource WorkbenchText11}" Foreground="#EDF1F7" Margin="8,8" Checked="ViewChanged" Unchecked="ViewChanged"/>
+  </WrapPanel>
+  <Grid Grid.Row="2">
+   <Grid.ColumnDefinitions><ColumnDefinition Width="3*"/><ColumnDefinition Width="16"/><ColumnDefinition Width="2*"/></Grid.ColumnDefinitions>
+   <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="2*"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+    <TextBlock Text="{DynamicResource WorkbenchText12}" Margin="0,0,0,8"/>
+    <ScrollViewer x:Name="PreviewScroller" Grid.Row="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto" Background="#080B10">
+     <Viewbox Stretch="Uniform">
+      <Grid x:Name="ImageSurface">
+       <Image x:Name="SourceImage" Stretch="Fill" AutomationProperties.Name="{DynamicResource WorkbenchText13}"/>
+       <Image x:Name="TranslationImage" Stretch="Fill" IsHitTestVisible="False"/>
+       <Canvas x:Name="RegionCanvas"/>
+      </Grid>
+     </Viewbox>
+    </ScrollViewer>
+    <ListBox Grid.Row="2" x:Name="RegionList" Margin="0,12,0,0" Background="#1A2230" Foreground="#EDF1F7"
+     SelectionMode="Extended" SelectionChanged="RegionSelectionChanged" AutomationProperties.Name="{DynamicResource WorkbenchText14}" ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+   </Grid>
+   <ScrollViewer x:Name="DetailsScroller" Grid.Column="2" VerticalScrollBarVisibility="Auto">
+    <StackPanel>
+     <TextBlock x:Name="FileCheckText" TextWrapping="Wrap" Foreground="#B2BDCE" Margin="0,0,0,12"/>
+     <TextBlock x:Name="RegionHeading" Text="{DynamicResource WorkbenchText15}" FontSize="18" Margin="0,0,0,12"/>
+     <TextBlock Text="{DynamicResource WorkbenchText16}" Margin="0,0,0,6"/>
+     <Grid Margin="0,0,0,12">
+      <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="12"/><ColumnDefinition/></Grid.ColumnDefinitions>
+      <ComboBox x:Name="SourceLanguageBox" SelectionChanged="LanguageChanged" AutomationProperties.Name="{DynamicResource WorkbenchText17}"/>
+      <ComboBox Grid.Column="2" x:Name="TargetLanguageBox" SelectionChanged="LanguageChanged" AutomationProperties.Name="{DynamicResource WorkbenchText18}"/>
+     </Grid>
+     <TextBlock Text="{DynamicResource WorkbenchText19}" TextWrapping="Wrap" Margin="0,0,0,12" Foreground="#B2BDCE"/>
+     <TextBlock x:Name="OcrReviewText" TextWrapping="Wrap" Foreground="#F1C879" Margin="0,0,0,8" AutomationProperties.LiveSetting="Polite"/>
+     <TextBlock Text="{DynamicResource WorkbenchText20}" Margin="0,0,0,6"/>
+     <TextBox x:Name="DraftBox" MinHeight="140" AcceptsReturn="True" TextChanged="DraftChanged" SelectionChanged="SplitSelectionChanged" AutomationProperties.Name="{DynamicResource WorkbenchText21}"/>
+     <WrapPanel Margin="0,12,0,0">
+      <Button x:Name="TranslateButton" Content="{DynamicResource WorkbenchText22}" Click="TranslateClick" ToolTip="{DynamicResource WorkbenchText23}"/>
+      <Button x:Name="CancelButton" Content="{DynamicResource WorkbenchText24}" Click="CancelClick" ToolTip="{DynamicResource WorkbenchText25}"/>
+     <Button x:Name="RestoreButton" Content="{DynamicResource WorkbenchText26}" Click="RestoreClick"/>
+      <Button x:Name="CopySourceButton" Content="{DynamicResource WorkbenchText27}" Click="CopySourceClick" ToolTip="{DynamicResource WorkbenchText28}"/>
+      <Button x:Name="PreserveButton" Content="{DynamicResource WorkbenchText29}" Click="PreserveClick"/>
+     </WrapPanel>
+     <TextBlock x:Name="RegionStatus" TextWrapping="Wrap" Margin="0,4,0,12"/>
+     <Expander x:Name="GroupingPanel" Foreground="#EDF1F7" Margin="0,4,0,12">
+      <StackPanel>
+       <TextBlock x:Name="GroupingHelp" TextWrapping="Wrap"/>
+       <TextBox x:Name="MergePreviewBox" IsReadOnly="True" TextWrapping="Wrap" MaxHeight="160" VerticalScrollBarVisibility="Auto"/>
+       <WrapPanel>
+        <Button x:Name="MergeButton" Click="MergeClick"/>
+        <Button x:Name="UndoGroupButton" Click="UndoGroupClick"/>
+        <Button x:Name="RedoGroupButton" Click="RedoGroupClick"/>
+       </WrapPanel>
+       <TextBlock x:Name="SplitHelp" TextWrapping="Wrap" Margin="0,12,0,4"/>
+       <ComboBox x:Name="SplitLineBox" SelectionChanged="SplitSelectionChanged"/>
+       <TextBox x:Name="SplitPreviewBox" IsReadOnly="True" TextWrapping="Wrap" MaxHeight="180" VerticalScrollBarVisibility="Auto"/>
+       <Button x:Name="SplitButton" Click="SplitClick" HorizontalAlignment="Left"/>
+      </StackPanel>
+     </Expander>
+     <TextBlock Text="{DynamicResource WorkbenchText30}" Margin="0,0,0,6"/>
+     <TextBox x:Name="ResultBox" MinHeight="150" IsReadOnly="True" AutomationProperties.Name="{DynamicResource WorkbenchText31}"/>
+     <TextBlock x:Name="ManualTranslationHelp" TextWrapping="Wrap" Margin="0,10,0,4"/>
+     <TextBox x:Name="ManualTranslationBox" MinHeight="70" AcceptsReturn="True" TextWrapping="Wrap"
+              TextChanged="ManualTranslationChanged" VerticalScrollBarVisibility="Auto"/>
+     <WrapPanel Margin="0,6,0,0">
+      <Button x:Name="ApplyManualTranslationButton" Click="ApplyManualTranslationClick"/>
+      <Button x:Name="RestoreTranslationButton" Click="RestoreTranslationClick"/>
+     </WrapPanel>
+     <Button x:Name="CopyButton" Content="{DynamicResource WorkbenchText32}" HorizontalAlignment="Left" Margin="0,12,0,0" Click="CopyClick"/>
+     <Expander Header="{DynamicResource WorkbenchText33}" Foreground="#EDF1F7" Margin="0,16,0,0">
+      <TextBox x:Name="EvidenceBox" IsReadOnly="True" TextWrapping="Wrap" MinHeight="90" AutomationProperties.Name="{DynamicResource WorkbenchText34}"/>
+     </Expander>
+    </StackPanel>
+   </ScrollViewer>
+  </Grid>
+  <TextBlock Grid.Row="3" x:Name="StatusText" TextWrapping="Wrap" Margin="0,14,0,0" AutomationProperties.LiveSetting="Polite"/>
+ </Grid>
+</Window>

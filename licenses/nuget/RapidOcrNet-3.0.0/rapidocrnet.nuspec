@@ -1,0 +1,33 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>RapidOcrNet</id>
+    <version>3.0.0</version>
+    <title>RapidOcrNet</title>
+    <authors>BobLd,RapidOCR</authors>
+    <requireLicenseAcceptance>true</requireLicenseAcceptance>
+    <license type="expression">Apache-2.0</license>
+    <licenseUrl>https://licenses.nuget.org/Apache-2.0</licenseUrl>
+    <readme>README.md</readme>
+    <projectUrl>https://github.com/BobLd/RapidOcrNet</projectUrl>
+    <description>Lightweight cross-platform OCR processing library using PaddleOCR ONNX PP-OCR v5 models, and based on original code from RapidAI's RapidOCR. Also support v6 models (tiny / small / medium), see README.</description>
+    <tags>OCR RapidOCR PaddleOCR PP-OCRv5 PPOCRv5 Document skia skiasharp onnx image</tags>
+    <repository type="git" url="https://github.com/BobLd/RapidOcrNet" branch="refs/heads/master" commit="590d44b2efc7ecbef446c36bb6359ebbfcffeb50" />
+    <dependencies>
+      <group targetFramework="net10.0">
+        <dependency id="Clipper2" version="2.0.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.ML.OnnxRuntime" version="1.27.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.ML.OnnxRuntime.Managed" version="1.27.0" exclude="Build,Analyzers" />
+        <dependency id="SkiaSharp" version="3.119.1" exclude="Build,Analyzers" />
+        <dependency id="SkiaSharp.NativeAssets.Linux" version="3.119.1" exclude="Build,Analyzers" />
+      </group>
+      <group targetFramework="net8.0">
+        <dependency id="Clipper2" version="2.0.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.ML.OnnxRuntime" version="1.27.0" exclude="Build,Analyzers" />
+        <dependency id="Microsoft.ML.OnnxRuntime.Managed" version="1.27.0" exclude="Build,Analyzers" />
+        <dependency id="SkiaSharp" version="3.119.1" exclude="Build,Analyzers" />
+        <dependency id="SkiaSharp.NativeAssets.Linux" version="3.119.1" exclude="Build,Analyzers" />
+      </group>
+    </dependencies>
+  </metadata>
+</package>

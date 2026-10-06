@@ -1,0 +1,181 @@
+# Each source language translates to every other common target language.
+
+[case]
+id=translation-zh-en-01
+kind=translation
+source_language=zh-Hans
+target_language=en
+source_text=请在设置中选择保存位置。
+expected_text=Please choose a save location in Settings.
+execution=automated
+
+[case]
+id=translation-zh-ja-01
+kind=translation
+source_language=zh-Hans
+target_language=ja
+source_text=请在设置中选择保存位置。
+expected_text=設定で保存先を選択してください。
+execution=automated
+
+[case]
+id=translation-zh-fr-01
+kind=translation
+source_language=zh-Hans
+target_language=fr
+source_text=请在设置中选择保存位置。
+expected_text=Veuillez choisir un emplacement d’enregistrement dans les paramètres.
+execution=automated
+
+[case]
+id=translation-zh-ru-01
+kind=translation
+source_language=zh-Hans
+target_language=ru
+source_text=请在设置中选择保存位置。
+expected_text=Выберите место сохранения в настройках.
+execution=automated
+
+[case]
+id=translation-en-zh-01
+kind=translation
+source_language=en
+target_language=zh-Hans
+source_text=The capture is ready to save.
+expected_text=截图已准备好保存。
+execution=automated
+
+[case]
+id=translation-en-ja-01
+kind=translation
+source_language=en
+target_language=ja
+source_text=The capture is ready to save.
+expected_text=キャプチャは保存する準備ができました。
+execution=automated
+
+[case]
+id=translation-en-fr-01
+kind=translation
+source_language=en
+target_language=fr
+source_text=The capture is ready to save.
+expected_text=La capture est prête à être enregistrée.
+execution=automated
+
+[case]
+id=translation-en-ru-01
+kind=translation
+source_language=en
+target_language=ru
+source_text=The capture is ready to save.
+expected_text=Снимок готов к сохранению.
+execution=automated
+
+[case]
+id=translation-ja-zh-01
+kind=translation
+source_language=ja
+target_language=zh-Hans
+source_text=長い画面を自動でスクロールします。
+expected_text=将自动滚动长页面。
+execution=automated
+
+[case]
+id=translation-ja-en-01
+kind=translation
+source_language=ja
+target_language=en
+source_text=長い画面を自動でスクロールします。
+expected_text=The long page will scroll automatically.
+execution=automated
+
+[case]
+id=translation-ja-fr-01
+kind=translation
+source_language=ja
+target_language=fr
+source_text=長い画面を自動でスクロールします。
+expected_text=La longue page défilera automatiquement.
+execution=automated
+
+[case]
+id=translation-ja-ru-01
+kind=translation
+source_language=ja
+target_language=ru
+source_text=長い画面を自動でスクロールします。
+expected_text=Длинная страница будет прокручиваться автоматически.
+execution=automated
+
+[case]
+id=translation-fr-zh-01
+kind=translation
+source_language=fr
+target_language=zh-Hans
+source_text=Le texte reste lisible sur un fond sombre.
+expected_text=文字在深色背景上仍然清晰可读。
+execution=automated
+
+[case]
+id=translation-fr-en-01
+kind=translation
+source_language=fr
+target_language=en
+source_text=Le texte reste lisible sur un fond sombre.
+expected_text=The text remains legible on a dark background.
+execution=automated
+
+[case]
+id=translation-fr-ja-01
+kind=translation
+source_language=fr
+target_language=ja
+source_text=Le texte reste lisible sur un fond sombre.
+expected_text=文字は暗い背景でも読みやすいままです。
+execution=automated
+
+[case]
+id=translation-fr-ru-01
+kind=translation
+source_language=fr
+target_language=ru
+source_text=Le texte reste lisible sur un fond sombre.
+expected_text=Текст остаётся читаемым на тёмном фоне.
+execution=automated
+
+[case]
+id=translation-ru-zh-01
+kind=translation
+source_language=ru
+target_language=zh-Hans
+source_text=Прокрутка остановлена, но сеанс захвата остаётся активным.
+expected_text=滚动已停止，但捕获会话仍保持活动状态。
+execution=automated
+
+[case]
+id=translation-ru-en-01
+kind=translation
+source_language=ru
+target_language=en
+source_text=Прокрутка остановлена, но сеанс захвата остаётся активным.
+expected_text=Scrolling has stopped, but the capture session remains active.
+execution=automated
+
+[case]
+id=translation-ru-ja-01
+kind=translation
+source_language=ru
+target_language=ja
+source_text=Прокрутка остановлена, но сеанс захвата остаётся активным.
+expected_text=スクロールは停止しましたが、キャプチャセッションはアクティブのままです。
+execution=automated
+
+[case]
+id=translation-ru-fr-01
+kind=translation
+source_language=ru
+target_language=fr
+source_text=Прокрутка остановлена, но сеанс захвата остаётся активным.
+expected_text=Le défilement est arrêté, mais la session de capture reste active.
+execution=automated

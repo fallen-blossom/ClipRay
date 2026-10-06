@@ -1,0 +1,70 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ClipRay.Core\ClipRay.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio.Wasapi" Version="2.3.0" />
+    <PackageReference Include="RapidOcrNet" Version="[3.0.0]" GeneratePathProperty="true" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\ClipRay-v2.ico</ApplicationIcon>
+    <Version>1.0.6</Version>
+    <AssemblyVersion>1.0.6.0</AssemblyVersion>
+    <FileVersion>1.0.6.0</FileVersion>
+    <InformationalVersion>1.0.6+realtime-stability-fix</InformationalVersion>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode>true</RestoreLockedMode>
+    <ClipRayCudaRuntimeRoot Condition="'$(ClipRayCudaRuntimeRoot)' == ''">F:\ClipRayAssets\cuda-12.8.1\bin</ClipRayCudaRuntimeRoot>
+    <ClipRayIncludeCudaRuntime Condition="'$(ClipRayIncludeCudaRuntime)' == ''">true</ClipRayIncludeCudaRuntime>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Local optional CUDA redistributables: package at publish time, not into E: build outputs. -->
+    <Content Include="$(ClipRayCudaRuntimeRoot)\*.dll;$(ClipRayCudaRuntimeRoot)\*-license-*.txt;$(ClipRayCudaRuntimeRoot)\runtime-manifest.json;$(ClipRayCudaRuntimeRoot)\SOURCE-EXPLANATION.md"
+             Condition="'$(ClipRayIncludeCudaRuntime)' == 'true' and Exists('$(ClipRayCudaRuntimeRoot)\cublas64_12.dll') and Exists('$(ClipRayCudaRuntimeRoot)\cublasLt64_12.dll') and Exists('$(ClipRayCudaRuntimeRoot)\cudart64_12.dll')"
+             Link="machine-translation\gpu\%(Filename)%(Extension)"
+             CopyToOutputDirectory="Never" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="Assets\ClipRay.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\artifacts\models\rapidocr\arabic_PP-OCRv5_rec_mobile.onnx;..\..\artifacts\models\rapidocr\cyrillic_PP-OCRv5_rec_mobile.onnx;..\..\artifacts\models\rapidocr\ppocrv5_arabic_dict.txt;..\..\artifacts\models\rapidocr\ppocrv5_cyrillic_dict.txt" Link="models\v5\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="Assets\ClipRay-v2.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\THIRD_PARTY_NOTICES.md" Link="THIRD_PARTY_NOTICES.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\docs\ClipRay-使用教程.html" Link="docs\ClipRay-使用教程.html" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Resource Include="Assets\ClipRay-icon-transparent.png" />
+    <Content Include="Ocr\ppocr_sidecar.py" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Translation\machine_translation_worker.py" Link="machine-translation\machine_translation_worker.py" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\artifacts\machine-translation\**\*"
+             Exclude="..\..\artifacts\machine-translation\**\*test*;..\..\artifacts\machine-translation\**\*Test*"
+             Link="machine-translation\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+    <!-- NumPy imports this runtime helper from numpy.__init__; it is not a bundled test suite. -->
+    <Content Include="..\..\artifacts\machine-translation\runtime\Lib\site-packages\numpy\_pytesttester.py"
+             Link="machine-translation\runtime\Lib\site-packages\numpy\_pytesttester.py"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\artifacts\models\rapidocr\PP-OCRv6_*.*;..\..\artifacts\models\rapidocr\ppocrv6_small_dict.txt" Link="models\v6\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\artifacts\models\rapidocr\ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx;..\..\artifacts\models\rapidocr\ch_PP-OCRv5_mobile_det.onnx" Link="models\v5\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\artifacts\models\rapidocr\korean_PP-OCRv5_rec_mobile.onnx;..\..\artifacts\models\rapidocr\ppocrv5_korean_dict.txt" Link="models\v5\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="$(PkgRapidOcrNet)\models\v5\latin_PP-OCRv5_rec_mobile_infer.onnx;$(PkgRapidOcrNet)\models\v5\ppocrv5_latin_dict.txt"
+             Link="models\v5\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(ClipRayIncludeCudaRuntime)' != 'true'">
+    <!-- CTranslate2's optional cuDNN loader is not needed for the CPU translation route. -->
+    <Content Remove="..\..\artifacts\machine-translation\runtime\Lib\site-packages\ctranslate2\cudnn64_9.dll" />
+  </ItemGroup>
+
+</Project>

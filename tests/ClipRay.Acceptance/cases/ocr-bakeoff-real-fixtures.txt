@@ -1,0 +1,52 @@
+# OCR bake-off manifest. Each image must be a user-provided real UI or game capture.
+# Do not replace these records with rendered text, synthetic images, or enlarged fonts.
+
+[case]
+id=ocr-real-ui-zh-hans-01
+kind=ocr_bake_off
+source_language=zh-Hans
+fixture_path=fixtures/ocr-real-ui-zh-hans-01.png
+fixture_status=real_ui_image_required
+expected_text=保存设置后，长截图会自动滚动。
+minimum_visible_character_height_px=10
+execution=manual_pending
+
+[case]
+id=ocr-real-ui-en-01
+kind=ocr_bake_off
+source_language=en
+fixture_path=fixtures/ocr-real-ui-en-01.png
+fixture_status=real_ui_image_required
+expected_text=Press Save to keep the capture.
+minimum_visible_character_height_px=10
+execution=manual_pending
+
+[case]
+id=ocr-real-ui-ja-01
+kind=ocr_bake_off
+source_language=ja
+fixture_path=fixtures/ocr-real-ui-ja-01.png
+fixture_status=real_ui_image_required
+expected_text=保存すると長いスクリーンショットが自動的にスクロールします。
+minimum_visible_character_height_px=10
+execution=manual_pending
+
+[case]
+id=ocr-real-ui-fr-01
+kind=ocr_bake_off
+source_language=fr
+fixture_path=fixtures/ocr-real-ui-fr-01.png
+fixture_status=real_ui_image_required
+expected_text=Enregistrez la capture avant de fermer la fenêtre.
+minimum_visible_character_height_px=10
+execution=manual_pending
+
+[case]
+id=ocr-real-ui-ru-01
+kind=ocr_bake_off
+source_language=ru
+fixture_path=fixtures/ocr-real-ui-ru-01.png
+fixture_status=real_ui_image_required
+expected_text=Сохраните снимок перед закрытием окна.
+minimum_visible_character_height_px=10
+execution=manual_pending

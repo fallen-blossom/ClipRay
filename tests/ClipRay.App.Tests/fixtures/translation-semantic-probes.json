@@ -1,0 +1,201 @@
+{
+  "scope": "Authored synthetic semantic probes. Expectations are review criteria, never sent to the model. Not screenshot/OCR/release acceptance.",
+  "cases": [
+    {
+      "id": "en-agent",
+      "sourceLanguage": "en",
+      "targetLanguage": "zh",
+      "sourceText": "Nora asked Atlas to review the patch, but Atlas did not change any files.",
+      "semanticCriteria": [
+        "Nora asks Atlas",
+        "Atlas reviews patch",
+        "Atlas changes no files"
+      ],
+      "sourceMetadata": {
+        "scene": "software development discussion",
+        "terms": [
+          "Atlas",
+          "Nora"
+        ]
+      }
+    },
+    {
+      "id": "en-condition",
+      "sourceLanguage": "en",
+      "targetLanguage": "zh",
+      "sourceText": "Do not close the window until the upload finishes. If it fails, keep the original file.",
+      "semanticCriteria": [
+        "must wait for upload before closing",
+        "failure preserves original file"
+      ],
+      "sourceMetadata": {
+        "scene": "file upload user interface",
+        "terms": []
+      }
+    },
+    {
+      "id": "en-quantity",
+      "sourceLanguage": "en",
+      "targetLanguage": "zh",
+      "sourceText": "Only 3 of the 12 requests failed; the remaining requests were not retried.",
+      "semanticCriteria": [
+        "3 failed out of 12",
+        "remaining requests not retried"
+      ],
+      "sourceMetadata": {
+        "scene": "request processing report",
+        "terms": []
+      }
+    },
+    {
+      "id": "en-uncertainty",
+      "sourceLanguage": "en",
+      "targetLanguage": "zh",
+      "sourceText": "This update may reduce startup time, but it does not guarantee faster translation.",
+      "semanticCriteria": [
+        "startup improvement uncertain",
+        "no translation speed guarantee"
+      ],
+      "sourceMetadata": {
+        "scene": "software release notes",
+        "terms": []
+      }
+    },
+    {
+      "id": "en-product",
+      "sourceLanguage": "en",
+      "targetLanguage": "zh",
+      "sourceText": "The coding assistant codex found the error that Mira had missed.",
+      "semanticCriteria": [
+        "codex identifies error",
+        "Mira missed error",
+        "codex is assistant name"
+      ],
+      "sourceMetadata": {
+        "scene": "coding assistant discussion",
+        "terms": [
+          "codex",
+          "Mira"
+        ]
+      }
+    },
+    {
+      "id": "es-agent",
+      "sourceLanguage": "es",
+      "targetLanguage": "zh",
+      "sourceText": "Lucía pidió a Atlas que revisara el cambio, pero Atlas no modificó ningún archivo.",
+      "semanticCriteria": [
+        "Lucia asks Atlas",
+        "Atlas reviews change",
+        "Atlas changes no files"
+      ],
+      "sourceMetadata": {
+        "scene": "software development discussion",
+        "terms": [
+          "Atlas",
+          "Lucía"
+        ]
+      }
+    },
+    {
+      "id": "es-condition",
+      "sourceLanguage": "es",
+      "targetLanguage": "zh",
+      "sourceText": "No cierres la ventana hasta que termine la descarga. Si falla, conserva el archivo original.",
+      "semanticCriteria": [
+        "wait for download before closing",
+        "failure preserves original file"
+      ],
+      "sourceMetadata": {
+        "scene": "file download user interface",
+        "terms": []
+      }
+    },
+    {
+      "id": "es-quantity",
+      "sourceLanguage": "es",
+      "targetLanguage": "zh",
+      "sourceText": "Solo fallaron 3 de las 12 solicitudes; las demás no se volvieron a intentar.",
+      "semanticCriteria": [
+        "3 failed out of 12",
+        "remaining requests not retried"
+      ],
+      "sourceMetadata": {
+        "scene": "request processing report",
+        "terms": []
+      }
+    },
+    {
+      "id": "en-common",
+      "sourceLanguage": "en",
+      "targetLanguage": "zh",
+      "sourceText": "She opened the atlas to find the island, then closed the book.",
+      "semanticCriteria": [
+        "atlas is a map book",
+        "she finds island then closes book"
+      ],
+      "sourceMetadata": {
+        "scene": "travel narrative",
+        "terms": []
+      },
+      "batch": "supplemental-contrast"
+    },
+    {
+      "id": "en-brand",
+      "sourceLanguage": "en",
+      "targetLanguage": "zh",
+      "sourceText": "She opened atlas to inspect the failing test, then asked the coding assistant to explain it.",
+      "semanticCriteria": [
+        "atlas is an application name",
+        "test is failing",
+        "assistant explains test"
+      ],
+      "sourceMetadata": {
+        "scene": "software development application named atlas",
+        "terms": [
+          "atlas"
+        ]
+      },
+      "batch": "supplemental-contrast"
+    },
+    {
+      "id": "en-passive",
+      "sourceLanguage": "en",
+      "targetLanguage": "zh",
+      "sourceText": "The patch was rejected by Mira, not by Nora, because it removed the warning.",
+      "semanticCriteria": [
+        "Mira rejected patch",
+        "Nora did not reject it",
+        "patch removed warning"
+      ],
+      "sourceMetadata": {
+        "scene": "code review discussion",
+        "terms": [
+          "Mira",
+          "Nora"
+        ]
+      },
+      "batch": "supplemental-contrast"
+    },
+    {
+      "id": "es-reference",
+      "sourceLanguage": "es",
+      "targetLanguage": "zh",
+      "sourceText": "Atlas revisó el informe que envió Lucía. Ella corrigió dos cifras, pero él no cambió las conclusiones.",
+      "semanticCriteria": [
+        "Atlas reviewed report sent by Lucia",
+        "Lucia corrected two figures",
+        "Atlas did not change conclusions"
+      ],
+      "sourceMetadata": {
+        "scene": "report review by two people named Atlas and Lucía",
+        "terms": [
+          "Atlas",
+          "Lucía"
+        ]
+      },
+      "batch": "supplemental-contrast"
+    }
+  ],
+  "metadataBoundary": "Authored scene/name metadata simulates supplied source context; automatic reliable extraction is NOT established. Both arms use identical source text. No reference translations sent."
+}

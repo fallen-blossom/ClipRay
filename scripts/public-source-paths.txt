@@ -1,0 +1,22 @@
+# Paths selected from a committed Git tree for the first public source snapshot.
+.gitignore
+.gitattributes
+ClipRay.sln
+NuGet.Config
+README.md
+LICENSE
+SOURCE.md
+TRADEMARKS.md
+THIRD_PARTY_NOTICES.md
+src
+tests
+scripts
+installer/ClipRay.iss
+installer/ClipRay.RecordingDiagnosticPatch.iss
+installer/Languages/ChineseSimplified.isl
+licenses
+docs/ClipRay-使用教程.html
+docs/model-supply-chain.md
+docs/BUILD.zh-CN.md
+docs/prototypes/translation-workbench.html
+docs/release/RELEASE-NOTES.zh-CN.md

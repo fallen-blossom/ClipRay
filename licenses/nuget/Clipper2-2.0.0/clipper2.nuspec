@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd">
+  <metadata>
+    <id>Clipper2</id>
+    <version>2.0.0</version>
+    <title>Clipper2</title>
+    <authors>Angus Johnson</authors>
+    <license type="file">License.txt</license>
+    <licenseUrl>https://aka.ms/deprecateLicenseUrl</licenseUrl>
+    <icon>icon.png</icon>
+    <readme>README.md</readme>
+    <projectUrl>https://www.angusj.com/clipper2/Docs/Overview.htm</projectUrl>
+    <description>Polygon Clipping and Offsetting Library</description>
+    <releaseNotes>Release ver. 2.0.0
+This release adds a new Triangulation module to the library.
+It also includes a number of bugfixes (see GitHub issues  #980 .. #1045)</releaseNotes>
+    <copyright>Copyright © 2010-2025</copyright>
+    <tags>geometry polygon clipping inflate intersection union difference offsetting boolean-operations</tags>
+    <repository type="git" url="https://github.com/AngusJohnson/Clipper2" />
+    <dependencies>
+      <group targetFramework=".NETStandard2.0" />
+    </dependencies>
+  </metadata>
+</package>

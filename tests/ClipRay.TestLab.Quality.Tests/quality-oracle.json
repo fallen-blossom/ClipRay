@@ -1,0 +1,233 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "id": "synthetic-visual-check",
+      "imageSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "targetLanguage": "简体中文",
+      "regions": [
+        {
+          "id": "first",
+          "bounds": {
+            "x": 10,
+            "y": 10,
+            "width": 130,
+            "height": 24
+          },
+          "sourceText": "First",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": true,
+          "minimumFontPixels": 10,
+          "fontTier": "body",
+          "expectedAlignment": "left",
+          "foregroundRgb": "#FFFFFF",
+          "maximumColorDistance": 70,
+          "allowedLayoutBounds": {
+            "x": 8,
+            "y": 8,
+            "width": 150,
+            "height": 30
+          }
+        },
+        {
+          "id": "second",
+          "bounds": {
+            "x": 10,
+            "y": 50,
+            "width": 130,
+            "height": 24
+          },
+          "sourceText": "Second",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": true,
+          "minimumFontPixels": 10,
+          "fontTier": "body",
+          "foregroundRgb": "#3978DB",
+          "maximumColorDistance": 70,
+          "allowedLayoutBounds": {
+            "x": 8,
+            "y": 48,
+            "width": 150,
+            "height": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "synthetic-source-preserve",
+      "imageSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "targetLanguage": "简体中文",
+      "regions": [
+        {
+          "id": "brand",
+          "bounds": {
+            "x": 10,
+            "y": 10,
+            "width": 130,
+            "height": 24
+          },
+          "sourceText": "Grok",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": false,
+          "mustPreserveSource": true,
+          "minimumFontPixels": 0
+        }
+      ]
+    },
+    {
+      "id": "synthetic-identity-pixels",
+      "imageSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "targetLanguage": "简体中文",
+      "regions": [
+        {
+          "id": "identity-row",
+          "bounds": {
+            "x": 10,
+            "y": 10,
+            "width": 130,
+            "height": 24
+          },
+          "sourceText": "tamara @tamara · Sep 18",
+          "meaningSignals": [{ "id": "date", "anyOf": ["9月18日"] }],
+          "protectedTokens": ["tamara @tamara"],
+          "mustRender": false,
+          "mustPreservePixels": true,
+          "minimumFontPixels": 0
+        }
+      ]
+    },
+    {
+      "id": "synthetic-reading-groups",
+      "imageSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "targetLanguage": "简体中文",
+      "regions": [
+        {
+          "id": "sidebar-first",
+          "bounds": {
+            "x": 10,
+            "y": 10,
+            "width": 80,
+            "height": 20
+          },
+          "sourceText": "Side one",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": false,
+          "minimumFontPixels": 0,
+          "readingGroup": "sidebar"
+        },
+        {
+          "id": "main-first",
+          "bounds": {
+            "x": 150,
+            "y": 20,
+            "width": 100,
+            "height": 20
+          },
+          "sourceText": "Main one",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": false,
+          "minimumFontPixels": 0,
+          "readingGroup": "main"
+        },
+        {
+          "id": "sidebar-second",
+          "bounds": {
+            "x": 10,
+            "y": 40,
+            "width": 80,
+            "height": 20
+          },
+          "sourceText": "Side two",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": false,
+          "minimumFontPixels": 0,
+          "readingGroup": "sidebar"
+        },
+        {
+          "id": "main-second",
+          "bounds": {
+            "x": 150,
+            "y": 50,
+            "width": 100,
+            "height": 20
+          },
+          "sourceText": "Main two",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": false,
+          "minimumFontPixels": 0,
+          "readingGroup": "main"
+        }
+      ]
+    },
+    {
+      "id": "synthetic-reading-legacy",
+      "imageSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "targetLanguage": "简体中文",
+      "regions": [
+        {
+          "id": "sidebar-first",
+          "bounds": {
+            "x": 10,
+            "y": 10,
+            "width": 80,
+            "height": 20
+          },
+          "sourceText": "Side one",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": false,
+          "minimumFontPixels": 0
+        },
+        {
+          "id": "main-first",
+          "bounds": {
+            "x": 150,
+            "y": 20,
+            "width": 100,
+            "height": 20
+          },
+          "sourceText": "Main one",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": false,
+          "minimumFontPixels": 0
+        },
+        {
+          "id": "sidebar-second",
+          "bounds": {
+            "x": 10,
+            "y": 40,
+            "width": 80,
+            "height": 20
+          },
+          "sourceText": "Side two",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": false,
+          "minimumFontPixels": 0
+        },
+        {
+          "id": "main-second",
+          "bounds": {
+            "x": 150,
+            "y": 50,
+            "width": 100,
+            "height": 20
+          },
+          "sourceText": "Main two",
+          "meaningSignals": [],
+          "protectedTokens": [],
+          "mustRender": false,
+          "minimumFontPixels": 0
+        }
+      ]
+    }
+  ]
+}

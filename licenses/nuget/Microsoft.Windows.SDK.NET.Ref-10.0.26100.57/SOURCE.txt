@@ -1,0 +1,7 @@
+Microsoft.Windows.SDK.NET.Ref 10.0.26100.57
+License URL from the original package metadata: https://aka.ms/WinSDKLicenseURL
+Resolved original RTF: https://download.microsoft.com/download/0/F/F/0FF2B061-47DD-4F55-89B6-FD1D8C44F14D/sdk_license.rtf
+SHA-256: dd07eb178e00c6bba4148457fc00ff77cd4887eb521d504186fe59c9ec8bbe62
+Redistribution list: https://learn.microsoft.com/en-us/legal/windows-sdk/redist#microsoftwindowssdknetref
+Reviewed on 2026-10-06. The list explicitly includes Microsoft.Windows.SDK.NET.dll and WinRT.Runtime.dll as unmodified files distributed as part of a Windows application to call WinRT APIs.
+The Windows SDK components retain their own license; ClipRay does not relicense them.

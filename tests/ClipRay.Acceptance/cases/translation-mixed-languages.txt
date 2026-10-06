@@ -1,0 +1,44 @@
+[case]
+id=mixed-en-zh-01
+kind=mixed_translation
+source_language=auto
+target_language=zh-Hans
+source_text=Press 保存 to save the Screenshot.
+expected_text=按“保存”以保存截图。
+execution=automated
+
+[case]
+id=mixed-zh-ja-01
+kind=mixed_translation
+source_language=auto
+target_language=ja
+source_text=点击 Start 后，长截图会自动滚动。
+expected_text=Start をクリックすると、長いスクリーンショットは自動的にスクロールします。
+execution=automated
+
+[case]
+id=mixed-ja-en-01
+kind=mixed_translation
+source_language=auto
+target_language=en
+source_text=設定の Save path を確認してください。
+expected_text=Please check the Save path in Settings.
+execution=automated
+
+[case]
+id=mixed-fr-ru-01
+kind=mixed_translation
+source_language=auto
+target_language=ru
+source_text=Le bouton Pause reste visible pendant scrolling.
+expected_text=Кнопка «Пауза» остаётся видимой во время прокрутки.
+execution=automated
+
+[case]
+id=mixed-ru-fr-01
+kind=mixed_translation
+source_language=auto
+target_language=fr
+source_text=После Capture нажмите 保存, puis fermez la fenêtre.
+expected_text=Après Capture, cliquez sur 保存, puis fermez la fenêtre.
+execution=automated

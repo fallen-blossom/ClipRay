@@ -1,0 +1,16 @@
+<Window x:Class="ClipRay.App.LiveTranslation.LiveTranslationSelectionWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        WindowStyle="None" ResizeMode="NoResize" AllowsTransparency="True"
+        Background="#01000000" Topmost="True" ShowInTaskbar="False"
+        Cursor="Cross" Focusable="True">
+    <Canvas x:Name="SelectionCanvas" Background="Transparent">
+        <Border x:Name="SelectionBorder" Visibility="Collapsed"
+                BorderBrush="#66D9FF" BorderThickness="2" Background="#221DAEFF" />
+        <Border Canvas.Left="16" Canvas.Top="16" Padding="12,8" CornerRadius="8"
+                Background="#E619202A" IsHitTestVisible="False">
+            <TextBlock x:Name="StatusText" Foreground="White"
+                       Text="拖动框选实时翻译区域，Esc 取消" />
+        </Border>
+    </Canvas>
+</Window>

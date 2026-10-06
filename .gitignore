@@ -1,0 +1,41 @@
+# 默认排除，仅放行长期维护的源码、测试、稳定配置和文档。
+*
+
+!/.gitignore
+!/.gitattributes
+!/ClipRay.sln
+!/NuGet.Config
+!/README.md
+!/LICENSE
+!/TRADEMARKS.md
+!/THIRD_PARTY_NOTICES.md
+!/SOURCE.md
+!/licenses/
+!/licenses/**
+!/轻量截图翻译工具_架构与精益开发策略.md
+
+!/docs/
+!/docs/**
+!/src/
+!/src/**
+!/tests/
+!/tests/**
+!/scripts/
+!/scripts/**
+!/installer/
+!/installer/**
+
+# 即使位于放行目录内，生成物和本地状态也不进入版本历史。
+**/bin/
+**/obj/
+**/.vs/
+**/*.user
+**/*.suo
+**/*.log
+**/*.tmp
+**/.env
+**/.env.*
+
+# 截图、运行证据和其他用户数据保持本地。
+/artifacts/
+/screenshots/

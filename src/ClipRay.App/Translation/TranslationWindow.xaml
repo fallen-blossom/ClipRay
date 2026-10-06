@@ -1,0 +1,152 @@
+<Window x:Class="ClipRay.App.Translation.TranslationWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:settings="clr-namespace:ClipRay.App.Settings"
+        Title="ClipRay 翻译" Width="940" Height="720" MinWidth="720" MinHeight="540"
+        WindowStartupLocation="CenterScreen" Background="#0E1118" Foreground="#F4F6FB"
+        FontFamily="Segoe UI, Microsoft YaHei UI"
+        Icon="/ClipRay.App;component/Assets/ClipRay-icon-transparent.png">
+    <Window.Resources>
+        <SolidColorBrush x:Key="PanelBrush" Color="#171B24" />
+        <SolidColorBrush x:Key="BorderBrush" Color="#2C3547" />
+        <ControlTemplate x:Key="DarkComboBoxTemplate" TargetType="ComboBox">
+            <Grid>
+                <ToggleButton x:Name="DropDownToggle" Focusable="False" ClickMode="Press"
+                              IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}">
+                    <ToggleButton.Template>
+                        <ControlTemplate TargetType="ToggleButton">
+                            <Border x:Name="ToggleSurface" Background="#10151E" BorderBrush="#3A465B" BorderThickness="1" CornerRadius="7">
+                                <Grid>
+                                    <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="34" /></Grid.ColumnDefinitions>
+                                    <ContentPresenter Margin="11,0,4,0" VerticalAlignment="Center"
+                                                      Content="{Binding SelectionBoxItem, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                                                      TextElement.Foreground="#F4F6FB" />
+                                    <Path Grid.Column="1" Width="9" Height="5" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                          Data="M0,0 L4.5,5 L9,0" Stroke="#A9B5C8" StrokeThickness="1.5" />
+                                </Grid>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ToggleSurface" Property="BorderBrush" Value="#6185C7" /></Trigger>
+                                <Trigger Property="IsChecked" Value="True"><Setter TargetName="ToggleSurface" Property="BorderBrush" Value="#72BFFF" /></Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </ToggleButton.Template>
+                </ToggleButton>
+                <Popup x:Name="PART_Popup" IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom"
+                       AllowsTransparency="True" Focusable="False" PopupAnimation="Fade">
+                    <Border MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
+                            Margin="0,4,0,0" Padding="4" Background="#171D28" BorderBrush="#3A465B"
+                            BorderThickness="1" CornerRadius="7">
+                        <ScrollViewer MaxHeight="280"><ItemsPresenter /></ScrollViewer>
+                    </Border>
+                </Popup>
+            </Grid>
+        </ControlTemplate>
+        <Style TargetType="TextBlock"><Setter Property="Foreground" Value="#E9ECF4" /></Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Foreground" Value="#F4F6FB" /><Setter Property="Background" Value="#10151E" />
+            <Setter Property="BorderBrush" Value="#364156" /><Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="14,12" /><Setter Property="CaretBrush" Value="#F4F6FB" />
+        </Style>
+        <Style TargetType="ComboBox">
+            <Setter Property="Foreground" Value="#F4F6FB" /><Setter Property="Background" Value="#171E2A" />
+            <Setter Property="BorderBrush" Value="#3A465B" /><Setter Property="Padding" Value="10,7" />
+            <Setter Property="Template" Value="{StaticResource DarkComboBoxTemplate}" />
+        </Style>
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Foreground" Value="#F4F6FB" /><Setter Property="Background" Value="Transparent" />
+            <Setter Property="Padding" Value="10,7" /><Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Style.Triggers>
+                <Trigger Property="IsHighlighted" Value="True"><Setter Property="Background" Value="#2A3650" /></Trigger>
+                <Trigger Property="IsSelected" Value="True"><Setter Property="Background" Value="#243E69" /></Trigger>
+            </Style.Triggers>
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="Foreground" Value="#EDF2FA" /><Setter Property="Background" Value="#222B3A" />
+            <Setter Property="BorderBrush" Value="#3A465B" /><Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="18,9" /><Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Surface" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="8" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Surface" Property="Background" Value="#2D3950" /><Setter TargetName="Surface" Property="BorderBrush" Value="#58709A" /></Trigger>
+                            <Trigger Property="IsPressed" Value="True"><Setter TargetName="Surface" Property="Background" Value="#3A4965" /></Trigger>
+                            <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.72" /></Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+            <RowDefinition Height="*" /><RowDefinition Height="8" /><RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+            <StackPanel Orientation="Horizontal">
+                <Image Width="38" Height="38" Margin="0,0,12,0" Source="/ClipRay.App;component/Assets/ClipRay-icon-transparent.png" />
+                <StackPanel><TextBlock settings:SettingsText.Chinese="翻译" settings:SettingsText.English="Translation" FontSize="25" FontWeight="SemiBold" />
+                    <TextBlock settings:SettingsText.Chinese="本地隐私翻译或临时切换 DeepSeek；不会修改默认设置" settings:SettingsText.English="Translate locally or use DeepSeek for this session. Your defaults stay unchanged." Foreground="#929DB2" Margin="0,3,0,0" /></StackPanel>
+            </StackPanel>
+            <Border Grid.Column="1" Padding="10,6" CornerRadius="10" Background="#17283A" BorderBrush="#315979" BorderThickness="1" VerticalAlignment="Center">
+                <TextBlock x:Name="ProviderStatus" Foreground="#83D5FF" FontWeight="SemiBold" />
+            </Border>
+        </Grid>
+
+        <Border Grid.Row="1" Margin="0,18,0,12" Padding="14,11" Background="#151B25" BorderBrush="#2C3547" BorderThickness="1" CornerRadius="11">
+            <Grid><Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" /><ColumnDefinition Width="180" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="180" />
+                <ColumnDefinition Width="Auto" /><ColumnDefinition Width="220" /><ColumnDefinition />
+            </Grid.ColumnDefinitions>
+                <TextBlock settings:SettingsText.Chinese="源语言" settings:SettingsText.English="Source language" VerticalAlignment="Center" /><ComboBox x:Name="SourceLanguageBox" Grid.Column="1" Margin="9,0,18,0" SelectedIndex="0">
+                    <ComboBoxItem Tag="auto" settings:SettingsText.Chinese="自动检测" settings:SettingsText.English="Auto detect" />
+                    <ComboBoxItem Tag="English" Content="English" />
+                    <ComboBoxItem Tag="简体中文" settings:SettingsText.Chinese="简体中文" settings:SettingsText.English="Simplified Chinese" />
+                    <ComboBoxItem Tag="Japanese" settings:SettingsText.Chinese="日语" settings:SettingsText.English="Japanese" />
+                    <ComboBoxItem Tag="Korean" settings:SettingsText.Chinese="韩语" settings:SettingsText.English="Korean" />
+                </ComboBox>
+                <TextBlock Grid.Column="2" settings:SettingsText.Chinese="目标语言" settings:SettingsText.English="Target language" VerticalAlignment="Center" /><ComboBox x:Name="TargetLanguageBox" Grid.Column="3" Margin="9,0,18,0" SelectedIndex="0">
+                    <ComboBoxItem Tag="简体中文" settings:SettingsText.Chinese="简体中文" settings:SettingsText.English="Simplified Chinese" />
+                    <ComboBoxItem Tag="English" Content="English" />
+                    <ComboBoxItem Tag="Japanese" settings:SettingsText.Chinese="日语" settings:SettingsText.English="Japanese" />
+                    <ComboBoxItem Tag="Korean" settings:SettingsText.Chinese="韩语" settings:SettingsText.English="Korean" />
+                </ComboBox>
+                <TextBlock Grid.Column="4" settings:SettingsText.Chinese="本次模型" settings:SettingsText.English="Model for this session" VerticalAlignment="Center" />
+                <ComboBox x:Name="RouteBox" Grid.Column="5" Margin="9,0,0,0" SelectionChanged="OnRouteChanged" />
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="2" Background="{StaticResource PanelBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="12" Padding="15">
+            <Grid><Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                <TextBlock settings:SettingsText.Chinese="原文" settings:SettingsText.English="Source text" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,9" />
+                <TextBox x:Name="InputText" Grid.Row="1" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
+            </Grid>
+        </Border>
+        <GridSplitter Grid.Row="3" Height="8" HorizontalAlignment="Stretch" Background="Transparent" ResizeDirection="Rows" />
+        <Border Grid.Row="4" Background="{StaticResource PanelBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="12" Padding="15">
+            <Grid><Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                <TextBlock settings:SettingsText.Chinese="译文" settings:SettingsText.English="Translation" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,9" />
+                <TextBox x:Name="ResultText" Grid.Row="1" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True" VerticalScrollBarVisibility="Auto" />
+            </Grid>
+        </Border>
+        <Grid Grid.Row="5" Margin="0,14,0,0"><Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+            <TextBlock x:Name="ProgressStatus" Foreground="#A9B5C8" VerticalAlignment="Center" settings:SettingsText.Chinese="就绪" settings:SettingsText.English="Ready" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button x:Name="LiveTranslateButton" settings:SettingsText.Chinese="实时区域翻译" settings:SettingsText.English="Live region translation" MinWidth="122" Click="OnLiveTranslate" />
+                <Button x:Name="CopyButton" settings:SettingsText.Chinese="复制译文" settings:SettingsText.English="Copy translation" MinWidth="110" Click="OnCopy" />
+                <Button x:Name="TranslateButton" settings:SettingsText.Chinese="开始翻译" settings:SettingsText.English="Translate" MinWidth="122" Margin="10,0,0,0" Click="OnTranslate"
+                        Background="#5474EE" BorderBrush="#7890F6" FontWeight="SemiBold" RenderTransformOrigin="0.5,0.5">
+                    <Button.RenderTransform><ScaleTransform x:Name="TranslateButtonScale" ScaleX="1" ScaleY="1" /></Button.RenderTransform>
+                </Button>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

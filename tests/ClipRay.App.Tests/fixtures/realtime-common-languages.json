@@ -1,0 +1,23 @@
+[
+  {"language":"en","text":"I can use this app today, but I cannot use it tomorrow.","meaning":"今天能使用，明天不能使用"},
+  {"language":"en","text":"Do not delete the file. Keep all 18 items for 24 hours.","meaning":"不要删除；18项；保存24小时"},
+  {"language":"ja","text":"今日はこのアプリを使えますが、明日は使えません。","meaning":"今天能使用，明天不能使用"},
+  {"language":"ja","text":"ファイルを削除しないでください。18個の項目を24時間保存してください。","meaning":"不要删除；18项；保存24小时"},
+  {"language":"ko","text":"오늘은 이 앱을 사용할 수 있지만 내일은 사용할 수 없습니다.","meaning":"今天能使用，明天不能使用"},
+  {"language":"ko","text":"파일을 삭제하지 마세요. 18개 항목을 24시간 동안 보관하세요.","meaning":"不要删除；18项；保存24小时"},
+  {"language":"fr","text":"Je peux utiliser cette application aujourd'hui, mais je ne peux pas l'utiliser demain.","meaning":"今天能使用，明天不能使用"},
+  {"language":"fr","text":"Ne supprimez pas le fichier. Conservez les 18 éléments pendant 24 heures.","meaning":"不要删除；18项；保存24小时"},
+  {"language":"de","text":"Ich kann diese App heute benutzen, aber morgen kann ich sie nicht benutzen.","meaning":"今天能使用，明天不能使用"},
+  {"language":"de","text":"Löschen Sie die Datei nicht. Bewahren Sie alle 18 Einträge für 24 Stunden auf.","meaning":"不要删除；18项；保存24小时"},
+  {"language":"es","text":"Puedo usar esta aplicación hoy, pero no puedo usarla mañana.","meaning":"今天能使用，明天不能使用"},
+  {"language":"es","text":"No elimines el archivo. Conserva los 18 elementos durante 24 horas.","meaning":"不要删除；18项；保存24小时"},
+  {"language":"ru","text":"Сегодня я могу использовать это приложение, но завтра не смогу.","meaning":"今天能使用，明天不能使用"},
+  {"language":"ru","text":"Не удаляйте файл. Сохраните все 18 элементов на 24 часа.","meaning":"不要删除；18项；保存24小时"},
+  {"language":"pt","text":"Posso usar este aplicativo hoje, mas não posso usá-lo amanhã.","meaning":"今天能使用，明天不能使用"},
+  {"language":"pt","text":"Não exclua o arquivo. Guarde todos os 18 itens por 24 horas.","meaning":"不要删除；18项；保存24小时"},
+  {"language":"it","text":"Posso usare questa applicazione oggi, ma non posso usarla domani.","meaning":"今天能使用，明天不能使用"},
+  {"language":"it","text":"Non eliminare il file. Conserva tutti i 18 elementi per 24 ore.","meaning":"不要删除；18项；保存24小时"},
+  {"language":"ar","text":"يمكنني استخدام هذا التطبيق اليوم، لكن لا يمكنني استخدامه غدًا.","meaning":"今天能使用，明天不能使用"},
+  {"language":"ar","text":"لا تحذف الملف. احتفظ بجميع العناصر الـ18 لمدة 24 ساعة.","meaning":"不要删除；18项；保存24小时"},
+  {"language":"zh","text":"中文保持原样，不要重新翻译。18项保存24小时。","meaning":"必须字节保持原样"}
+]
