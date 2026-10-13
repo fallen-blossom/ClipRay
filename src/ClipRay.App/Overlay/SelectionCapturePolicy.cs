@@ -80,17 +80,22 @@ public static class SelectionCapturePolicy
             .ToArray();
     }
 
-    private static bool BelongsToSelection(PixelRect selection, PixelRect candidate)
+    private static bool BelongsToSelection(PixelRect selection, PixelRect candidate) => Classify(selection,candidate)=="selected";
+
+    internal static string WordDisposition(PixelRect selection,PixelRect captureBounds,PixelRect candidate) =>
+        Classify(new(selection.X-captureBounds.X,selection.Y-captureBounds.Y,selection.Width,selection.Height),candidate);
+
+    private static string Classify(PixelRect selection, PixelRect candidate)
     {
         var x = candidate.Left + candidate.Width / 2;
         var y = candidate.Top + candidate.Height / 2;
         if (x < selection.Left || x > selection.Right || y < selection.Top || y > selection.Bottom)
-            return false;
-        if (!TryIntersect(selection, candidate, out var overlap)) return false;
+            return "center-outside-selection";
+        if (!TryIntersect(selection, candidate, out var overlap)) return "no-overlap";
 
         // Padding gives OCR context, but a neighboring row belongs to the user's
         // selection only when most of its glyph box is actually inside it.
-        return overlap.Height / candidate.Height >= 0.60;
+        return overlap.Height / candidate.Height >= 0.60 ? "selected" : "height-overlap-below-0.60";
     }
 
     private static bool TryIntersect(PixelRect first, PixelRect second, out PixelRect intersection)

@@ -5,11 +5,12 @@ param(
     [string] $OutputDirectory,
     [string] $PreparedStaging,
     [ValidateSet('Lite', 'Full')]
-    [string] $Flavor = 'Full',
+    [string] $Flavor = 'Lite',
     [switch] $KeepStaging
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Release-Identity.ps1')
 $WorkspaceRoot = [IO.Path]::GetFullPath($WorkspaceRoot)
 $artifactsRoot = Join-Path $WorkspaceRoot 'artifacts'
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
@@ -38,6 +39,13 @@ $sourceCommit = & git -C $WorkspaceRoot rev-parse --verify HEAD
 if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Installer source must be a Git commit.' }
 & git -C $WorkspaceRoot diff --quiet HEAD --
 if ($LASTEXITCODE -ne 0) { throw 'Commit tracked changes before building an installer and its corresponding source.' }
+$untrackedInputs = @(& git -C $WorkspaceRoot ls-files --others --exclude-standard)
+if ($LASTEXITCODE -ne 0 -or $untrackedInputs.Count -gt 0) { throw 'Commit or move untracked inputs before building an installer from an exact source revision.' }
+$informationalVersion = "$appVersion+$sourceCommit"
+Assert-ReleaseOrdinaryPath $OutputDirectory
+$sourceArchive = Join-Path $OutputDirectory "ClipRay-$appVersion-source.zip"
+Assert-SourceArchiveRevision $sourceArchive $appVersion $sourceCommit
+if ($reusePreparedStaging) { Assert-ReleaseIdentity $staging $sourceCommit $informationalVersion $Flavor }
 
 function Assert-ChildPath([string] $Path, [string] $Parent) {
     $fullPath = [IO.Path]::GetFullPath($Path)
@@ -157,7 +165,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "ClipRay win-x64 restore failed with exit code $LASTEXITCODE." }
         & dotnet publish (Join-Path $WorkspaceRoot 'src\ClipRay.App\ClipRay.App.csproj') `
             -c Release -r win-x64 --self-contained true --no-restore `
-            -p:DebugType=None -p:DebugSymbols=false -p:ClipRayIncludeCudaRuntime=$($includeLocalModel.ToString().ToLowerInvariant()) -o $staging | Out-Host
+            -p:DebugType=None -p:DebugSymbols=false "-p:InformationalVersion=$informationalVersion" -p:IncludeSourceRevisionInInformationalVersion=false -p:ClipRayIncludeCudaRuntime=$($includeLocalModel.ToString().ToLowerInvariant()) -o $staging | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "ClipRay publish failed with exit code $LASTEXITCODE." }
 
         New-Item -ItemType Directory -Path (Join-Path $staging 'licenses') -Force | Out-Null
@@ -222,20 +230,12 @@ try {
     }
     if ($forbidden) { throw "Release staging contains forbidden development files: $($forbidden.FullName -join ', ')" }
 
-    $manifestPath = Join-Path $staging 'release-manifest.json'
-    if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force }
-    $manifest = Get-ChildItem -LiteralPath $staging -Recurse -File | Sort-Object FullName | ForEach-Object {
-        [pscustomobject]@{
-            Path = $_.FullName.Substring($staging.TrimEnd([IO.Path]::DirectorySeparatorChar).Length + 1).Replace('\', '/')
-            Size = $_.Length
-            Sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash
-        }
+    if (-not $reusePreparedStaging) {
+        Set-Content -LiteralPath (Join-Path $staging 'install-exit-protocol.txt') -Value 'ClipRay.InstallExit.1' -Encoding ascii
+        Write-ReleaseIdentity $staging $sourceCommit $informationalVersion $Flavor
     }
-    ConvertTo-Json -InputObject @($manifest) -Depth 3 | Set-Content -LiteralPath $manifestPath -Encoding utf8
-    $parsedManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    if ($parsedManifest.Count -ne $manifest.Count -or $parsedManifest.Path -contains 'release-manifest.json') {
-        throw 'Release manifest is not a flat payload array or contains itself.'
-    }
+    Assert-ReleaseIdentity $staging $sourceCommit $informationalVersion $Flavor
+    Assert-SourceArchiveRevision $sourceArchive $appVersion $sourceCommit
 
     & $IsccPath "/DStagingDir=$staging" "/DOutputDir=$OutputDirectory" "/DSetupFlavor=$Flavor" $installerDefinition | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed with exit code $LASTEXITCODE." }

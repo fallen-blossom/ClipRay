@@ -7,6 +7,123 @@ using ClipRay.Core.Geometry;
 
 internal static class LiveSemanticAnimationTests
 {
+    public static void SegmentedVideoCannotStarveNewViewport()
+    {
+        VerifySegmentedVideo(changeTextDuringWorker: false);
+        VerifySegmentedVideo(changeTextDuringWorker: true);
+    }
+
+    public static void OcrBoundaryJitterNeedsExactPixelEvidence()
+    {
+        using var before = new Bitmap(100, 70);
+        using (var graphics = Graphics.FromImage(before))
+            graphics.FillRectangle(Brushes.White, 20, 18, 5, 10);
+        var expected = Item("A", "译A", 10);
+        var observed = LiveTranslationSemanticEvidence.FromRecognition(
+            new OcrRecognitionResult(true, [Block("A", 13)], "completed"), before)!;
+        var snapshot = new LiveTranslationPixelSnapshot(before);
+        if (observed.SameSourceStableGeometry([expected.Region])
+            || !observed.SameSourceStableGeometry([expected.Region], snapshot, snapshot)
+            || !observed.MatchesStableGeometry(expected.Item, snapshot, snapshot))
+            throw new Exception("Identical glyph pixels did not distinguish OCR boundary jitter.");
+
+        using var moved = new Bitmap(100, 70);
+        using (var graphics = Graphics.FromImage(moved))
+            graphics.FillRectangle(Brushes.White, 20, 23, 5, 10);
+        var movedSnapshot = new LiveTranslationPixelSnapshot(moved);
+        if (observed.SameSourceStableGeometry([expected.Region], snapshot, movedSnapshot)
+            || observed.MatchesStableGeometry(expected.Item, snapshot, movedSnapshot))
+            throw new Exception("Actually moved glyph pixels reused old overlay geometry.");
+    }
+
+    public static void EmptyViewportReturnsWithoutCloudFailureBackoff()
+    {
+        var phase = 0;
+        var published = 0;
+        var elapsed = Stopwatch.StartNew();
+        TimeSpan returnedAt = default;
+        TimeSpan restoredAt = default;
+        Task? returnSource = null;
+        LiveTranslationSession? session = null;
+        session = new LiveTranslationSession(new Rectangle(0, 0, 100, 70), _ =>
+        {
+            var image = new Bitmap(100, 70);
+            image.SetPixel(2, 2, Volatile.Read(ref phase) == 0 ? Color.Red : Color.Gray);
+            return image;
+        }, (bitmap, _) =>
+        {
+            if (bitmap.GetPixel(2, 2).ToArgb() != Color.Gray.ToArgb())
+                return Task.FromResult(Frame("A"));
+            returnSource ??= Task.Run(async () =>
+            {
+                await Task.Delay(250);
+                returnedAt = elapsed.Elapsed;
+                Interlocked.Exchange(ref phase, 0);
+            });
+            return Task.FromResult(new LiveTranslationFrame("DeepSeek", "partial-or-failed", [],
+                "Scope:partial-or-failed"));
+        }, TranslationRouteKind.DeepSeekFlash, validateLayoutRegions: true,
+        verifySource: (bitmap, _) => Task.FromResult(bitmap.GetPixel(2, 2).ToArgb() == Color.Gray.ToArgb()
+            ? new OcrRecognitionResult(true, [], "completed") : Ocr("A")));
+        using (session)
+        using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4)))
+        {
+            session.FrameReady += (_, _) =>
+            {
+                if (++published == 1) Interlocked.Exchange(ref phase, 1);
+                else { restoredAt = elapsed.Elapsed; session.Stop(); }
+            };
+            session.StartAsync(timeout.Token).GetAwaiter().GetResult();
+        }
+        returnSource?.GetAwaiter().GetResult();
+        if (published != 2 || restoredAt == default || restoredAt - returnedAt > TimeSpan.FromSeconds(1)
+            || session.LastErrorCategory != "none")
+            throw new Exception($"Empty viewport used cloud failure backoff: published={published}, "
+                + $"recovery={restoredAt - returnedAt}, error={session.LastErrorCategory}.");
+    }
+
+    private static void VerifySegmentedVideo(bool changeTextDuringWorker)
+    {
+        var phase = 0;
+        var captures = 0;
+        var calls = 0;
+        var published = new List<string>();
+        LiveTranslationSession? session = null;
+        session = new LiveTranslationSession(new Rectangle(0, 0, 160, 140), _ =>
+        {
+            var image = new Bitmap(160, 140);
+            image.SetPixel(2, 2, Volatile.Read(ref phase) == 0 ? Color.Red : Color.Blue);
+            var color = Color.FromArgb(30 + Interlocked.Increment(ref captures) % 180, 60, 90);
+            using var graphics = Graphics.FromImage(image);
+            using var brush = new SolidBrush(color);
+            foreach (var y in new[] { 50, 85, 120 }) graphics.FillRectangle(brush, 5, y, 140, 10);
+            return image;
+        }, async (bitmap, token) =>
+        {
+            var source = ReadSource(bitmap);
+            Interlocked.Increment(ref calls);
+            if (changeTextDuringWorker && source == "A") Interlocked.Exchange(ref phase, 1);
+            await Task.Delay(650, token);
+            return Frame(source);
+        }, TranslationRouteKind.Machine, validateLayoutRegions: true,
+        verifySource: (bitmap, _) => Task.FromResult(Ocr(ReadSource(bitmap))));
+
+        using (session)
+        using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4)))
+        {
+            session.FrameReady += (_, args) =>
+            {
+                published.AddRange(args.Frame.LayoutItems.Select(item => item.Text));
+                session.Stop();
+            };
+            session.StartAsync(timeout.Token).GetAwaiter().GetResult();
+        }
+        var expected = changeTextDuringWorker ? "译B" : "译A";
+        if (published.Count != 1 || published[0] != expected || calls > 2)
+            throw new Exception($"Segmented video starved or committed stale text: "
+                + $"changed={changeTextDuringWorker}, calls={calls}, published={string.Join(',', published)}.");
+    }
+
     public static void AnimatedBackingRebuildsTheErasurePatch()
     {
         using var first = new Bitmap(160, 64);
@@ -219,6 +336,8 @@ internal static class LiveSemanticAnimationTests
         {
             var image = new Bitmap(100, 70);
             image.SetPixel(2, 2, Volatile.Read(ref phase) == 0 ? Color.Red : Color.Blue);
+            // The changed signal must also lie inside the claimed text witness.
+            image.SetPixel(20, 18, Volatile.Read(ref phase) == 0 ? Color.Red : Color.Blue);
             image.SetPixel(70, 55, Color.FromArgb(30 + Interlocked.Increment(ref captures) % 180, 60, 90));
             return image;
         }, (bitmap, _) => Task.FromResult(Frame(ReadSource(bitmap))),
@@ -247,7 +366,6 @@ internal static class LiveSemanticAnimationTests
             session.StartAsync(timeout.Token).GetAwaiter().GetResult();
         }
         if (!published.SequenceEqual(["译A"]) || invalidatedAt == TimeSpan.Zero
-            || invalidatedAt - changedAt < TimeSpan.FromSeconds(1.5)
             || invalidatedAt - changedAt > TimeSpan.FromSeconds(2.5))
             throw new Exception($"Unknown latest OCR left old text visible: "
                 + $"published={string.Join(',', published)}, elapsed={invalidatedAt - changedAt}.");

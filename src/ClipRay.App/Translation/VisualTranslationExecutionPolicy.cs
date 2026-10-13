@@ -20,12 +20,14 @@ public static class VisualTranslationExecutionPolicy
         IDeepSeekTranslationProvider provider,
         Action<DeepSeekCostEstimate?>? recordCost,
         CancellationToken cancellationToken,
-        TimeSpan? budget = null)
+        TimeSpan? budget = null,
+        string? credentialName = null)
     {
         ArgumentNullException.ThrowIfNull(requests);
         ArgumentNullException.ThrowIfNull(vault);
         ArgumentNullException.ThrowIfNull(provider);
-        if (vault.GetForUse(CredentialVault.FixedDeepSeekSlot) is null)
+        credentialName ??= CredentialVault.FixedDeepSeekSlot;
+        if (vault.GetForUse(credentialName) is null)
         {
             return requests.Select(static _ =>
                 new TranslationResult(false, string.Empty, "credential-missing")).ToArray();
@@ -41,10 +43,10 @@ public static class VisualTranslationExecutionPolicy
             });
             var results = await provider.TranslateBlocksAsync(
                 requests,
-                CredentialVault.FixedDeepSeekSlot,
+                credentialName,
                 deadline.Token).ConfigureAwait(false);
-            recordCost?.Invoke(results.Select(static result => result.CostEstimate)
-                .FirstOrDefault(static estimate => estimate is not null));
+            TranslationCostRecording.TryRecord(results.Select(static result => result.CostEstimate)
+                .FirstOrDefault(static estimate => estimate is not null), recordCost);
             return results;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)

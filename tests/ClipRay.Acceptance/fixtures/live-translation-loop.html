@@ -10,6 +10,7 @@
     .controls { position: fixed; top: 24px; right: 24px; z-index: 1; width: 200px; padding: 16px; background: white; border: 1px solid #aab4c0; border-radius: 10px; }
     .controls button { display: block; width: 100%; margin: 10px 0; padding: 10px; font-size: 15px; }
     .controls output { display: block; margin-top: 12px; font-weight: bold; }
+    #source-evidence { max-height: 160px; overflow: auto; font-size: 10px; white-space: pre-wrap; }
     main { width: min(720px, calc(100% - 280px)); min-width: 420px; margin: 32px auto 80px; }
     article { min-height: 170px; margin-bottom: 22px; padding: 26px; background: white; border: 1px solid #c7d0da; border-radius: 10px; }
     article h2 { margin: 0 0 18px; font-size: 25px; }
@@ -26,6 +27,10 @@
     }
     @keyframes backdrop-drift { to { transform: translateX(38px); } }
     #changing p:empty::before { content: ""; }
+    .metadata { margin-bottom: 12px; font-size: 15px; color: #687787; }
+    .link { color: #087fbd; }
+    article p + p { margin-top: 16px; }
+    video { display: block; width: 100%; height: 160px; margin-top: 20px; background: #17212e; }
   </style>
 </head>
 <body>
@@ -35,9 +40,13 @@
     <button id="show-b" type="button">Show B</button>
     <button id="clear" type="button">Clear first card</button>
     <button id="toggle-animation" type="button">Start background animation</button>
+    <button id="toggle-video" type="button">Pause video</button>
+    <button id="export-source" type="button">Export source evidence</button>
     <output id="state" aria-live="polite">A</output>
     <output id="animation-state" aria-live="polite">Animation off</output>
+    <output id="video-state" aria-live="polite">Video starting</output>
     <output id="change-time" aria-label="Last fixture change time"></output>
+    <pre id="source-evidence" hidden aria-label="Exported source evidence"></pre>
   </aside>
   <main aria-label="Translation source column">
     <article id="changing">
@@ -45,6 +54,14 @@
       <p id="changing-text">The blue train leaves at eight. Keep ticket XR-17 until arrival.</p>
     </article>
     <article><h2>Library notice</h2><p>Return the borrowed book before Friday. The library closes at six.</p></article>
+    <article id="mixed-video">
+      <div class="metadata">Alex Chen · @clipray_test · 12:30</div>
+      <h2>Video and mixed languages</h2>
+      <p>The video keeps playing while this sentence stays unchanged.</p>
+      <p>这段中文应保留原样，不应再次翻译。</p>
+      <p class="link">Read the full update before changing the settings.</p>
+      <video id="moving-video" muted autoplay playsinline aria-label="Locally generated moving test video"></video>
+    </article>
     <article><h2>Travel notice</h2><p>Platform four is closed today. Please use the stairs near the south entrance.</p></article>
     <article><h2>Safety notice</h2><p>Do not leave bags unattended. Ask a member of staff if you need help.</p></article>
     <article><h2>Meeting notice</h2><p>The meeting starts at nine in room B-12. Bring the printed schedule.</p></article>
@@ -53,6 +70,13 @@
     <article><h2>Final notice</h2><p>The last bus leaves at ten. Keep your receipt until the end of the journey.</p></article>
   </main>
   <script>
+    // Independent source facts for local acceptance. The product still reads
+    // pixels through its normal capture/OCR pipeline, never this DOM data.
+    const sourceEvents = [];
+    function recordSourceEvent(kind, details = {}) {
+      sourceEvents.push({ sequence: sourceEvents.length + 1, kind,
+        time: new Date().toISOString(), monotonicMs: performance.now(), ...details });
+    }
     const states = Object.freeze({
       A: 'The blue train leaves at eight. Keep ticket XR-17 until arrival.',
       B: 'The red train leaves at nine. Keep ticket XR-17 until arrival.',
@@ -63,6 +87,7 @@
       document.getElementById('state').textContent = name;
       document.body.dataset.fixtureState = name;
       document.getElementById('change-time').textContent = new Date().toISOString();
+      recordSourceEvent('text-change', { state: name, text: states[name] });
     }
     document.getElementById('show-a').addEventListener('click', () => setState('A'));
     document.getElementById('show-b').addEventListener('click', () => setState('B'));
@@ -73,6 +98,76 @@
       document.getElementById('toggle-animation').textContent = active
         ? 'Stop background animation' : 'Start background animation';
       document.getElementById('change-time').textContent = new Date().toISOString();
+      recordSourceEvent('background-animation', { active });
+    });
+    const video = document.getElementById('moving-video');
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = 160;
+    const context = canvas.getContext('2d');
+    let generatedFrames = 0;
+    function drawVideoFrame(time) {
+      context.fillStyle = '#17212e';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      for (let i = 0; i < 7; i++) {
+        context.fillStyle = i % 2 ? '#58a7ca' : '#dea854';
+        context.fillRect((time / 5 + i * 110) % 760 - 100, 15 + i % 3 * 42, 80, 30);
+      }
+      generatedFrames++;
+      requestAnimationFrame(drawVideoFrame);
+    }
+    requestAnimationFrame(drawVideoFrame);
+    if (canvas.captureStream) {
+      video.srcObject = canvas.captureStream(24);
+      video.play().catch(error => {
+        document.getElementById('video-state').textContent = 'Video blocked: ' + error.name;
+        recordSourceEvent('video-error', { error: error.name });
+      });
+    } else {
+      document.getElementById('video-state').textContent = 'Video unsupported';
+      recordSourceEvent('video-error', { error: 'captureStream-unsupported' });
+    }
+    video.addEventListener('playing', () => {
+      document.getElementById('video-state').textContent = 'Video playing';
+      recordSourceEvent('video-playing');
+    });
+    document.getElementById('toggle-video').addEventListener('click', () => {
+      if (video.paused) video.play(); else video.pause();
+      document.getElementById('toggle-video').textContent = video.paused ? 'Play video' : 'Pause video';
+      document.getElementById('video-state').textContent = video.paused ? 'Video paused' : 'Video playing';
+      recordSourceEvent('video-toggle', { paused: video.paused });
+    });
+    let scrollTimer;
+    window.addEventListener('scroll', () => {
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => recordSourceEvent('scroll-settled', { y: scrollY }), 150);
+    }, { passive: true });
+    window.cliprayFixture = Object.freeze({
+      setState,
+      snapshot: () => ({ time: new Date().toISOString(), state: document.body.dataset.fixtureState,
+        scrollY, generatedFrames, video: { paused: video.paused, currentTime: video.currentTime,
+          readyState: video.readyState }, events: sourceEvents.slice(),
+        source: Array.from(document.querySelectorAll('main h2, main p, main .metadata'), element => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return { text: element.textContent, rect: { x: rect.x, y: rect.y,
+            width: rect.width, height: rect.height }, fontSize: style.fontSize,
+            lineHeight: style.lineHeight, color: style.color };
+        }) })
+    });
+    document.getElementById('export-source').addEventListener('click', () => {
+      const serialized = JSON.stringify(window.cliprayFixture.snapshot(), null, 2);
+      const evidence = document.getElementById('source-evidence');
+      evidence.textContent = serialized;
+      evidence.hidden = false;
+      const blob = new Blob([serialized],
+        { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'clipray-fixture-source.json';
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
     setState('A');
   </script>

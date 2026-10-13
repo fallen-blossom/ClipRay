@@ -10,9 +10,15 @@ TRADEMARKS.md
 THIRD_PARTY_NOTICES.md
 src
 tests
-scripts
+scripts/Build-Installer.ps1
+scripts/Publish-Local.ps1
+scripts/Release-Identity.ps1
+scripts/Export-PublicSource.ps1
+scripts/public-source-paths.txt
+scripts/Collect-PackageNotices.ps1
+scripts/Convert-LmtToGguf.ps1
+scripts/Get-LmtModel.ps1
 installer/ClipRay.iss
-installer/ClipRay.RecordingDiagnosticPatch.iss
 installer/Languages/ChineseSimplified.isl
 licenses
 docs/ClipRay-使用教程.html

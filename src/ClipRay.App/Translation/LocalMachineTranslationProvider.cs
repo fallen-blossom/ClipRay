@@ -31,7 +31,7 @@ public sealed class LocalMachineTranslationProvider(IMachineTranslationProcess p
     Action<string, string, TranslationInvariantMismatch>? onIntegrityFailure = null,
     bool supportsCommonLanguages = false,
     Action<string, string>? onProtectedFailure = null)
-    : IMachineTranslationProvider, IDisposable
+    : IMachineTranslationProvider, IDisposable, IAsyncDisposable
 {
     private readonly IMachineTranslationProcess _process = process ?? throw new ArgumentNullException(nameof(process));
     private static readonly Dictionary<string,string> ControlTerms = new(StringComparer.OrdinalIgnoreCase)
@@ -293,7 +293,12 @@ public sealed class LocalMachineTranslationProvider(IMachineTranslationProcess p
         return results;
     }
 
-    public void Dispose() => (_process as IDisposable)?.Dispose();
+    public void Dispose() => _ = DisposeAsync();
+    public async ValueTask DisposeAsync()
+    {
+        if (_process is IAsyncDisposable asyncDisposable) await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+        else if (_process is IDisposable disposable) await Task.Run(disposable.Dispose).ConfigureAwait(false);
+    }
 
     private static bool ShouldPreserveWithoutModel(TranslationRequest request) =>
         IsSimplifiedChinese(request.SourceLanguage)

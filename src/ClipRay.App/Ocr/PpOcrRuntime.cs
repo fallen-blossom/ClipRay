@@ -189,24 +189,32 @@ internal sealed class PpOcrRuntime : IOcrRuntime, IOcrWarmup, IDisposable
     }
 }
 
-internal sealed class FastFirstOcrRuntime(IOcrRuntime fast, IOcrRuntime fallback) : IOcrRuntime, IOcrWarmup, IDisposable
+internal sealed class FastFirstOcrRuntime(IOcrRuntime fast, IOcrRuntime fallback) : IOcrRuntime, IOcrWarmup, IDisposable, IAsyncDisposable
 {
     public async Task<IReadOnlyList<OcrWord>> RecognizeAsync(Bitmap bitmap, CancellationToken cancellationToken)
     {
+        IReadOnlyList<OcrWord> words = [];
         try
         {
-            var words = await fast.RecognizeAsync(bitmap, cancellationToken).ConfigureAwait(false);
-            if (words.Count > 0) return words;
+            words = await fast.RecognizeAsync(bitmap, cancellationToken).ConfigureAwait(false);
+            if (!OcrQualityPolicy.NeedsReview(words, bitmap.Width, bitmap.Height)) return words;
         }
         catch (OperationCanceledException) { throw; }
         catch { }
-        return await fallback.RecognizeAsync(bitmap, cancellationToken).ConfigureAwait(false);
+        try { return OcrQualityPolicy.Choose(words, await fallback.RecognizeAsync(bitmap, cancellationToken).ConfigureAwait(false)); }
+        catch (OperationCanceledException) { throw; }
+        catch when (words.Count > 0) { return words; }
     }
 
     public void Dispose()
     {
-        if (fast is IDisposable fastDisposable) fastDisposable.Dispose();
-        if (fallback is IDisposable fallbackDisposable) fallbackDisposable.Dispose();
+        _ = DisposeAsync();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try { await OcrRuntimeRelease.ReleaseAsync(fast).ConfigureAwait(false); }
+        finally { await OcrRuntimeRelease.ReleaseAsync(fallback).ConfigureAwait(false); }
     }
 
     public Task WarmupAsync(CancellationToken cancellationToken) =>

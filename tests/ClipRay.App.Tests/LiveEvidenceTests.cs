@@ -9,15 +9,63 @@ using ClipRay.App.Translation;
 
 internal static class LiveEvidenceTests
 {
+    public static void DataBundleKeepsFrameAndRenderEvidenceWithoutImages()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "ClipRay-live-data-tests", Guid.NewGuid().ToString("N"));
+        var identity = new LiveTranslationWorkIdentity(1, 2, 3);
+        string directory;
+        using (var trace = new LiveTranslationAcceptanceTrace(root, dataOnlyOverride: true))
+        {
+            directory = trace.SessionDirectory!;
+            trace.Record("session_context", data: new {
+                AppVersion = "test", ExecutableSha256 = new string('a', 64),
+                Region = new Rectangle(0, 0, 2, 2), Monitor = new Rectangle(0, 0, 2, 2),
+                Route = "Machine", TargetLanguage = "简体中文", ShowInRecordings = false
+            });
+            using var source = new Bitmap(2, 2);
+            using (var graphics = Graphics.FromImage(source)) graphics.Clear(System.Drawing.Color.FromArgb(255, 20, 40, 60));
+            trace.SaveSource(source, identity);
+            trace.Record("region_decisions", identity: identity, data: new { Layouts = 1 });
+            trace.Record("applied", 1, identity, new { State = "Ready", Layouts = 1 });
+            var pixels = Enumerable.Range(0, 4).SelectMany(_ => new byte[] { 60, 40, 20, 255 }).ToArray();
+            trace.SaveRendered(BitmapSource.Create(2, 2, 96, 96, PixelFormats.Bgra32, null, pixels, 8), 1, identity);
+            trace.Record("render_cycle_observed", 1, identity, new { Visible = true, Layouts = 1 });
+            trace.Record("ended");
+        }
+        if (Directory.EnumerateFiles(directory, "*.png").Any())
+            throw new Exception("Data-only tracing still persists image artifacts.");
+        using var manifest = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "manifest.json")));
+        if (!manifest.RootElement.GetProperty("complete").GetBoolean()
+            || manifest.RootElement.GetProperty("schema_version").GetString() != LiveTranslationAcceptanceTrace.DataSchemaVersion
+            || manifest.RootElement.GetProperty("evidence_mode").GetString() != "data")
+            throw new Exception("Data-only evidence lost its explicit schema or complete render chain.");
+        var expected = Convert.ToHexString(SHA256.HashData(
+            Enumerable.Range(0, 4).SelectMany(_ => new byte[] { 60, 40, 20, 255 }).ToArray())).ToLowerInvariant();
+        var fingerprints = File.ReadAllLines(Path.Combine(directory, "events.jsonl"))
+            .Select(line => JsonDocument.Parse(line)).Where(d => d.RootElement.GetProperty("kind").GetString()!
+                .EndsWith("_frame_fingerprint")).ToArray();
+        try
+        {
+            if (fingerprints.Length != 2 || fingerprints.Any(d =>
+                d.RootElement.GetProperty("data").GetProperty("sha256").GetString() != expected
+                || d.RootElement.GetProperty("data").GetProperty("byte_count").GetInt64() != 16))
+                throw new Exception("Source or rendered fingerprint does not match independently known BGRA bytes.");
+        }
+        finally { foreach (var document in fingerprints) document.Dispose(); }
+    }
+
     public static void BundleHasLinkedContentAndChecksums()
     {
         var root = Path.Combine(Path.GetTempPath(), "ClipRay-live-evidence-tests", Guid.NewGuid().ToString("N"));
         try
         {
             var priorRoot = Environment.GetEnvironmentVariable("CLIPRAY_LIVE_ACCEPTANCE_ROOT");
+            var priorMode = Environment.GetEnvironmentVariable("CLIPRAY_LIVE_EVIDENCE_MODE");
             try
             {
                 Environment.SetEnvironmentVariable("CLIPRAY_LIVE_ACCEPTANCE_ROOT", root);
+                // This case deliberately verifies the explicit private-content diagnostic mode.
+                Environment.SetEnvironmentVariable("CLIPRAY_LIVE_EVIDENCE_MODE", "content");
                 using (LiveTranslationWorkContext.Push(new LiveTranslationWorkIdentity(7, 8, 9)))
                 {
                     LiveTranslationAcceptanceTrace.RecordProtectedFailure(
@@ -40,13 +88,13 @@ internal static class LiveEvidenceTests
                     || integrityFailure.RootElement.GetProperty("mismatch").GetString() != "Number")
                     throw new Exception("Machine failure evidence lost source, rejected output, or frame identity.");
             }
-            finally { Environment.SetEnvironmentVariable("CLIPRAY_LIVE_ACCEPTANCE_ROOT", priorRoot); }
+            finally { Environment.SetEnvironmentVariable("CLIPRAY_LIVE_ACCEPTANCE_ROOT", priorRoot);Environment.SetEnvironmentVariable("CLIPRAY_LIVE_EVIDENCE_MODE",priorMode); }
             using (var rejectedNetworkTrace = new LiveTranslationAcceptanceTrace(@"\\server\share"))
                 if (rejectedNetworkTrace.Enabled)
                     throw new Exception("Private live evidence accepted a network root.");
             var identity = new LiveTranslationWorkIdentity(1, 2, 3);
             string sessionDirectory;
-            using (var trace = new LiveTranslationAcceptanceTrace(root))
+            using (var trace = new LiveTranslationAcceptanceTrace(root,dataOnlyOverride:false))
             {
                 if (!trace.Enabled || trace.SessionDirectory is null)
                     throw new Exception("Local evidence trace did not start.");

@@ -35,7 +35,12 @@ public partial class App : System.Windows.Application
     private ImageOutputService? _longCaptureOutputService;
     private ApplicationPathSet? _paths;
     private ITranslationRunLogWriter? _translationRunLogWriter;
-    private HotkeyHost? _hotkeyHost;
+    private IGlobalHotkeyHost? _hotkeyHost;
+    private GlobalHotkeyRegistration? _hotkeyRegistration;
+    private HotkeyRegistrationResult _lastHotkeyRegistration = HotkeyRegistrationResult.Empty;
+    internal Func<IGlobalHotkeyHost>? HotkeyHostFactory { get; set; }
+    internal string? LastExitWarning { get; private set; }
+    private Task<bool>? _managedShutdownAttempt;
     private Forms.NotifyIcon? _trayIcon;
     private Icon? _applicationIcon;
     private SelectionOverlayWindow? _overlay;
@@ -46,9 +51,14 @@ public partial class App : System.Windows.Application
     private LiveTranslationEscapeListener? _liveTranslationEscape;
     private LiveTranslationOverlayWindow? _liveTranslationOverlay;
     private LiveTranslationStopControlWindow? _liveTranslationStopControl;
-    private bool _liveTranslationSelectionActive;
+    private readonly LiveTranslationStartupCoordinator _liveStartup = new();
+    internal Func<LiveTranslationOperation, Task<ClipRay.Core.Geometry.PixelRect?>>? LiveSelectionFactory { get; set; }
+    internal Func<LiveTranslationOperation, Task>? LiveWarmupFactory { get; set; }
+    internal Func<LiveTranslationOperation, ClipRay.Core.Geometry.PixelRect, Task>? LiveSessionFactory { get; set; }
+    internal Func<Rectangle, CancellationToken, Func<Rectangle, Bitmap>, Task<LiveTranslationScreenCapture>>? LiveCaptureFactory { get; set; }
     private readonly UiOperationOwner _overlayTranslationOperations = new();
     private readonly TranslationRuntimeServices _translationServices;
+    private DeepSeekTranslationProvider? _liveCloudProvider;
     private readonly TranslationApplicationOrchestrator _translationOrchestrator;
     private readonly OcrService _machineOcr = OcrService.CreateForCommonMachine();
     private readonly SemaphoreSlim _ocrGate = new(1, 1);
@@ -57,26 +67,30 @@ public partial class App : System.Windows.Application
     private LocalTranslationProvider? _localTranslationProvider;
     private IMachineTranslationProvider? _machineTranslationProvider;
     private Task? _machineTranslationWarmup;
+    private readonly ResourceRetirementRegistry _translationRetirements = new();
+    private readonly AsyncResourceLifetime _translationRequests = new();
+    private AsyncResourceLifetime _localProviderOwners = new();
+    private Task? _localProviderRetirement;
+    private LocalTranslationProvider? _retiringLocalProvider;
+    private bool _translationClosing;
+    internal Action? RegisterHotkeysOverride { get; set; }
+    internal Action<Action>? LiveDisplayDispatcher { get; set; }
+    internal Func<LocalTranslationProvider>? LocalProviderFactory { get; set; }
     private CancellationTokenSource? _longCaptureCancellation;
     private ScrollCaptureControlWindow? _longCaptureControls;
     private ScrollCaptureBorderWindow? _longCaptureBorder;
     private ScrollCapturePreviewWindow? _longCapturePreview;
     private HotkeyHost? _longCaptureHotkeyHost;
-    private RecordingSession? _recordingSession;
-    private bool _recordingStopRequested;
-    private RecordingBorderWindow? _recordingBorder;
-    private RecordingControlWindow? _recordingControl;
     private RecordingPreviewWindow? _recordingPreview;
     private Forms.ToolStripMenuItem? _stopRecordingMenuItem;
     private Forms.ToolStripMenuItem? _stopLiveTranslationMenuItem;
-    private RecordingOutputPaths? _recordingPaths;
     private SingleInstanceCoordinator? _singleInstance;
 
     public App()
     {
         _translationServices = new TranslationRuntimeServices(
             () => new DeepSeekTranslationProvider(_credentialVault),
-            () => new OcrService());
+            () => VisualOcrFactory?.Invoke() ?? new OcrService());
         _translationOrchestrator = new TranslationApplicationOrchestrator(
             RecognizeVisualAsync,
             TranslateVisualRequestsAsync);
@@ -85,23 +99,39 @@ public partial class App : System.Windows.Application
             TranslateVisualRequestsAsync);
     }
 
+    internal Func<OcrService>? VisualOcrFactory { get; set; }
+    internal string? ExtractionDiagnosticsRoot { get; set; }
+    internal Task WarmStartupOcrAsync() => Task.CompletedTask;
+
     private async Task<OcrRecognitionResult> RecognizeMachineAsync(Bitmap bitmap, CancellationToken token)
     {
-        await _ocrGate.WaitAsync(token);
-        try { return await _machineOcr.RecognizeAsync(bitmap, token); }
+        await _ocrGate.WaitAsync(token).ConfigureAwait(false);
+        try { return await _machineOcr.RecognizeAsync(bitmap, token).ConfigureAwait(false); }
         finally { _ocrGate.Release(); }
     }
 
     private async Task<OcrRecognitionResult> RecognizeVisualAsync(Bitmap bitmap, CancellationToken token)
     {
-        await _ocrGate.WaitAsync(token);
-        try { return await _translationServices.Ocr.RecognizeAsync(bitmap, token); }
+        await _ocrGate.WaitAsync(token).ConfigureAwait(false);
+        try { return await _translationServices.Ocr.RecognizeAsync(bitmap, token).ConfigureAwait(false); }
         finally { _ocrGate.Release(); }
     }
 
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        if (e.Args.Contains("--request-install-exit", StringComparer.OrdinalIgnoreCase))
+        {
+            Dispatcher.BeginInvoke(RunInstallExitHelper);
+            return;
+        }
+        // Only the exact exit helper may run while setup replaces application files.
+        // Keep normal starts, scheduled cleanup and uninstall cleanup out of that interval.
+        if (InstallerUpgradeGuard.IsActive())
+        {
+            Shutdown(3);
+            return;
+        }
         RegionAcceptanceCommand? acceptanceCommand = null;
         if (RegionAcceptanceCommand.IsRequested(e.Args)
             && !RegionAcceptanceCommand.TryParse(e.Args, out acceptanceCommand, out _))
@@ -111,15 +141,7 @@ public partial class App : System.Windows.Application
         }
         if (e.Args.Contains("--uninstall-cleanup", StringComparer.OrdinalIgnoreCase))
         {
-            var paths = ApplicationPaths.Create(
-                AppContext.BaseDirectory,
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
-            var recycleOutputs = e.Args.Contains("--recycle-outputs", StringComparer.OrdinalIgnoreCase);
-            var result = new UninstallCleanupService(
-                paths,
-                Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "ClipRay.App.exe"))
-                .Execute(recycleOutputs);
-            Shutdown(result.FailedOutputCount == 0 ? 0 : 2);
+            Dispatcher.BeginInvoke(() => RunUninstallCleanupHelper(e.Args.Contains("--recycle-outputs", StringComparer.OrdinalIgnoreCase)));
             return;
         }
 
@@ -196,7 +218,7 @@ public partial class App : System.Windows.Application
 
         if (e.Args.Contains("--long-capture-runtime-probe", StringComparer.OrdinalIgnoreCase))
         {
-            Dispatcher.BeginInvoke(StartLongCaptureRuntimeProbe);
+            Dispatcher.BeginInvoke(() => StartLongCaptureRuntimeProbe());
             return;
         }
 
@@ -227,26 +249,11 @@ public partial class App : System.Windows.Application
             "deepseek-cost-summary.json"));
         _settingsStore = new SettingsStore(settingsPath, _paths.InstallRoot);
         var loadResult = _settingsStore.LoadRecoverable();
-        if (_credentialVault.MigrateSelectedDeepSeekCredential(loadResult.Settings.CredentialName))
-        {
-            loadResult = loadResult with
-            {
-                Settings = loadResult.Settings with { CredentialName = CredentialVault.FixedDeepSeekSlot },
-                RequiresSave = true,
-            };
-        }
         var executablePath = Environment.ProcessPath
             ?? throw new InvalidOperationException("无法确定 ClipRay 可执行文件路径。");
         var startupEnabled = StartupRegistration.IsEnabled(executablePath);
-        if (loadResult.Settings.StartWithWindows != startupEnabled)
-        {
-            loadResult = loadResult with
-            {
-                Settings = loadResult.Settings with { StartWithWindows = startupEnabled },
-                RequiresSave = true,
-            };
-        }
-        if (loadResult.RequiresSave) _settingsStore.Save(loadResult.Settings);
+        loadResult = StartupSettingsReconciliation.Apply(loadResult, startupEnabled,
+            _credentialVault.MigrateSelectedDeepSeekCredential, _settingsStore.Save);
         var cleanupScheduleRegistration = new WindowsCleanupScheduleRegistration();
         var cleanupRepairWarning = ExternalSettingsReconciler.RepairCleanupSchedule(
             loadResult.Settings,
@@ -256,13 +263,48 @@ public partial class App : System.Windows.Application
             " ",
             new[] { loadResult.Warning, cleanupRepairWarning }.Where(static warning => !string.IsNullOrWhiteSpace(warning)));
         if (string.IsNullOrWhiteSpace(_settingsLoadWarning)) _settingsLoadWarning = null;
-        OutputDirectoryLayout.Ensure(loadResult.Settings);
+        PrepareOutputDirectories(loadResult.Settings);
         _settingsApplyCoordinator = new SettingsApplyCoordinator(
             _settingsStore,
             new WindowsStartupRegistration(),
             cleanupScheduleRegistration,
             executablePath);
         ApplySettings(loadResult.Settings, registerHotkeys: false);
+#if DEBUG
+        if (e.Args.Contains("--live-logged-runtime-probe", StringComparer.OrdinalIgnoreCase))
+        {
+            var index = Array.FindIndex(e.Args, value => value == "--live-logged-runtime-probe");
+            if (index < 0 || e.Args.Length < index + 6
+                || !string.Equals(Environment.GetEnvironmentVariable("CLIPRAY_LIVE_EVIDENCE_MODE"), "data", StringComparison.OrdinalIgnoreCase)
+                || !ScreenshotTranslationEvidence.TryResolveLocalRoot(
+                    Environment.GetEnvironmentVariable("CLIPRAY_LIVE_ACCEPTANCE_ROOT"), out _)
+                || !int.TryParse(e.Args[index + 1], out var x) || !int.TryParse(e.Args[index + 2], out var y)
+                || !int.TryParse(e.Args[index + 3], out var width) || !int.TryParse(e.Args[index + 4], out var height)
+                || !int.TryParse(e.Args[index + 5], out var seconds) || seconds is < 10 or > 180
+                || width <= 0 || height <= 0)
+            {
+                Shutdown(2);
+                return;
+            }
+            Dispatcher.BeginInvoke(async () =>
+            {
+                // Exercise the production fixed-region handler, without its selection dialog.
+                await Task.Delay(1500);
+                StartLiveTranslation(new ClipRay.Core.Geometry.PixelRect(x, y, width, height));
+                await Task.Delay(TimeSpan.FromSeconds(seconds));
+                StopLiveTranslation();
+                for (var step = 0; step < 100 && (_liveTranslationSession is not null || _liveTranslationStartup is not null); step++)
+                    await Task.Delay(100);
+                Shutdown(_liveTranslationSession is null && _liveTranslationStartup is null ? 0 : 2);
+            });
+            return;
+        }
+        if (e.Args.Contains("--long-capture-runtime-ui-probe", StringComparer.OrdinalIgnoreCase))
+        {
+            Dispatcher.BeginInvoke(() => StartLongCaptureRuntimeProbe(useProductionControls: true));
+            return;
+        }
+#endif
         if (acceptanceCommand is not null)
         {
             Dispatcher.BeginInvoke(async () =>
@@ -274,7 +316,7 @@ public partial class App : System.Windows.Application
         }
         CreateTrayIcon();
         RegisterHotkeys();
-        _ = _translationServices.Ocr.WarmupAsync(CancellationToken.None);
+        _ = WarmStartupOcrAsync();
 
 #if DEBUG
         if (e.Args.Contains("--settings-preview", StringComparer.OrdinalIgnoreCase))
@@ -322,6 +364,34 @@ public partial class App : System.Windows.Application
         }
     }
 
+    private async void RunInstallExitHelper()
+    {
+        try
+        {
+            var paths=ApplicationPaths.Create(AppContext.BaseDirectory,Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+            var executable=Environment.ProcessPath;
+            var success=executable is not null && await new InstallMaintenance(new WindowsInstallExitBackend()).ConfirmExitAsync(
+                Path.GetFullPath(executable),AppActivationPolicy.CurrentUserScope(paths.ProfileId),TimeSpan.FromSeconds(8));
+            Shutdown(success ? 0 : 3);
+        }
+        catch { Shutdown(3); }
+    }
+
+    private async void RunUninstallCleanupHelper(bool recycleOutputs)
+    {
+        try
+        {
+            var paths=ApplicationPaths.Create(AppContext.BaseDirectory,Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+            var executable=Environment.ProcessPath;
+            if(executable is null) { Shutdown(3);return; }
+            // The await keeps cleanup on the calling STA; no settings/model/tray startup occurs in this helper.
+            var result=await new InstallMaintenance(new WindowsInstallExitBackend()).ExecuteUninstallAsync(
+                Path.GetFullPath(executable),AppActivationPolicy.CurrentUserScope(paths.ProfileId),paths,recycleOutputs,TimeSpan.FromSeconds(8));
+            Shutdown(result is null ? 3 : result.FailedOutputCount==0 ? 0 : 2);
+        }
+        catch { Shutdown(1); }
+    }
+
     private bool TryOwnSingleInstance(string[] arguments, string profileId)
     {
 #if DEBUG
@@ -334,6 +404,10 @@ public partial class App : System.Windows.Application
         _singleInstance = new SingleInstanceCoordinator(AppActivationPolicy.CurrentUserScope(profileId));
         _singleInstance.ActivationRequested += command =>
             Dispatcher.BeginInvoke(() => HandleActivation(command));
+        _singleInstance.InstallExitRequested = request => Dispatcher.InvokeAsync(() =>
+            InstallExitProtocol.HandleAsync(request, InstallExitProtocol.Current(),
+                () => RequestManagedShutdownAsync(finalShutdown: () => { }))).Task.Unwrap();
+        _singleInstance.InstallExitResponseCompleted += () => Dispatcher.BeginInvoke(() => Shutdown());
         var result = _singleInstance.Start(AppActivationPolicy.ForwardedCommand(arguments));
         if (result == SingleInstanceStartResult.Primary) return true;
 
@@ -366,7 +440,7 @@ public partial class App : System.Windows.Application
                 case RegionAcceptanceMode.Original:
                 {
                     using var frame = _captureService.CaptureRegion(command.Region);
-                    outputPath = output.SaveAndCopy(frame.Bitmap);
+                    outputPath = (await output.SaveWithDeliveryAsync(frame.Bitmap)).Path;
                     outputSize = frame.Bitmap.Size;
                     acceptedFrameCount = 1;
                     break;
@@ -379,7 +453,7 @@ public partial class App : System.Windows.Application
                         frame.Bitmap,
                         new ClipRay.Core.Geometry.PixelRect(0, 0, frame.Bitmap.Width, frame.Bitmap.Height),
                         outcome.LayoutItems);
-                    outputPath = output.SaveAndCopy(rendered);
+                    outputPath = (await output.SaveWithDeliveryAsync(rendered)).Path;
                     outputSize = rendered.Size;
                     acceptedFrameCount = 1;
                     status = outcome.Status;
@@ -408,13 +482,14 @@ public partial class App : System.Windows.Application
                             ConsecutiveRepeatedFramesToStop: 3),
                         diagnostics: diagnostics);
                     using var result = await session.RunAsync(CancellationToken.None);
-                    using var composite = result.CreateComposite();
-                    outputPath = output.SaveAndCopy(composite, diagnostics);
+                    using var composite = await Task.Run(result.CreateComposite);
+                    outputPath = (await output.SaveWithDeliveryAsync(composite, diagnostics)).Path;
                     outputSize = composite.Size;
                     acceptedFrameCount = result.AcceptedFrameCount;
                     status = result.StopReason.ToString();
                     LongCaptureRunDiagnosticStore.TryWrite(command.OutputRoot, diagnostics);
-                    result.CleanupAfterSuccessfulOutput();
+                    try { result.CleanupAfterSuccessfulOutput(); }
+                    catch { errorCategory="cleanup-unavailable"; }
                     break;
                 }
                 case RegionAcceptanceMode.Live:
@@ -547,7 +622,7 @@ public partial class App : System.Windows.Application
                             new ClipRay.Core.Geometry.PixelRect(0, 0, finalBitmap.Width, finalBitmap.Height),
                             latest.LayoutItems))
                         {
-                            outputPath = output.SaveAndCopy(rendered);
+                            outputPath = (await output.SaveWithDeliveryAsync(rendered)).Path;
                             outputSize = rendered.Size;
                         }
                         acceptedFrameCount = readyCount;
@@ -722,7 +797,7 @@ public partial class App : System.Windows.Application
                 result.FailedPathCount == 0,
                 result.DeletedFileCount,
                 result.SkippedPathCount,
-                result.FailedPathCount));
+                result.FailedPathCount) { Items = result.Items });
             return result.FailedPathCount == 0 ? 0 : 2;
         }
         catch
@@ -939,21 +1014,17 @@ public partial class App : System.Windows.Application
         _longCapturePreview = null;
         _longCaptureHotkeyHost?.Dispose();
         _longCaptureHotkeyHost = null;
+        PrepareSettingsForCommittedShutdown();
         _settingsWindow?.Close();
         _translationWindow?.Close();
         _overlayTranslationOperations.Close();
         StopLiveTranslation();
-        (_machineTranslationProvider as IDisposable)?.Dispose();
-        _localTranslationProvider?.Dispose();
-        _recordingBorder?.Close();
-        _recordingControl?.Close();
+        RequestImageOutputRetirement();
+        RequestTranslationRetirement();
+        RequestRecordingRetirement();
         _recordingPreview?.Close();
-        ShutdownSafety.Try(() => _recordingSession?.StopAsync().GetAwaiter().GetResult());
-        _recordingSession = null;
         _feedbackService.Dispose();
-        _translationServices.Dispose();
-        _machineOcr.Dispose();
-        _hotkeyHost?.Dispose();
+        ReleaseHotkeys();
         if (_trayIcon is not null)
         {
             _trayIcon.Visible = false;
@@ -964,7 +1035,35 @@ public partial class App : System.Windows.Application
         base.OnExit(e);
     }
 
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        base.OnSessionEnding(e);
+        if (!e.Cancel) PrepareSettingsForCommittedShutdown();
+    }
+
+    // OS shutdown and already committed WPF shutdown cannot honor an ordinary
+    // Closing cancellation. Do not show an interactive draft prompt there.
+    internal void PrepareSettingsForCommittedShutdown() => _settingsWindow?.PrepareForCommittedShutdown();
+
+    internal IReadOnlyList<string> PrepareOutputDirectories(AppSettings settings, Action<string>? ensure = null)
+    {
+        var failures = OutputDirectoryLayout.TryEnsure(settings, ensure);
+        if (failures.Count > 0) _settingsLoadWarning = string.Join(" ", new[] { _settingsLoadWarning,
+            AppInterfaceLanguage.Normalize(settings.InterfaceLanguage) == "en"
+                ? $"Output folders are unavailable ({string.Join(", ", failures)}). Settings remains available; paths were kept."
+                : $"输出目录暂不可用（{string.Join(", ", failures)}）；仍可打开设置，原路径已保留。" }.Where(s => !string.IsNullOrWhiteSpace(s)));
+        return failures;
+    }
+
     private void CreateTrayIcon()
+    {
+        var menu = CreateTrayMenu();
+        _applicationIcon = ApplicationIconLoader.LoadOrDefault(Path.Combine(AppContext.BaseDirectory, "Assets", "ClipRay-v2.ico"));
+        _trayIcon = new Forms.NotifyIcon { Icon = _applicationIcon, Text = "ClipRay 截光", ContextMenuStrip = menu, Visible = true };
+        _trayIcon.DoubleClick += (_, _) => StartInteractiveCapture();
+    }
+
+    internal Forms.ContextMenuStrip CreateTrayMenu()
     {
         var menu = new Forms.ContextMenuStrip();
         TrayMenuTheme.Apply(menu);
@@ -979,51 +1078,101 @@ public partial class App : System.Windows.Application
         menu.Items.Add("翻译", null, (_, _) => OpenTranslationWindow());
         menu.Items.Add("实时区域翻译", null, (_, _) => StartLiveTranslationSelection());
         menu.Items.Add("设置", null, (_, _) => OpenSettings());
+        var recentCaptures = new Forms.ToolStripMenuItem("最近截取");
+        var recentLoadVersion = 0;
+        var recentCopyVersion = 0;
+        recentCaptures.DropDownClosed += (_, _) => recentLoadVersion++;
+        recentCaptures.DropDownItems.Add("打开后加载");
+        recentCaptures.DropDownOpening += async (_, _) =>
+        {
+            var loadVersion = ++recentLoadVersion;
+            var settingsForLoad = _settings!;
+            recentCaptures.DropDownItems.Clear();
+            recentCaptures.DropDownItems.Add(AppUi("正在加载…", "Loading…")).Enabled = false;
+            var service = new RecentCaptureService(settingsForLoad);
+            try
+            {
+                var items = await Task.Run(() => service.GetRecent());
+                if (recentCaptures.IsDisposed || loadVersion != recentLoadVersion
+                    || !ReferenceEquals(settingsForLoad, _settings)) return;
+                recentCaptures.DropDownItems.Clear();
+                if (items.Count == 0)
+                    recentCaptures.DropDownItems.Add(AppUi("暂无可复制的截取", "No saved captures to copy")).Enabled = false;
+                foreach (var item in items)
+                {
+                    var kind = item.Kind switch
+                    {
+                        RecentCaptureKind.Recording => AppUi("视频", "Video"),
+                        RecentCaptureKind.LongCapture => AppUi("长截图", "Scrolling capture"),
+                        _ => AppUi("截图", "Screenshot"),
+                    };
+                    var entry = new Forms.ToolStripMenuItem($"{item.LastWriteTimeUtc.ToLocalTime():MM-dd HH:mm:ss} · {kind}") { ToolTipText = Path.GetFileName(item.Path) };
+                    entry.Click += async (_, _) =>
+                    {
+                        var copyVersion = ++recentCopyVersion;
+                        SetTrayTooltip(AppUi("ClipRay | 正在准备复制", "ClipRay | Preparing capture copy"));
+                        var prepared = await Task.Run(() => service.TryPrepareCopy(item, out var payload) ? payload : null);
+                        if (copyVersion != recentCopyVersion || _trayIcon is null) return;
+                        var copied = prepared is not null && await Dispatcher.InvokeAsync(() => service.TryPublishCopy(prepared));
+                        SetTrayTooltip(AppUi(copied ? "ClipRay | 已重新复制" : "ClipRay | 文件不可用或剪贴板暂忙",
+                            copied ? "ClipRay | Copied again" : "ClipRay | File unavailable or clipboard busy"));
+                        if (!copied) _trayIcon?.ShowBalloonTip(3000, AppUi("未能复制", "Copy failed"),
+                            AppUi("文件可能已移动或清理，也可能是剪贴板暂忙。", "The file may have moved or been cleaned, or the clipboard is busy."), Forms.ToolTipIcon.Warning);
+                    };
+                    recentCaptures.DropDownItems.Add(entry);
+                }
+                recentCaptures.DropDown.Renderer = menu.Renderer;
+                recentCaptures.DropDown.BackColor = menu.BackColor;
+                recentCaptures.DropDown.ForeColor = menu.ForeColor;
+            }
+            catch
+            {
+                if (recentCaptures.IsDisposed || loadVersion != recentLoadVersion) return;
+                recentCaptures.DropDownItems.Clear();
+                recentCaptures.DropDownItems.Add(AppUi("暂时无法读取，请重试", "Cannot read captures; retry")).Enabled = false;
+            }
+        };
+        menu.Items.Add(recentCaptures);
+        menu.Items.Add(CreateLongCaptureRecoveryMenu());
         _stopLiveTranslationMenuItem = new Forms.ToolStripMenuItem("停止实时翻译", null, (_, _) => StopLiveTranslation()) { Enabled = false };
         menu.Items.Add(_stopLiveTranslationMenuItem);
         _stopRecordingMenuItem = new Forms.ToolStripMenuItem("停止录屏", null, (_, _) => StopRecording()) { Enabled = false };
         menu.Items.Add(_stopRecordingMenuItem);
         menu.Items.Add(new Forms.ToolStripSeparator());
-        menu.Items.Add("退出 ClipRay", null, (_, _) => Shutdown());
+        menu.Items.Add("退出 ClipRay", null, async (_, _) => await RequestManagedShutdownAsync());
 
-        _applicationIcon = ApplicationIconLoader.LoadOrDefault(
-            Path.Combine(AppContext.BaseDirectory, "Assets", "ClipRay-v2.ico"));
-
-        _trayIcon = new Forms.NotifyIcon
-        {
-            Icon = _applicationIcon,
-            Text = "ClipRay 截光",
-            ContextMenuStrip = menu,
-            Visible = true,
-        };
         AppInterfaceLanguage.UpdateTray(menu.Items, _settings!.InterfaceLanguage);
-        _trayIcon.DoubleClick += (_, _) => StartInteractiveCapture();
+        return menu;
     }
 
     private void RegisterHotkeys()
     {
-        _hotkeyHost?.Dispose();
-        _hotkeyHost = new HotkeyHost();
-        var failures = new List<string>();
-        RegisterAll(_settings!.RegionCaptureHotkey, _settings.RegionCaptureSecondaryHotkey, () => StartInteractiveCapture(), failures);
-        RegisterAll(_settings.CurrentScreenHotkey, _settings.CurrentScreenSecondaryHotkey, () =>
-            _ = RunCurrentMonitorCaptureAsync(), failures);
-        RegisterAll(_settings.TaskbarFreeCurrentScreenHotkey, _settings.TaskbarFreeCurrentScreenSecondaryHotkey, () =>
-            _ = RunCurrentMonitorCaptureIncludingTaskbarAsync(), failures);
-        RegisterAll(_settings.VirtualDesktopHotkey, _settings.VirtualDesktopSecondaryHotkey, () =>
-            RunCapture(_captureService.CaptureVirtualDesktop, AllMonitorBounds), failures);
-        RegisterAll(_settings.StartRecordingHotkey, _settings.StartRecordingSecondaryHotkey,
-            StartRecordingSelection, failures);
-        RegisterAll(_settings.StopRecordingHotkey, _settings.StopRecordingSecondaryHotkey, StopRecording, failures);
-        RegisterAll(_settings.StartLiveTranslationHotkey, _settings.StartLiveTranslationSecondaryHotkey,
-            () => StartLiveTranslationSelection(), failures);
-        RegisterAll(_settings.StopLiveTranslationHotkey, _settings.StopLiveTranslationSecondaryHotkey,
-            StopLiveTranslation, failures);
-
-        if (failures.Count > 0)
+        if (_translationClosing) return;
+        if (_hotkeyRegistration is null)
         {
-            SetTrayTooltip(AppUi($"ClipRay | 快捷键冲突: {string.Join(", ", failures)}",
-                $"ClipRay | Shortcut conflict: {string.Join(", ", failures)}"));
+            _hotkeyHost = (HotkeyHostFactory ?? (() => new HotkeyHost()))();
+            _hotkeyRegistration = new(_hotkeyHost);
+        }
+        var desired = new List<HotkeyRegistrationRequest>();
+        void Add(string id, string label, GlobalHotkey primary, GlobalHotkey? secondary, Action action)
+        {
+            desired.Add(new(id + ".primary", label, primary, action));
+            if (secondary is not null) desired.Add(new(id + ".secondary", label, secondary, action));
+        }
+        Add("region", AppUi("区域截图", "Capture region"), _settings!.RegionCaptureHotkey, _settings.RegionCaptureSecondaryHotkey, () => StartInteractiveCapture());
+        Add("screen", AppUi("全屏截图", "Capture screen"), _settings.CurrentScreenHotkey, _settings.CurrentScreenSecondaryHotkey, () => _ = RunCurrentMonitorCaptureAsync());
+        Add("taskbar", AppUi("含任务栏截图", "Capture with taskbar"), _settings.TaskbarFreeCurrentScreenHotkey, _settings.TaskbarFreeCurrentScreenSecondaryHotkey, () => _ = RunCurrentMonitorCaptureIncludingTaskbarAsync());
+        Add("desktop", AppUi("全部屏幕", "Capture all screens"), _settings.VirtualDesktopHotkey, _settings.VirtualDesktopSecondaryHotkey, () => RunCapture(_captureService.CaptureVirtualDesktop, AllMonitorBounds));
+        Add("record-start", AppUi("开始录屏", "Start recording"), _settings.StartRecordingHotkey, _settings.StartRecordingSecondaryHotkey, StartRecordingSelection);
+        Add("record-stop", AppUi("停止录屏", "Stop recording"), _settings.StopRecordingHotkey, _settings.StopRecordingSecondaryHotkey, StopRecording);
+        Add("live-start", AppUi("开始实时翻译", "Start live translation"), _settings.StartLiveTranslationHotkey, _settings.StartLiveTranslationSecondaryHotkey, () => StartLiveTranslationSelection());
+        Add("live-stop", AppUi("停止实时翻译", "Stop live translation"), _settings.StopLiveTranslationHotkey, _settings.StopLiveTranslationSecondaryHotkey, StopLiveTranslation);
+        _lastHotkeyRegistration = _hotkeyRegistration.Apply(desired);
+        _settingsWindow?.ReportHotkeyRegistration(_lastHotkeyRegistration);
+        if (_lastHotkeyRegistration.Failures.Count > 0)
+        {
+            SetTrayTooltip(AppUi($"ClipRay | 快捷键未全部生效: {string.Join(", ", _lastHotkeyRegistration.Failures)}",
+                $"ClipRay | Shortcuts not fully applied: {string.Join(", ", _lastHotkeyRegistration.Failures)}"));
         }
         else
         {
@@ -1031,28 +1180,21 @@ public partial class App : System.Windows.Application
         }
     }
 
-    private void Register(GlobalHotkey hotkey, string label, Action action, ICollection<string> failures)
+    private void ReleaseHotkeys()
     {
-        if (!_hotkeyHost!.TryRegister(hotkey, action))
-        {
-            failures.Add(label);
-        }
-    }
-
-    private void RegisterAll(
-        GlobalHotkey primary,
-        GlobalHotkey? secondary,
-        Action action,
-        ICollection<string> failures)
-    {
-        foreach (var hotkey in HotkeyBindingPolicy.Active(primary, secondary))
-        {
-            Register(hotkey, HotkeyDisplayFormatter.Format(hotkey), action, failures);
-        }
+        if (_hotkeyRegistration is not null) _hotkeyRegistration.Dispose();
+        else _hotkeyHost?.Dispose();
+        _hotkeyRegistration = null; _hotkeyHost = null;
     }
 
     private void StartInteractiveCapture(OverlayLaunchMode launchMode = OverlayLaunchMode.Capture)
     {
+        if (!CanDeliverImageOutput) return;
+        if (_longCaptureCancellation is not null && _overlay is null)
+        {
+            SetTrayTooltip(AppUi("ClipRay | 长截图正在保存，请稍候", "ClipRay | Scrolling capture is being saved"));
+            return;
+        }
         if (InteractiveCapturePolicy.Resolve(_overlay is not null) is InteractiveCaptureAction.CancelExisting)
         {
             _overlay!.Close();
@@ -1065,7 +1207,8 @@ public partial class App : System.Windows.Application
             frame = _captureService.CaptureVirtualDesktop();
             _overlay = new SelectionOverlayWindow(frame, interactionSettings: _settings, launchMode: launchMode);
             frame = null;
-            _overlay.CaptureDelivery = HandleConfirmedCapture;
+            var captureOverlay = _overlay;
+            captureOverlay.CaptureDeliveryAsync = bitmap => HandleConfirmedCaptureAsync(bitmap, captureOverlay);
             _overlay.TranslationRequested += HandleOverlayTranslationRequested;
             _overlay.LiveTranslationRequested += (_, request) => Dispatcher.BeginInvoke(() => StartLiveTranslationRequest(request));
             _overlay.TextExtractionRequested += HandleTextExtractionRequested;
@@ -1090,7 +1233,7 @@ public partial class App : System.Windows.Application
 
     private void StartRecordingSelection()
     {
-        if (!RecordingStartPolicy.CanOpenSelection(_recordingSession is not null))
+        if (!RecordingStartPolicy.CanOpenSelection(_recordingAdmissionClosed || _recordingController?.IsBusy == true))
         {
             SetTrayTooltip(AppUi("ClipRay | 录屏已在进行中", "ClipRay | Recording is already running"));
             return;
@@ -1102,20 +1245,29 @@ public partial class App : System.Windows.Application
     private async void HandleLongCaptureRequested(object? sender, LongCaptureRequest request)
     {
         if (sender is not SelectionOverlayWindow overlay) return;
-        _longCaptureCancellation?.Cancel();
-        _longCaptureCancellation?.Dispose();
+        if (!CanDeliverImageOutput || _longCaptureCancellation is not null || _longCaptureRecoveryBusy)
+        {
+            SetTrayTooltip(AppUi("ClipRay | 上一次长截图尚未结束", "ClipRay | The previous scrolling capture is still finishing"));
+            return;
+        }
         _longCaptureCancellation = CancellationTokenSource.CreateLinkedTokenSource(overlay.LifetimeToken);
         var cancellation = _longCaptureCancellation;
         var discard = false;
+        var longCaptureSettings = _settings!;
+        var longCaptureOutput = _longCaptureOutputService!;
+        var tempRoot = _paths!.LongCaptureTempRoot;
+        var longCaptureDiagnostics = new LongCaptureRunDiagnostics(
+            Guid.NewGuid().ToString("N"),
+            typeof(App).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+                .OfType<System.Reflection.AssemblyInformationalVersionAttribute>().FirstOrDefault()?.InformationalVersion ?? "unknown",
+            _paths.DiagnosticsRoot);
+        try
+        {
         overlay.ShowLongCaptureProgress(0, request.Mode == ScrollCaptureMode.Manual ? "手动滚动捕获" : "自动滚动捕获");
         await Dispatcher.InvokeAsync(overlay.Hide);
         var scrollTarget = ScrollInputService.ResolveTarget(new System.Drawing.Point(
             request.PhysicalPixelRegion.Left + request.PhysicalPixelRegion.Width / 2,
             request.PhysicalPixelRegion.Top + request.PhysicalPixelRegion.Height / 2));
-        var tempRoot = _paths!.LongCaptureTempRoot;
-        var longCaptureDiagnostics = new LongCaptureRunDiagnostics(
-            Guid.NewGuid().ToString("N"),
-            typeof(App).Assembly.GetName().Version?.ToString() ?? "unknown");
         using var session = new ScrollCaptureSession(
             request.PhysicalPixelRegion,
             request.Mode,
@@ -1128,16 +1280,17 @@ public partial class App : System.Windows.Application
         _longCaptureBorder.Show();
         _longCapturePreview = new ScrollCapturePreviewWindow(request.PhysicalPixelRegion);
         _longCaptureControls = new ScrollCaptureControlWindow(
-            _settings!.StopLongCaptureHotkey,
+            longCaptureSettings.StopLongCaptureHotkey,
             request.Mode,
-            secondaryStopHotkey: _settings.StopLongCaptureSecondaryHotkey,
-            interfaceLanguage: _settings.InterfaceLanguage);
-        void CompleteCapture()
+            secondaryStopHotkey: longCaptureSettings.StopLongCaptureSecondaryHotkey,
+            interfaceLanguage: longCaptureSettings.InterfaceLanguage);
+        void CompleteCapture(string origin)
         {
+            longCaptureDiagnostics.RecordEvent("completion_trigger", new { Origin = origin });
             session.RequestCompletion();
             TryCancel(cancellation);
         }
-        _longCaptureControls.StopRequested += (_, _) => CompleteCapture();
+        _longCaptureControls.StopRequested += (_, _) => CompleteCapture("control");
         _longCaptureControls.CancelRequested += (_, _) =>
         {
             discard = true;
@@ -1147,14 +1300,17 @@ public partial class App : System.Windows.Application
         _longCaptureHotkeyHost?.Dispose();
         _longCaptureHotkeyHost = new HotkeyHost();
         foreach (var hotkey in HotkeyBindingPolicy.Active(
-                     _settings.StopLongCaptureHotkey,
-                     _settings.StopLongCaptureSecondaryHotkey))
+                     longCaptureSettings.StopLongCaptureHotkey,
+                     longCaptureSettings.StopLongCaptureSecondaryHotkey))
         {
-            _longCaptureHotkeyHost.TryRegister(hotkey, CompleteCapture);
+            var registered = _longCaptureHotkeyHost.TryRegister(hotkey, () => CompleteCapture(hotkey.ToString()));
+            longCaptureDiagnostics.RecordEvent("hotkey_registration", new { Key = hotkey.ToString(), Registered = registered });
         }
-        _longCaptureHotkeyHost.TryRegister(GlobalHotkey.Parse("Enter"), CompleteCapture);
+        var enterRegistered = _longCaptureHotkeyHost.TryRegister(GlobalHotkey.Parse("Enter"), () => CompleteCapture("Enter"));
+        longCaptureDiagnostics.RecordEvent("hotkey_registration", new { Key = "Enter", Registered = enterRegistered });
         _longCaptureControls.Show();
         var placedOutside = _longCaptureControls.PlaceOutside(request.PhysicalPixelRegion);
+        longCaptureDiagnostics.RecordEvent("controls_ready", new { _longCaptureControls.AffinityApplied, PlacedOutside = placedOutside, WidthDip = _longCaptureControls.ActualWidth, HeightDip = _longCaptureControls.ActualHeight, EnterRegistered = enterRegistered });
         if (!ScrollCaptureControlReadiness.CanStart(_longCaptureControls.AffinityApplied, placedOutside))
         {
             _longCaptureControls.IsNormalTeardown = true;
@@ -1174,40 +1330,63 @@ public partial class App : System.Windows.Application
         }
         session.PreviewChanged += (_, preview) =>
         {
-            if (_longCapturePreview is not { } window) return;
-            if (!window.IsVisible) window.Show();
-            window.ShowPreview(preview.Bitmap);
+            var source = BitmapSourceFactory.Create(preview.Bitmap);
+            Dispatcher.Invoke(() =>
+            {
+                if (_longCapturePreview is not { } window) return;
+                if (!window.IsVisible) window.Show();
+                window.ShowPreview(source, preview.CompositeSize);
+                longCaptureDiagnostics.RecordEvent("preview_applied", new { preview.CompositeSize.Width, preview.CompositeSize.Height });
+            });
         };
         session.ProgressChanged += (_, progress) => Dispatcher.BeginInvoke(() =>
         {
             if (!overlay.IsLoaded || _longCaptureControls is not { } controls) return;
             controls.SetProgress(progress);
         });
-        using var result = await session.RunAsync(cancellation.Token);
+        using var result = await Task.Run(() => session.RunAsync(cancellation.Token));
         var status = $"{result.AcceptedFrameCount} 帧";
+        string? savedPath = null;
         try
         {
-            if (discard)
+            if (discard || !CanDeliverImageOutput)
             {
-                result.CleanupAfterSuccessfulOutput();
+                try { result.PreserveForRecovery(); } catch { }
                 status = AppUi("已取消长截图", "Scrolling capture cancelled");
             }
             else if (result.AcceptedFrameCount > 0)
             {
-                using var bitmap = result.CreateComposite();
                 CloseLongCaptureCaptureUi();
                 if (overlay.IsLoaded) overlay.Close();
-                var delivery = _longCaptureOutputService!.SaveWithDelivery(bitmap, longCaptureDiagnostics);
-                result.CleanupAfterSuccessfulOutput();
-                status = ScrollCaptureResultWindow.SavedStatus(_settings.InterfaceLanguage, delivery.ClipboardRequested, delivery.ClipboardCopied);
+                using var outputOwner=EnterImageOutput();
+                if (outputOwner is null) { result.PreserveForRecovery();return; }
+                using var bitmap = await Task.Run(result.CreateComposite);
+                if (!CanDeliverImageOutput) { result.PreserveForRecovery();return; }
+                var delivery = await longCaptureOutput.SaveWithDeliveryAsync(bitmap, longCaptureDiagnostics,()=>CanDeliverImageOutput);
+                savedPath = delivery.Path;
+                ReportImageDelivery(delivery,longCaptureSettings);
+                status = ScrollCaptureResultWindow.SavedStatus(longCaptureSettings.InterfaceLanguage, delivery.ClipboardRequested, delivery.ClipboardCopied);
+                try { result.CleanupAfterSuccessfulOutput(); }
+                catch { OutputWarning(AppUi("PNG 已保存，恢复片段清理未完成。", "PNG saved; recovery-piece cleanup incomplete.")); }
+                var resultPreview = await Task.Run(() => BitmapSourceFactory.Create(bitmap));
+                outputOwner.Dispose();
+                if (!CanDeliverImageOutput) return;
                 var preview = new ScrollCaptureResultWindow(
                     bitmap,
                     result.StopReason,
                     delivery.Path,
                     delivery.ClipboardCopied,
-                    () => _longCaptureOutputService.TryCopySavedFile(bitmap, delivery.Path),
-                    interfaceLanguage: _settings.InterfaceLanguage,
-                    clipboardRequested: delivery.ClipboardRequested);
+                    () => CanDeliverImageOutput && longCaptureOutput.TryCopySavedFile(delivery.Path),
+                    interfaceLanguage: longCaptureSettings.InterfaceLanguage,
+                    clipboardRequested: delivery.ClipboardRequested,
+                    previewSource: resultPreview,
+                    copyAgainAsync: canPublish => SavedMediaClipboard.TryCopyPngAsync(delivery.Path,
+                        () => CanDeliverImageOutput && canPublish()));
+                longCaptureDiagnostics.RecordEvent("result_preview_ready", new { delivery.ClipboardRequested, delivery.ClipboardCopied });
+                LongCaptureRunDiagnosticStore.TryWrite(_paths.DiagnosticsRoot, longCaptureDiagnostics);
+                // Capture/output ownership ends before the modal preview. Its later
+                // teardown must not close a new capture's controls or hotkeys.
+                if (ReferenceEquals(_longCaptureCancellation, cancellation)) _longCaptureCancellation = null;
                 preview.ShowDialog();
             }
             else
@@ -1217,23 +1396,49 @@ public partial class App : System.Windows.Application
                     $"No valid frames ({result.StopReason}); temporary files were kept");
             }
         }
-        catch
+        catch (Exception exception)
         {
+            longCaptureDiagnostics.RecordFailure("output", exception);
+            if (savedPath is not null)
+            {
+                status = AppUi("PNG 已保存，结果窗口未能显示；可从最近截取再次复制。", "PNG saved; preview failed. Copy it again from Recent captures.");
+                if (CanDeliverImageOutput) _trayIcon?.ShowBalloonTip(4000, AppUi("长截图已保存", "Scrolling capture saved"), status, Forms.ToolTipIcon.Warning);
+            }
+            else
+            {
             status = AppUi($"已保留 partial recovery：{result.TempSessionDirectory}",
                 $"Partial capture kept for recovery: {result.TempSessionDirectory}");
             try { result.PreserveForRecovery(); }
             catch { /* Preserve flag is already set even if the marker cannot be written. */ }
-            System.Windows.MessageBox.Show(AppUi($"长截图保存未完成，已有片段保留在：\n{result.TempSessionDirectory}",
+            if (CanDeliverImageOutput) System.Windows.MessageBox.Show(AppUi($"长截图保存未完成，已有片段保留在：\n{result.TempSessionDirectory}",
                 $"Scrolling capture could not be saved. Captured pieces remain at:\n{result.TempSessionDirectory}"),
                 AppUi("长截图可恢复", "Scrolling capture can be recovered"));
+            }
         }
         finally
         {
-            if (ReferenceEquals(_longCaptureCancellation, cancellation)) _longCaptureCancellation = null;
+            if (ReferenceEquals(_longCaptureCancellation, cancellation))
+            {
+                CloseLongCaptureCaptureUi();
+                _longCaptureCancellation = null;
+            }
+            cancellation.Dispose();
+            var diagnosticsWritten = LongCaptureRunDiagnosticStore.TryWrite(_paths.DiagnosticsRoot, longCaptureDiagnostics);
+            if (!diagnosticsWritten && CanDeliverImageOutput) SetTrayTooltip(AppUi("ClipRay | 长截图诊断写入失败", "ClipRay | Scrolling capture diagnostics could not be written"));
+            if (CanDeliverImageOutput && overlay.IsLoaded) overlay.RestoreAfterLongCapture(status);
+        }
+        }
+        catch (Exception exception)
+        {
+            longCaptureDiagnostics.RecordFailure("setup_or_teardown", exception);
+            if (ReferenceEquals(_longCaptureCancellation, cancellation))
+            {
+                CloseLongCaptureCaptureUi();
+                _longCaptureCancellation = null;
+            }
             cancellation.Dispose();
             LongCaptureRunDiagnosticStore.TryWrite(_paths.DiagnosticsRoot, longCaptureDiagnostics);
-            CloseLongCaptureCaptureUi();
-            if (overlay.IsLoaded) overlay.RestoreAfterLongCapture(status);
+            if (CanDeliverImageOutput && overlay.IsLoaded) overlay.RestoreAfterLongCapture(AppUi("长截图未能启动，请重试；诊断已记录。", "Scrolling capture failed to start; diagnostics were recorded."));
         }
     }
 
@@ -1325,13 +1530,13 @@ public partial class App : System.Windows.Application
         }
     }
 
-    private async void StartLongCaptureRuntimeProbe()
+    private async void StartLongCaptureRuntimeProbe(bool useProductionControls = false)
     {
         System.Windows.Window? target = null;
         try
         {
             var rows = new System.Windows.Controls.StackPanel();
-            for (var index = 0; index < 72; index++)
+            for (var index = 0; index < (useProductionControls ? 400 : 72); index++)
             {
                 rows.Children.Add(new System.Windows.Controls.Border
                 {
@@ -1360,6 +1565,7 @@ public partial class App : System.Windows.Application
             };
             target = new System.Windows.Window
             {
+                Title = "ClipRay long-capture test content",
                 Content = scroll,
                 WindowStyle = WindowStyle.None,
                 ResizeMode = ResizeMode.NoResize,
@@ -1383,6 +1589,17 @@ public partial class App : System.Windows.Application
 
             var topLeft = target.PointToScreen(new System.Windows.Point(0, 0));
             var region = new Rectangle((int)Math.Round(topLeft.X), (int)Math.Round(topLeft.Y), 452, 600);
+            if (useProductionControls)
+            {
+                var frame = _captureService.CaptureCurrentMonitor();
+                _overlay = new SelectionOverlayWindow(frame, CreateOverlayPreviewSelection(frame), interactionSettings: _settings);
+                _overlay.Show();
+                HandleLongCaptureRequested(_overlay, new LongCaptureRequest(region, ScrollCaptureMode.Manual));
+                while (_longCaptureCancellation is not null) await Task.Delay(100);
+                _overlay?.Close();
+                _overlay = null;
+                return;
+            }
             var input = new ScrollInputService(ScrollInputService.ResolveTarget(new System.Drawing.Point(region.Left + 226, region.Top + 300)));
             var tempRoot = Path.Combine(WorkspaceLocator.Find(AppContext.BaseDirectory), "tmp", "long-capture-probe");
             var diagnosticRoot = Path.Combine(tempRoot, $"frames-{DateTime.Now:yyyyMMdd-HHmmssfff}");
@@ -1460,23 +1677,24 @@ public partial class App : System.Windows.Application
         }
     }
 
-    private bool HandleConfirmedCapture(Bitmap bitmap)
+    private async Task<bool> HandleConfirmedCaptureAsync(Bitmap bitmap, SelectionOverlayWindow overlay)
     {
+        using var owner=EnterImageOutput();
+        if (owner is null) return false;
+        var output = _outputService!;
+        var settings = _settings!;
+        var lifetime = overlay.LifetimeToken;
         try
         {
-            var delivery = _outputService!.SaveWithDelivery(bitmap);
-            if (delivery.ClipboardRequested && !delivery.ClipboardCopied)
-            {
-                SetTrayTooltip(AppUi("ClipRay | 已保存截图，剪贴板暂忙", "ClipRay | Saved; clipboard is busy"));
-                _trayIcon?.ShowBalloonTip(4000, AppUi("截图已保存", "Screenshot saved"),
-                    AppUi("PNG 已保存；剪贴板暂忙，未复制。", "PNG saved, but the clipboard is busy; it was not copied."), Forms.ToolTipIcon.Warning);
-            }
+            var delivery = await output.SaveWithDeliveryAsync(bitmap,canPublish:()=>CanDeliverImageOutput);
+            ReportImageDelivery(delivery, settings);
             return true;
         }
         catch
         {
-            _overlay?.ShowTranslationStatus(AppUi("保存失败，编辑内容已保留；请重试保存或调整输出目录。",
-                "Save failed. Your edits were kept; retry or choose another output folder."));
+            if (CanDeliverImageOutput && !lifetime.IsCancellationRequested)
+                overlay.ShowTranslationStatus(AppInterfaceLanguage.Text(settings.InterfaceLanguage,"保存失败，编辑内容已保留；请重试保存或调整输出目录。",
+                    "Save failed. Your edits were kept; retry or choose another output folder."));
             return false;
         }
     }
@@ -1486,38 +1704,43 @@ public partial class App : System.Windows.Application
         using (capture)
         {
             if (sender is not SelectionOverlayWindow overlay) return;
-            var operation = _overlayTranslationOperations.Begin(overlay.LifetimeToken);
+            using var captureCancellation = CancellationTokenSource.CreateLinkedTokenSource(overlay.LifetimeToken, capture.Token);
+            var operation = _overlayTranslationOperations.Begin(captureCancellation.Token);
             var runId = Guid.NewGuid().ToString("N");
             var startedUtc = DateTimeOffset.UtcNow;
             TranslationPipelineTelemetry? telemetry = null;
             TranslationPipelineStage? activeStage = null;
-            using var screenshotEvidence = ScreenshotTranslationEvidence.StartFromEnvironment(runId, startedUtc);
+            using var screenshotEvidence = ScreenshotTranslationEvidence.StartForRuntime(_paths!.DiagnosticsRoot, runId, startedUtc);
             using var screenshotEvidenceScope = screenshotEvidence?.Push();
             using var screenshotWireScope = screenshotEvidence is null ? null
                 : TranslationWireTrace.Push(screenshotEvidence.RecordWire);
             try
             {
                 var translationRoute = ResolveTranslationRoute(capture.Route);
+                using var services = CaptureTranslationServices(translationRoute);
+                var translationSettings = services.Settings;
+                var orchestrator = new TranslationApplicationOrchestrator(RecognizeVisualAsync,
+                    (route, requests, token) => TranslateVisualRequestsCoreAsync(route, requests, token, operationSnapshot: services));
                 var isDeepSeek = translationRoute is TranslationRouteKind.DeepSeekFlash or TranslationRouteKind.DeepSeekPro;
                 screenshotEvidence?.RecordContext(new
                 {
                     run_id = runId,
                     started_utc = startedUtc,
-                    app_version = GetType().Assembly.GetName().Version?.ToString(3),
+                    app_version = CurrentApplicationVersion(),
                     executable_sha256 = CurrentExecutableSha256(),
                     capture_version = capture.Version,
                     capture.Selection,
                     capture.CaptureBounds,
                     route = translationRoute.ToString(),
-                    target_language = _settings!.TranslationTargetLanguage,
+                    target_language = translationSettings.TranslationTargetLanguage,
                     source_width = capture.Bitmap.Width,
                     source_height = capture.Bitmap.Height
                 });
                 screenshotEvidence?.SaveSource(capture.Bitmap);
-                var outcome = await _translationOrchestrator.ExecuteAsync(
+                var outcome = await orchestrator.ExecuteAsync(
                     capture.Bitmap,
                     translationRoute,
-                    _settings!.TranslationTargetLanguage,
+                    translationSettings.TranslationTargetLanguage,
                     blocks => SelectionCapturePolicy.ConstrainToSelection(
                         blocks, capture.Selection, capture.CaptureBounds),
                     stage =>
@@ -1532,8 +1755,8 @@ public partial class App : System.Windows.Application
                                 : translationRoute == TranslationRouteKind.Machine
                                     ? "正在使用本地机翻；图片和 OCR 文本均不离开本机…"
                                 : isDeepSeek
-                                    ? $"正在请求 {TranslationRouteCatalog.Get(translationRoute).ShortName} 翻译 → {_settings!.TranslationTargetLanguage}…"
-                                    : GetLocalTranslationProvider().HasActiveSession
+                                    ? $"正在请求 {TranslationRouteCatalog.Get(translationRoute).ShortName} 翻译 → {translationSettings.TranslationTargetLanguage}…"
+                                    : services.Local?.HasActiveSession == true
                                         ? "正在使用已加载的本地模型翻译…"
                                         : "正在加载本地模型；首次加载或卸载后重新加载可能需要较长时间…";
                             overlay.TryShowTranslationStatus(capture.Version, status);
@@ -1633,7 +1856,7 @@ public partial class App : System.Windows.Application
             runId,
             startedUtc,
             _paths?.ProfileId ?? string.Empty,
-            GetType().Assembly.GetName().Version?.ToString(3) ?? string.Empty,
+            CurrentApplicationVersion(),
             CurrentExecutableSha256(),
             route.ToString(),
             outcome.Status,
@@ -1664,7 +1887,7 @@ public partial class App : System.Windows.Application
             runId,
             startedUtc,
             _paths?.ProfileId ?? string.Empty,
-            GetType().Assembly.GetName().Version?.ToString(3) ?? string.Empty,
+            CurrentApplicationVersion(),
             CurrentExecutableSha256(),
             capture.Route.ToString(),
             "runtime-failed",
@@ -1697,11 +1920,24 @@ public partial class App : System.Windows.Application
         }
     }
 
-    private async Task<TranslationBatchOutcome> TranslateVisualRequestsAsync(
+    private Task<TranslationBatchOutcome> TranslateVisualRequestsAsync(
         TranslationRouteKind route,
         IReadOnlyList<TranslationRequest> requests,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken) =>
+        TranslateVisualRequestsCoreAsync(route, requests, cancellationToken);
+
+    private async Task<TranslationBatchOutcome> TranslateVisualRequestsCoreAsync(
+        TranslationRouteKind route,
+        IReadOnlyList<TranslationRequest> requests,
+        CancellationToken cancellationToken,
+        IDeepSeekTranslationProvider? cloudProvider = null,
+        TranslationServiceSnapshot? operationSnapshot = null)
     {
+        using var admission = _translationRequests.Enter();
+        using var stopped = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _translationRequests.Token);
+        cancellationToken = stopped.Token;
+        using var ownedSnapshot = operationSnapshot is null ? CaptureTranslationServices(route) : null;
+        var snapshot = operationSnapshot ?? ownedSnapshot!;
         var screenshotEvidence = ScreenshotTranslationEvidence.Current;
         screenshotEvidence?.RecordTranslationInputs(route, requests);
         TranslationBatchOutcome Complete(TranslationBatchOutcome outcome)
@@ -1712,7 +1948,7 @@ public partial class App : System.Windows.Application
 
         if (route == TranslationRouteKind.Machine)
         {
-            var machine = GetMachineTranslationProvider();
+            var machine = snapshot.Machine!;
             if (screenshotEvidence is not null)
                 machine = screenshotEvidence.ObserveMachineProvider(machine, "direct-machine");
             var results = await machine.TranslateManyAsync(requests, cancellationToken).ConfigureAwait(false);
@@ -1725,22 +1961,22 @@ public partial class App : System.Windows.Application
             CancellationToken token)
         {
             Task<IReadOnlyList<TranslationResult>> Invoke() => primaryRoute == TranslationRouteKind.LocalLmt
-                ? GetLocalTranslationProvider().TranslateManyAsync(primaryRequests, token)
+                ? snapshot.Local!.TranslateManyAsync(primaryRequests, token)
                 : VisualTranslationExecutionPolicy.ExecuteCloudAsync(
                     primaryRequests,
                     _credentialVault,
-                    GetTranslationProvider(),
+                    cloudProvider ?? snapshot.Cloud!,
                     RecordDeepSeekCost,
-                    token);
+                    token, credentialName: snapshot.Settings.CredentialName);
             return screenshotEvidence is null
                 ? await Invoke().ConfigureAwait(false)
                 : await screenshotEvidence.ObserveProviderAsync(
                     "primary", primaryRoute, primaryRequests, Invoke).ConfigureAwait(false);
         }
 
-        if (_settings!.MachineTranslationFallbackEnabled)
+        if (snapshot.Settings.MachineTranslationFallbackEnabled)
         {
-            var machine = GetMachineTranslationProvider();
+            var machine = snapshot.Machine!;
             if (screenshotEvidence is not null)
                 machine = screenshotEvidence.ObserveMachineProvider(machine, "machine-fallback");
             var outcome = await new TranslationFallbackCoordinator(Primary, machine)
@@ -1762,14 +1998,31 @@ public partial class App : System.Windows.Application
             0)));
     }
 
-    private async void HandleTextExtractionRequested(object? sender, TranslationCapture capture)
+    private static string CurrentApplicationVersion() => typeof(App).Assembly
+        .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+        .OfType<System.Reflection.AssemblyInformationalVersionAttribute>().FirstOrDefault()?.InformationalVersion
+        ?? typeof(App).Assembly.GetName().Version?.ToString() ?? "unknown";
+
+    private async void HandleTextExtractionRequested(object? sender, TranslationCapture capture) => await ExtractTextAsync(sender,capture);
+    internal async Task ExtractTextAsync(object? sender, TranslationCapture capture)
     {
         using (capture)
         {
             if (sender is not SelectionOverlayWindow overlay) return;
+            using var captureCancellation = CancellationTokenSource.CreateLinkedTokenSource(overlay.LifetimeToken, capture.Token);
+            var root=ExtractionDiagnosticsRoot??_paths?.DiagnosticsRoot;
+            var store=root is null?null:new LocalDiagnosticSession(root);
+            var run=Guid.NewGuid().ToString("N");
+            void Trace(string stage,object data) { if(root is not null) store!.Json(Path.Combine(root,"extraction-"+run+".jsonl"),new { run_id=run,stage,capture.Version,data }); }
             try
             {
-                var result = await RecognizeVisualAsync(capture.Bitmap, overlay.LifetimeToken);
+                Trace("request",new { capture.Selection,capture.CaptureBounds,capture.Bitmap.Width,capture.Bitmap.Height });
+                OcrRecognitionResult result;
+                await _ocrGate.WaitAsync(captureCancellation.Token);
+                try { result = await _translationServices.Ocr.RecognizeAsync(capture.Bitmap,captureCancellation.Token,
+                    evidence=>Trace("recognition",evidence)); }
+                finally { _ocrGate.Release(); }
+                Trace("recognition-status",new { result.IsSuccess,block_count=result.Blocks.Count });
                 if (!result.IsSuccess)
                 {
                     overlay.ShowExtractedText(capture.Version, string.Empty, result.Status);
@@ -1780,87 +2033,45 @@ public partial class App : System.Windows.Application
                     capture.Selection,
                     capture.CaptureBounds);
                 var text = OcrTextLayout.FormatLines(scopedBlocks);
-                overlay.ShowExtractedText(
+                Trace("selection-filter",new { input_blocks=result.Blocks.Count,kept_blocks=scopedBlocks.Count,text_length=text.Length,
+                    capture.Selection,capture.CaptureBounds,
+                    words=result.Blocks.SelectMany(b=>b.Words).Select(w=>new {w.Bounds,w.IsDetectedLine,w.Evidence?.RawScore,
+                        w.Evidence?.EngineId,w.Evidence?.ModelId,w.Evidence?.ModelSha256,
+                        reason=SelectionCapturePolicy.WordDisposition(capture.Selection,capture.CaptureBounds,w.Bounds) }).ToArray() });
+                var applied=overlay.ShowExtractedText(
                     capture.Version,
                     text,
                     string.IsNullOrWhiteSpace(text) ? "框选范围内未识别到文字" : $"已识别 {scopedBlocks.Count} 行");
+                Trace("ui-commit",new { applied });
             }
             catch (OperationCanceledException)
             {
+                Trace("cancelled",new { });
                 // Overlay lifetime owns cancellation.
             }
             catch
             {
+                Trace("failed",new { category="extraction-failed" });
                 overlay.ShowExtractedText(capture.Version, string.Empty, "文字提取失败，未显示私密诊断。");
             }
         }
     }
 
-    private void RunCapture(
+    private async void RunCapture(
         Func<CapturedFrame> capture,
         Func<CapturedFrame, IEnumerable<Rectangle>> successBounds)
     {
-        try
-        {
-            using var frame = capture();
-            _outputService!.SaveAndCopy(frame.Bitmap);
-            if (_settings!.ShowBorderFeedback)
-            {
-                _feedbackService.ShowSuccess(successBounds(frame));
-            }
-        }
-        catch
-        {
-            var pointerMonitor = Forms.Screen.FromPoint(Forms.Cursor.Position);
-            if (_settings!.ShowBorderFeedback)
-            {
-                _feedbackService.ShowFailure(pointerMonitor.Bounds);
-            }
-        }
+        await RunQuickCaptureAsync(() => Task.FromResult(capture()), successBounds);
     }
 
     private async Task RunCurrentMonitorCaptureAsync()
     {
-        try
-        {
-            using var frame = await _captureService.CaptureCurrentMonitorGameCompatibleAsync();
-            _outputService!.SaveAndCopy(frame.Bitmap);
-            if (_settings!.ShowBorderFeedback
-                && CaptureFeedbackPolicy.ShouldShowAppSuccess(frame.HasSystemCaptureFeedback))
-            {
-                _feedbackService.ShowSuccess(CurrentMonitorBounds(frame));
-            }
-        }
-        catch
-        {
-            var pointerMonitor = Forms.Screen.FromPoint(Forms.Cursor.Position);
-            if (_settings!.ShowBorderFeedback)
-            {
-                _feedbackService.ShowFailure(pointerMonitor.Bounds);
-            }
-        }
+        await RunQuickCaptureAsync(() => _captureService.CaptureCurrentMonitorGameCompatibleAsync(), CurrentMonitorBounds, honorSystemFeedback:true);
     }
 
     private async Task RunCurrentMonitorCaptureIncludingTaskbarAsync()
     {
-        try
-        {
-            using var frame = await _captureService.CaptureCurrentMonitorIncludingTaskbarGameCompatibleAsync();
-            _outputService!.SaveAndCopy(frame.Bitmap);
-            if (_settings!.ShowBorderFeedback
-                && CaptureFeedbackPolicy.ShouldShowAppSuccess(frame.HasSystemCaptureFeedback))
-            {
-                _feedbackService.ShowSuccess(CurrentMonitorBounds(frame));
-            }
-        }
-        catch
-        {
-            var pointerMonitor = Forms.Screen.FromPoint(Forms.Cursor.Position);
-            if (_settings!.ShowBorderFeedback)
-            {
-                _feedbackService.ShowFailure(pointerMonitor.Bounds);
-            }
-        }
+        await RunQuickCaptureAsync(() => _captureService.CaptureCurrentMonitorIncludingTaskbarGameCompatibleAsync(), CurrentMonitorBounds, honorSystemFeedback:true);
     }
 
     private static IEnumerable<Rectangle> CurrentMonitorBounds(CapturedFrame frame) => [frame.ScreenBounds];
@@ -1917,30 +2128,42 @@ public partial class App : System.Windows.Application
             _deepSeekCostLedger?.Load() ?? DeepSeekCostSummary.Empty(DateTimeOffset.UtcNow),
             () => _deepSeekCostLedger!.Load(),
             () => _deepSeekCostLedger!.Reset(DateTimeOffset.UtcNow));
-        _settingsWindow.SettingsApplied += (_, settings) =>
+        AttachSettingsWindow(_settingsWindow);
+        _settingsWindow.Show();
+        _settingsWindow.Activate();
+    }
+
+    internal void AttachSettingsWindow(SettingsWindow window)
+    {
+        _settingsWindow = window;
+        window.ReportHotkeyRegistration(_lastHotkeyRegistration ?? HotkeyRegistrationResult.Empty);
+        if (_translationClosing)
+        {
+            window.BeginApplicationExit();
+            if (LastExitWarning is not null) window.ReportExitWarning(LastExitWarning);
+        }
+        window.RequestApplicationExit = action => RequestManagedShutdownAsync(finalShutdown: () => { action(); Shutdown(); });
+        window.SettingsApplied += (_, settings) =>
         {
             _settingsLoadWarning = null;
             ApplySettings(settings, registerHotkeys: true);
         };
-        _settingsWindow.HotkeyCaptureFocusChanged += (_, isCapturing) =>
+        window.HotkeyCaptureFocusChanged += (_, isCapturing) =>
         {
             if (isCapturing)
             {
-                _hotkeyHost?.Dispose();
-                _hotkeyHost = null;
+                ReleaseHotkeys();
             }
             else if (_settingsWindow is not null)
             {
                 RegisterHotkeys();
             }
         };
-        _settingsWindow.Closed += (_, _) =>
+        window.Closed += (_, _) =>
         {
             _settingsWindow = null;
             RegisterHotkeys();
         };
-        _settingsWindow.Show();
-        _settingsWindow.Activate();
     }
 
     private TranslationWindow OpenTranslationWindow()
@@ -1970,39 +2193,126 @@ public partial class App : System.Windows.Application
 
     private async void StartLiveTranslationSelection(TranslationRouteKind? requestedRoute = null, string? targetLanguage = null)
     {
-        if (_liveTranslationSelectionActive) return;
-        if (_liveTranslationSession is not null || _liveTranslationStartup is not null)
+        if (!TryResolveLiveRoute(requestedRoute, out _)) return;
+        await RunLiveTranslationEntryAsync(null, requestedRoute, targetLanguage);
+    }
+
+    private async void StartLiveTranslation(ClipRay.Core.Geometry.PixelRect selected,
+        TranslationRouteKind? requestedRoute = null, string? targetLanguage = null)
+    {
+        if (!TryResolveLiveRoute(requestedRoute, out _)) return;
+        await RunLiveTranslationEntryAsync(selected, requestedRoute, targetLanguage);
+    }
+
+    internal async Task RunLiveTranslationEntryAsync(ClipRay.Core.Geometry.PixelRect? selected,
+        TranslationRouteKind? requestedRoute = null, string? targetLanguage = null)
+    {
+        if (_translationClosing) return;
+        if (!TryResolveLiveRoute(requestedRoute, out var route)) return;
+        if (_liveStartup.Current is not null || _liveTranslationSession is not null) return;
+        if (LiveTranslationWorkerRegistry.HasUnresolvedWorker)
         {
-            SetTrayTooltip(LiveUi("ClipRay | 实时翻译已在进行中", "ClipRay | Live translation is already running"));
+            SetTrayTooltip(LiveUi("ClipRay | 等待上一项翻译退出", "ClipRay | Waiting for previous translation to finish"));
             return;
         }
-
-        _liveTranslationSelectionActive = true;
-        var warmup = EnsureMachineTranslationWarmup();
+        var settings = _settings!;
         try
         {
-            var selector = new LiveTranslationSelectionWindow(_settings!.InterfaceLanguage);
-            var selected = await selector.SelectAsync();
-            if (selected is not { } pixelRegion) return;
-            await warmup.ConfigureAwait(true);
-            StartLiveTranslation(pixelRegion, requestedRoute, targetLanguage);
+            await _liveStartup.RunAsync(selected, route, settings,
+                targetLanguage ?? settings.TranslationTargetLanguage,
+                LiveSelectionFactory ?? SelectLiveRegionAsync,
+                LiveWarmupFactory ?? WarmLiveRouteAsync,
+                LiveSessionFactory ?? StartLiveTranslationRegionAsync);
         }
-        catch
+        catch (Exception)
         {
             SetTrayTooltip(LiveUi("ClipRay | 无法启动实时翻译", "ClipRay | Could not start live translation"));
         }
-        finally
+    }
+
+    private async Task<ClipRay.Core.Geometry.PixelRect?> SelectLiveRegionAsync(LiveTranslationOperation operation)
+    {
+        var selector = new LiveTranslationSelectionWindow(operation.Settings.InterfaceLanguage);
+        operation.OwnSelection(selector.Close);
+        return await selector.SelectAsync();
+    }
+
+    private Task WarmLiveRouteAsync(LiveTranslationOperation operation) => operation.Route == TranslationRouteKind.Machine
+        ? EnsureMachineTranslationWarmup() : WarmOcrAsync(_machineOcr, operation.Token);
+
+    private async Task WarmOcrAsync(OcrService service, CancellationToken token)
+    {
+        using var admission = _translationRequests.Enter();
+        using var stopped = CancellationTokenSource.CreateLinkedTokenSource(token, _translationRequests.Token);
+        await _ocrGate.WaitAsync(stopped.Token).ConfigureAwait(false);
+        try { await service.WarmupAsync(stopped.Token).ConfigureAwait(false); }
+        finally { _ocrGate.Release(); }
+    }
+
+    internal async Task<LiveTranslationScreenCapture> PrepareLiveCaptureAsync(LiveTranslationOperation operation,
+        Rectangle region, Func<Rectangle, Bitmap> capture)
+    {
+        operation.CheckCurrent();
+        var preparing = operation.Observe(LiveCaptureFactory is { } factory
+            ? factory(region, operation.Token, capture)
+            : LiveTranslationScreenCapture.StartForRegionAsync(region, operation.Token, capture));
+        try { return await operation.AwaitAsync(preparing, TimeSpan.FromSeconds(2)); }
+        catch
         {
-            _liveTranslationSelectionActive = false;
+            // A capture factory may ignore cancellation. Its result still has an owner.
+            var cleanup = preparing.ContinueWith(async task =>
+            {
+                if (task.IsCompletedSuccessfully) await task.Result.DisposeAsync().ConfigureAwait(false);
+                else _ = task.Exception;
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default).Unwrap();
+            LiveTranslationWorkerRegistry.Register(cleanup);
+            throw;
         }
     }
 
+    internal bool TryApplyLiveFrame(LiveTranslationOperation operation, LiveTranslationSession session,
+        LiveTranslationFrameReadyEventArgs args, Func<bool> apply)
+    {
+        if (!ReferenceEquals(_liveTranslationSession, session) || !_liveStartup.IsCurrent(operation)
+            || !session.CanPresent(args) || !apply()) return false;
+        session.MarkDisplayApplied(args.Generation);
+        return true;
+    }
+
+    internal void QueueLiveFrame(LiveTranslationOperation operation, LiveTranslationSession session,
+        LiveTranslationFrameReadyEventArgs frame, Func<bool> apply, Action? presented = null, Action<Exception>? failed = null) =>
+        DispatchLiveDisplay(() =>
+        {
+            try { if (TryApplyLiveFrame(operation, session, frame, apply)) presented?.Invoke(); }
+            catch (Exception error) { failed?.Invoke(error); }
+        });
+
+    internal void QueueLiveInvalidation(LiveTranslationOperation operation, LiveTranslationSession session, Action clear)
+    {
+        var generation = session.Generation;
+        DispatchLiveDisplay(() =>
+        {
+            if (ReferenceEquals(_liveTranslationSession, session) && _liveStartup.IsCurrent(operation)
+                && session.CanInvalidateDisplay(generation))
+            {
+                clear();
+                session.MarkDisplayApplied(generation);
+            }
+        });
+    }
+
+    private void DispatchLiveDisplay(Action action)
+    {
+        if (LiveDisplayDispatcher is { } dispatch) dispatch(action);
+        else Dispatcher.BeginInvoke(action);
+    }
     private async Task WarmMachineTranslationAsync()
     {
+        var provider = GetMachineTranslationProvider();
         try
         {
-            await Task.WhenAll(_machineOcr.WarmupAsync(CancellationToken.None),
-                GetMachineTranslationProvider().TranslateManyAsync(
+            await Task.WhenAll(WarmOcrAsync(_machineOcr, CancellationToken.None),
+                provider.TranslateManyAsync(
                     [new TranslationRequest("en", "zh", "Ready.")], CancellationToken.None));
         }
         catch { /* Actual translation reports missing or failed components. */ }
@@ -2011,9 +2321,20 @@ public partial class App : System.Windows.Application
     private Task EnsureMachineTranslationWarmup() =>
         _machineTranslationWarmup ??= WarmMachineTranslationAsync();
 
-    private async void StartLiveTranslation(ClipRay.Core.Geometry.PixelRect selected,
-        TranslationRouteKind? requestedRoute = null, string? targetLanguage = null)
+    private bool TryResolveLiveRoute(TranslationRouteKind? requestedRoute, out TranslationRouteKind route)
     {
+        if (LiveTranslationRoutePolicy.TryResolve(requestedRoute, _settings?.LiveTranslationProvider ?? "DeepSeek", out route)) return true;
+        SetTrayTooltip(LiveUi("ClipRay | 所选模型不支持实时翻译，请选择本地机翻或 DeepSeek",
+            "ClipRay | Select local machine translation or DeepSeek for live translation"));
+        return false;
+    }
+
+    private async Task StartLiveTranslationRegionAsync(LiveTranslationOperation operation, ClipRay.Core.Geometry.PixelRect selected)
+    {
+        operation.CheckCurrent();
+        var route = operation.Route;
+        var liveSettings = operation.Settings;
+        using var services = CaptureTranslationServices(route, liveSettings);
         if (_liveTranslationSession is not null || _liveTranslationStartup is not null) return;
         if (LiveTranslationWorkerRegistry.HasUnresolvedWorker)
         {
@@ -2029,8 +2350,7 @@ public partial class App : System.Windows.Application
             (int)Math.Round(selected.Y),
             (int)Math.Round(selected.Width),
             (int)Math.Round(selected.Height));
-        var route = LiveTranslationRoutePolicy.Resolve(requestedRoute, _settings!.LiveTranslationProvider);
-        var target = targetLanguage ?? _settings!.TranslationTargetLanguage;
+        var target = operation.Target;
         if (!Forms.Screen.AllScreens.Any(screen => screen.Bounds.Contains(region)))
         {
             System.Windows.MessageBox.Show(LiveUi("实时翻译当前支持单显示器选区，请在同一显示器内重新选择。",
@@ -2048,22 +2368,25 @@ public partial class App : System.Windows.Application
         var overlay = new LiveTranslationOverlayWindow(
             region,
             showBorder: LiveTranslationCaptureVisibilityPolicy.SelectedRegionBorderVisible,
-            showInRecordings: _settings.ShowLiveTranslationInRecordings);
-        var stopControl = _settings.ShowLiveTranslationStopControl
-            ? new LiveTranslationStopControlWindow(region, _settings!.InterfaceLanguage) : null;
-        using var acceptanceTrace = new LiveTranslationAcceptanceTrace();
+            showInRecordings: liveSettings.ShowLiveTranslationInRecordings);
+        var stopControl = liveSettings.ShowLiveTranslationStopControl
+            ? new LiveTranslationStopControlWindow(region, liveSettings.InterfaceLanguage) : null;
+        using var acceptanceTrace = LiveTranslationAcceptanceTrace.ForRuntime(_paths!.DiagnosticsRoot);
         if (acceptanceTrace.Enabled)
             acceptanceTrace.Record("session_context", data: new {
-                AppVersion = GetType().Assembly.GetName().Version?.ToString(3),
+                AppVersion = CurrentApplicationVersion(),
                 ExecutableSha256 = CurrentExecutableSha256(),
                 Region = region,
                 Monitor = Forms.Screen.FromRectangle(region).Bounds,
                 Route = route.ToString(),
                 TargetLanguage = target,
-                ShowInRecordings = _settings.ShowLiveTranslationInRecordings
+                ShowInRecordings = liveSettings.ShowLiveTranslationInRecordings
             });
+        var liveCloudProvider = _liveCloudProvider ??= new DeepSeekTranslationProvider(_credentialVault,
+            deferVisualPartialRetries: true);
         var semanticCache = new LiveTranslationRequestCache(
-            TranslateVisualRequestsAsync,
+            (selectedRoute, requests, token) => TranslateVisualRequestsCoreAsync(
+                selectedRoute, requests, token, liveCloudProvider, services),
             diagnostic => acceptanceTrace.Record(diagnostic.Kind,
                 identity: LiveTranslationWorkContext.Current, data: diagnostic));
         async Task<TranslationBatchOutcome> TracedTranslate(
@@ -2124,15 +2447,15 @@ public partial class App : System.Windows.Application
             stopControl.Close();
             return;
         }
-        using var startup = new CancellationTokenSource();
+        using var startup = CancellationTokenSource.CreateLinkedTokenSource(operation.Token);
         _liveTranslationStartup = startup;
         LiveTranslationScreenCapture screenCapture;
         try
         {
-            screenCapture = await LiveTranslationScreenCapture.StartForRegionAsync(
+            screenCapture = await PrepareLiveCaptureAsync(operation,
                 region,
-                startup.Token,
                 CaptureSelectedPixels);
+            operation.CheckCurrent();
         }
         catch (OperationCanceledException)
         {
@@ -2252,7 +2575,18 @@ public partial class App : System.Windows.Application
             },
             route,
             validateLayoutRegions: true,
-            verifySource: RecognizeMachineAsync);
+            verifySource: async (bitmap, cancellationToken) =>
+            {
+                var recognition = await RecognizeMachineAsync(bitmap, cancellationToken).ConfigureAwait(false);
+                if (acceptanceTrace.Enabled)
+                    acceptanceTrace.Record("semantic_ocr", identity: LiveTranslationWorkContext.Current,
+                        data: new {
+                            SourceHash = Convert.ToHexString(new LiveTranslationPixelSnapshot(bitmap).FullHash()),
+                            bitmap.Width, bitmap.Height, recognition.IsSuccess, recognition.Status,
+                            recognition.Blocks
+                        });
+                return recognition;
+            });
 
         void RecordDecisions(ApplicationTranslationOutcome outcome, LiveTranslationWorkIdentity? identity)
         {
@@ -2314,15 +2648,14 @@ public partial class App : System.Windows.Application
                 diagnostic.ErrorCategory,
                 diagnostic.QuarantinedLayouts
             });
-        session.FrameReady += (_, args) => Dispatcher.BeginInvoke(() => _ = PresentAsync(args));
+        operation.CheckCurrent();
+        session.FrameReady += (_, args) => QueueLiveFrame(operation, session, args,
+            () => overlay.Apply(args.Frame, args.Generation), () => _ = PresentAsync(args),
+            error => acceptanceTrace.Record("apply_failed", args.Generation, args.WorkIdentity,
+                new { Category = error.GetType().Name }));
 
         async Task PresentAsync(LiveTranslationFrameReadyEventArgs args)
         {
-            if (!ReferenceEquals(_liveTranslationSession, session)
-                || args.Generation != session.Generation
-                || args.WorkIdentity?.ViewportGeneration != session.ViewportGeneration)
-                return;
-            if (!overlay.Apply(args.Frame, args.Generation)) return;
             acceptanceTrace.Record("applied", args.Generation, args.WorkIdentity, new {
                 State = args.Frame.ResultState.ToString(),
                 Layouts = args.Frame.LayoutItems.Count,
@@ -2347,7 +2680,7 @@ public partial class App : System.Windows.Application
                 acknowledgeError = exception.GetType().Name;
             }
             if (acknowledged && ReferenceEquals(_liveTranslationSession, session)
-                && args.Generation == session.Generation)
+                && args.Generation == session.AppliedDisplayGeneration)
                 acceptanceTrace.Record("render_cycle_observed", args.Generation, args.WorkIdentity,
                     new { Visible = overlay.IsVisible, Layouts = args.Frame.LayoutItems.Count });
             else
@@ -2361,14 +2694,15 @@ public partial class App : System.Windows.Application
                         Layouts = args.Frame.LayoutItems.Count
                     });
         }
-        session.FrameInvalidated += (_, _) => Dispatcher.Invoke(() =>
+        session.FrameInvalidated += (_, _) =>
         {
-            if (ReferenceEquals(_liveTranslationSession, session))
+            var invalidatedGeneration = session.Generation;
+            QueueLiveInvalidation(operation, session, () =>
             {
                 overlay.Clear();
-                acceptanceTrace.Record("cleared", session.Generation);
-            }
-        });
+                acceptanceTrace.Record("cleared", invalidatedGeneration);
+            });
+        };
         if (stopControl is not null) stopControl.RequestStop += (_, _) =>
         {
             acceptanceTrace.Record("stop_button", session.Generation);
@@ -2414,7 +2748,7 @@ public partial class App : System.Windows.Application
             stopControl?.ShowStatus("Esc 未注册 · 请点击停止按钮或使用停止快捷键");
         }
         SetTrayTooltip(LiveUi("ClipRay | 实时翻译中", "ClipRay | Live translation running"));
-        await session.StartAsync(CancellationToken.None);
+        await session.StartAsync(operation.Token);
         if (session.State == LiveTranslationSessionState.StoppedAfterConsecutiveFailures)
             SetTrayTooltip(LiveUi("ClipRay | 实时翻译连续失败，已停止", "ClipRay | Live translation stopped after repeated failures"));
         }
@@ -2473,10 +2807,93 @@ public partial class App : System.Windows.Application
 
     private void StopLiveTranslation()
     {
+        _liveStartup.Stop();
         _liveTranslationStartup?.Cancel();
         _liveTranslationSession?.Stop();
         CloseLiveTranslationUi();
         if (_stopLiveTranslationMenuItem is not null) _stopLiveTranslationMenuItem.Enabled = false;
+    }
+
+    // The caller decides draft/recording policy before this point. A cancelled
+    // decision never closes translation admission. Task 4/5 compose here.
+    internal Task<bool> RequestManagedShutdownAsync(Func<Task<bool>>? mayExit = null, Action? finalShutdown = null,
+        TimeSpan? drainBudget = null)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var existing = Interlocked.CompareExchange(ref _managedShutdownAttempt, completion.Task, null);
+        if (existing is not null) return existing;
+        _ = CompleteManagedShutdownAttemptAsync(completion, mayExit, finalShutdown, drainBudget);
+        return completion.Task;
+    }
+
+    private async Task CompleteManagedShutdownAttemptAsync(TaskCompletionSource<bool> completion,
+        Func<Task<bool>>? mayExit, Action? finalShutdown, TimeSpan? drainBudget)
+    {
+        var committed = false;
+        try
+        {
+            var allowed = mayExit is not null ? await mayExit() : _settingsWindow?.TryPrepareDraftClose() ?? true;
+            if (!allowed) return;
+            _settingsWindow?.BeginApplicationExit();
+            RequestImageOutputRetirement();
+            RequestRecordingRetirement();
+            RequestTranslationRetirement();
+            var result = await DrainTranslationAsync(drainBudget ?? TimeSpan.FromSeconds(2));
+            if (!result.Completed)
+            {
+                LastExitWarning = result.Failures.Count > 0
+                    ? LiveUi($"后台资源释放失败（{string.Join(", ", result.Failures)}）；退出未完成。" + (result.Pending > 0 ? $"另有 {result.Pending} 项仍在结束。" : "请保留此状态以排查，不会自动重新创建失败资源。"),
+                        $"Background resource release failed ({string.Join(", ", result.Failures)}); Exit did not complete. " + (result.Pending > 0 ? $"{result.Pending} other tasks remain pending." : "Keep this state for diagnosis; failed owners will not be recreated automatically."))
+                    : LiveUi($"后台仍有 {result.Pending} 项任务在结束；可稍后重试退出。", $"{result.Pending} background tasks are still stopping; retry Exit shortly.");
+                _settingsWindow?.ReportExitWarning(LastExitWarning);
+                SetTrayTooltip("ClipRay | " + LastExitWarning);
+                return;
+            }
+            LastExitWarning = null;
+            PrepareSettingsForCommittedShutdown();
+            (finalShutdown ?? (() => Shutdown()))();
+            committed = true;
+        }
+        catch (Exception error)
+        {
+            LastExitWarning = LiveUi($"退出未完成（错误 0x{unchecked((uint)error.HResult):X8}）；请检查退出状态。", "Exit did not complete. Review the exit state before retrying.");
+            _settingsWindow?.ReportExitWarning(LastExitWarning);
+            SetTrayTooltip("ClipRay | " + LastExitWarning);
+        }
+        finally
+        {
+            if (!committed) _ = Interlocked.CompareExchange(ref _managedShutdownAttempt, null, completion.Task);
+            completion.TrySetResult(committed);
+        }
+    }
+
+    internal void RequestTranslationRetirement()
+    {
+        if (_translationClosing) return;
+        _translationClosing = true;
+        StopLiveTranslation();
+        _overlayTranslationOperations.CancelPending();
+        void Retire(string name, Func<Task> request)
+        {
+            try { _translationRetirements.Track(name, request()); }
+            catch (Exception error) { _translationRetirements.Track(name, Task.FromException(error)); }
+        }
+        Retire("common-ocr", () => _machineOcr.DisposeAsync().AsTask());
+        Retire("visual-ocr", _translationServices.RetireAsync);
+        Retire("translation-requests", () => _translationRequests.RetireAsync(() => Task.CompletedTask));
+        Retire("uia-query",UiQueryScheduler.Shared.RetireAsync);
+        if (_machineTranslationProvider is IAsyncDisposable machine)
+            Retire("machine-provider", () => machine.DisposeAsync().AsTask());
+        else if (_machineTranslationProvider is IDisposable synchronousMachine)
+            Retire("machine-provider", () => Task.Run(synchronousMachine.Dispose));
+        if (_localTranslationProvider is { } local)
+            Retire("local-provider", () => _localProviderOwners.RetireAsync(local.RetireAsync));
+    }
+
+    internal async Task<ResourceDrainResult> DrainTranslationAsync(TimeSpan budget)
+    {
+        _translationRetirements.Track("live-workers", LiveTranslationWorkerRegistry.DrainAsync());
+        return await _translationRetirements.DrainAsync(budget);
     }
 
     private void CloseLiveTranslationUi()
@@ -2491,32 +2908,44 @@ public partial class App : System.Windows.Application
 
     private IDeepSeekTranslationProvider GetTranslationProvider() => _translationServices.Provider;
 
-    private Task<TranslationResult> TranslateConfiguredAsync(TranslationRequest request, CancellationToken cancellationToken)
+    private sealed record TranslationServiceSnapshot(AppSettings Settings, IDeepSeekTranslationProvider? Cloud,
+        LocalTranslationProvider? Local, IMachineTranslationProvider? Machine, IDisposable? Lease) : IDisposable
+    { public void Dispose() => Lease?.Dispose(); }
+
+    private TranslationServiceSnapshot CaptureTranslationServices(TranslationRouteKind route, AppSettings? settings = null)
     {
-        if (_settings!.Provider == "Local LMT") return GetLocalTranslationProvider().TranslateAsync(request, cancellationToken);
-        if (_settings.Provider == "Machine") return TranslateMachineAsync(request, cancellationToken);
-        if (string.IsNullOrWhiteSpace(_settings.CredentialName))
-        {
-            return Task.FromResult(new TranslationResult(false, string.Empty, "请先在设置中选择本地保存的 DeepSeek 凭据。"));
-        }
-        return GetTranslationProvider().TranslateAsync(request, _settings.CredentialName, cancellationToken);
+        ObjectDisposedException.ThrowIf(_translationClosing, this);
+        settings ??= _settings!;
+        var local = route == TranslationRouteKind.LocalLmt ? GetLocalTranslationProvider() : null;
+        var machine = route == TranslationRouteKind.Machine || settings.MachineTranslationFallbackEnabled
+            ? GetMachineTranslationProvider() : null;
+        var cloud = route is TranslationRouteKind.DeepSeekFlash or TranslationRouteKind.DeepSeekPro
+            ? GetTranslationProvider() : null;
+        return new(settings, cloud, local, machine, local is null ? null : _localProviderOwners.Enter());
     }
+
+    private Task<TranslationResult> TranslateConfiguredAsync(TranslationRequest request, CancellationToken cancellationToken) =>
+        TranslateUsingRouteAsync(request, TranslationRouteKind.FollowSettings, cancellationToken);
 
     private async Task<TranslationResult> TranslateUsingRouteAsync(
         TranslationRequest request,
         TranslationRouteKind route,
         CancellationToken cancellationToken)
     {
+        using var admission = _translationRequests.Enter();
+        using var stopped = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _translationRequests.Token);
+        cancellationToken = stopped.Token;
         var settings = _settings ?? throw new InvalidOperationException("Translation settings are unavailable.");
         var resolved = ResolveTranslationRoute(route);
+        using var services = CaptureTranslationServices(resolved, settings);
         TranslationResult result;
         if (resolved == TranslationRouteKind.LocalLmt)
         {
-            result = await GetLocalTranslationProvider().TranslateAsync(request, cancellationToken);
+            result = await services.Local!.TranslateAsync(request, cancellationToken);
         }
         else if (resolved == TranslationRouteKind.Machine)
         {
-            return await TranslateMachineAsync(request, cancellationToken).ConfigureAwait(false);
+            return (await services.Machine!.TranslateManyAsync([request], cancellationToken).ConfigureAwait(false))[0];
         }
         else if (string.IsNullOrWhiteSpace(settings.CredentialName))
         {
@@ -2533,12 +2962,12 @@ public partial class App : System.Windows.Application
                 request.TextKind,
                 request.Scene,
                 request.TranslationHint);
-            result = await GetTranslationProvider().TranslateAsync(routed, settings.CredentialName, cancellationToken);
+            result = await services.Cloud!.TranslateAsync(routed, settings.CredentialName, cancellationToken);
             RecordDeepSeekCost(result.CostEstimate);
         }
         if (!result.IsSuccess && settings.MachineTranslationFallbackEnabled)
         {
-            var fallback = await TranslateMachineAsync(request, cancellationToken).ConfigureAwait(false);
+            var fallback = (await services.Machine!.TranslateManyAsync([request], cancellationToken).ConfigureAwait(false))[0];
             if (fallback.IsSuccess) return fallback;
         }
         return result;
@@ -2558,13 +2987,34 @@ public partial class App : System.Windows.Application
 
     private void RecordDeepSeekCost(DeepSeekCostEstimate? estimate)
     {
-        if (estimate is not null) _deepSeekCostLedger?.Record(estimate);
+        if (estimate is not null) TranslationCostRecording.TryRecord(estimate, value => _deepSeekCostLedger?.Record(value!), () =>
+        {
+            var message=AppUi("翻译已保留，费用统计未写入", "Translation retained; cost accounting unavailable");
+            if (OutputWarningOverride is not null) OutputWarning(message);
+            else Dispatcher.BeginInvoke(() => OutputWarning(message));
+        });
     }
 
-    private LocalTranslationProvider GetLocalTranslationProvider() => _localTranslationProvider ??=
-        new LocalTranslationProvider(LocalLmtOptions.Discover(_settings!.LocalLmtModelPath));
+    private LocalTranslationProvider GetLocalTranslationProvider()
+    {
+        ObjectDisposedException.ThrowIf(_translationClosing, this);
+        if (_localProviderRetirement is { } retirement)
+        {
+            if (!retirement.IsCompletedSuccessfully)
+                throw new InvalidOperationException(retirement.IsFaulted ? "local-model-retirement-failed"
+                    : retirement.IsCanceled ? "local-model-retirement-cancelled" : "local-model-retiring",
+                    retirement.Exception?.GetBaseException());
+            _retiringLocalProvider = null;
+            _localProviderRetirement = null;
+        }
+        return _localTranslationProvider ??= LocalProviderFactory is { } factory ? factory()
+            : new LocalTranslationProvider(LocalLmtOptions.Discover(_settings!.LocalLmtModelPath));
+    }
 
-    private IMachineTranslationProvider GetMachineTranslationProvider() => _machineTranslationProvider ??=
+    private IMachineTranslationProvider GetMachineTranslationProvider()
+    {
+        ObjectDisposedException.ThrowIf(_translationClosing, this);
+        return _machineTranslationProvider ??=
         new LocalMachineTranslationProvider(new BundledMachineTranslationProcess(
             Path.Combine(AppContext.BaseDirectory, "machine-translation", "runtime", "python.exe"),
             Path.Combine(AppContext.BaseDirectory, "machine-translation", "machine_translation_worker.py"),
@@ -2572,6 +3022,7 @@ public partial class App : System.Windows.Application
             LiveTranslationAcceptanceTrace.RecordIntegrityFailure,
             supportsCommonLanguages: MachineTranslationModelPaths.IsCommonLanguageModel(MachineTranslationModelPaths.Resolve(AppContext.BaseDirectory)),
             onProtectedFailure: LiveTranslationAcceptanceTrace.RecordProtectedFailure);
+    }
 
     private async Task<TranslationResult> TranslateMachineAsync(
         TranslationRequest request,
@@ -2581,6 +3032,7 @@ public partial class App : System.Windows.Application
     private void ApplySettings(AppSettings settings, bool registerHotkeys)
     {
         settings.Validate();
+        var previous = _settings;
         if (AppInterfaceLanguage.IsOnlyInterfaceChange(_settings, settings))
         {
             _settings = settings;
@@ -2588,181 +3040,56 @@ public partial class App : System.Windows.Application
                 AppInterfaceLanguage.UpdateTray(existingMenu.Items, settings.InterfaceLanguage);
             return;
         }
-        if (_liveTranslationSession is not null || _liveTranslationStartup is not null) StopLiveTranslation();
-        _localTranslationProvider?.Dispose();
-        _localTranslationProvider = null;
-        (_machineTranslationProvider as IDisposable)?.Dispose();
-        _machineTranslationProvider = null;
-        _machineTranslationWarmup = null;
+        if (previous is not null && (previous.LiveTranslationProvider != settings.LiveTranslationProvider
+            || previous.TranslationTargetLanguage != settings.TranslationTargetLanguage
+            || previous.ShowLiveTranslationStopControl != settings.ShowLiveTranslationStopControl
+            || previous.ShowLiveTranslationInRecordings != settings.ShowLiveTranslationInRecordings
+            || previous.MachineTranslationFallbackEnabled != settings.MachineTranslationFallbackEnabled
+            || previous.CredentialName != settings.CredentialName)) StopLiveTranslation();
+        if (previous?.LocalLmtModelPath != settings.LocalLmtModelPath && _localTranslationProvider is { } oldLocal)
+        {
+            _retiringLocalProvider = oldLocal;
+            _localTranslationProvider = null;
+            _localProviderRetirement = _localProviderOwners.RetireAsync(oldLocal.RetireAsync);
+            _translationRetirements.Track("local-model-change", _localProviderRetirement);
+            _localProviderOwners = new();
+        }
         _settings = settings;
         if (_trayIcon?.ContextMenuStrip is { } menu) AppInterfaceLanguage.UpdateTray(menu.Items, settings.InterfaceLanguage);
+        if (previous is null || previous.ScreenshotDirectory != settings.ScreenshotDirectory || previous.CopyToClipboard != settings.CopyToClipboard)
         _outputService = new ImageOutputService(
             settings.ScreenshotDirectory,
             settings.CopyToClipboard,
             OutputArtifactKind.Screenshot);
+        if (previous is null || previous.LongCaptureDirectory != settings.LongCaptureDirectory || previous.CopyToClipboard != settings.CopyToClipboard)
         _longCaptureOutputService = new ImageOutputService(
             settings.LongCaptureDirectory,
             settings.CopyToClipboard,
             OutputArtifactKind.LongCapture);
-        if (settings.Provider == "Machine" || settings.MachineTranslationFallbackEnabled)
+        if ((previous is null || previous.Provider != settings.Provider || previous.MachineTranslationFallbackEnabled != settings.MachineTranslationFallbackEnabled)
+            && (settings.Provider == "Machine" || settings.MachineTranslationFallbackEnabled))
             _ = EnsureMachineTranslationWarmup();
-        if (registerHotkeys) RegisterHotkeys();
+        if (registerHotkeys) (RegisterHotkeysOverride ?? RegisterHotkeys)();
     }
 
     private async void HandleRecordingRequested(object? sender, RegionRecordingRequest request)
     {
         if (sender is not SelectionOverlayWindow overlay) return;
-        if (_recordingSession is not null)
-        {
-            overlay.RestoreAfterRecordingFailure("录屏已在进行中");
-            return;
-        }
-        var mapping = RecordingGeometry.MapToMonitor(
-            request.PhysicalPixelRegion,
-            Forms.Screen.AllScreens.Select(static screen => screen.Bounds).ToArray());
-        var crop = RecordingGeometry.NormalizeForEncoder(mapping.CropInMonitor);
-        var timeline = RecordingTimeline.StartNow();
-        _recordingPaths = RecordingOutputPaths.Create(_settings!.RecordingDirectory, DateTime.Now);
+        var closed = false;
+        void OnClosed(object? _, EventArgs __) => closed = true;
+        overlay.Closed += OnClosed;
         try
         {
-            var audio = RecordingStartupGuard.Execute(
-                RecordingStartupStage.AudioDevice,
-                () => new WasapiSystemAudioCaptureFactory(timeline).CreateDefaultRenderLoopback());
-            var recorder = new MediaFoundationRecorder(_recordingPaths, crop.Width, crop.Height, audio.Format);
-            var video = new GraphicsCaptureSource(mapping, timeline);
-            var session = new RecordingSession(new RegionRecordingRuntime(video, audio, recorder));
-            _recordingSession = session;
-            await session.StartAsync(CancellationToken.None);
-            RecordingStartupGuard.Execute(RecordingStartupStage.RecordingUi, () =>
-            {
-                _recordingBorder = new RecordingBorderWindow(request.PhysicalPixelRegion);
-                _recordingBorder.Show();
-                if (!_recordingBorder.IsCaptureSafe)
-                {
-                    _recordingBorder.Close();
-                    _recordingBorder = null;
-                }
-
-                _recordingControl = new RecordingControlWindow(request.PhysicalPixelRegion, _settings.InterfaceLanguage);
-                _recordingControl.StopRequested += (_, _) => StopRecording();
-                _recordingControl.Show();
-                _recordingControl.PlaceOutside(request.PhysicalPixelRegion);
-                _stopRecordingMenuItem!.Enabled = true;
-                overlay.Close();
-                SetTrayTooltip(AppUi($"ClipRay | 正在录屏，按 {HotkeyBindingPolicy.FormatForDisplay(
-                    _settings.StopRecordingHotkey,
-                    _settings.StopRecordingSecondaryHotkey)} 停止",
-                    $"ClipRay | Recording; press {HotkeyBindingPolicy.FormatForDisplay(
-                    _settings.StopRecordingHotkey,
-                    _settings.StopRecordingSecondaryHotkey)} to stop"));
-            });
+            await BeginRecordingAsync(request,overlay.RestoreAfterRecordingFailure,overlay.Close,
+                () => !closed && ReferenceEquals(_overlay,overlay));
         }
-        catch (Exception exception)
-        {
-            if (_recordingSession is { } failed)
-            {
-                try { await failed.StopAsync(); }
-                catch { /* 停止失败时仍以原始 partial 路径作为可恢复边界。 */ }
-            }
-            _recordingSession = null;
-            _recordingBorder?.Close();
-            _recordingBorder = null;
-            _recordingControl?.Close();
-            _recordingControl = null;
-            var partial = _recordingPaths.PartialPath;
-            overlay.RestoreAfterRecordingFailure(
-                RecordingFailureText.Format(exception, File.Exists(partial) ? partial : null,
-                    _settings?.InterfaceLanguage ?? "zh-CN"));
-        }
+        finally { overlay.Closed -= OnClosed; }
     }
 
     private async void StopRecording()
     {
-        var session = _recordingSession;
-        if (session is null || _recordingStopRequested) return;
-        _recordingStopRequested = true;
-        // 用户按下停止后录制反馈必须立刻消失；边框、计时条和托盘状态不能等待 finalize。
-        DismissRecordingFeedback();
-        SetTrayTooltip(AppUi("ClipRay | 正在保存录屏…", "ClipRay | Saving recording…"));
-        // 编码器要把积压的帧编完再写 moov，2560x1600 下实测能到数秒。先把预览窗亮出来
-        // 并置为等待态，停止到窗口出现之间就没有空档；收尾完成后再把成片接上去。
-        RecordingPreviewWindow? preview = null;
-        if (_recordingPaths?.FinalPath is { } pendingPath)
-        {
-            try
-            {
-                _recordingPreview?.Close();
-                preview = new RecordingPreviewWindow(pendingPath, pending: true,
-                    interfaceLanguage: _settings?.InterfaceLanguage ?? "zh-CN");
-                _recordingPreview = preview;
-                preview.Closed += (_, _) => _recordingPreview = null;
-                preview.Show();
-                preview.Activate();
-            }
-            catch
-            {
-                preview = null;
-                _recordingPreview = null;
-            }
-        }
-        try
-        {
-            // 编码收尾与文件 finalize 可能耗时；放到线程池执行，避免阻塞 UI 线程。
-            await Task.Run(session.StopAsync);
-            if (ReferenceEquals(_recordingSession, session) && _recordingPaths?.FinalPath is { } finalPath)
-            {
-                var copied = RecordingResultDelivery.TryCopyFile(finalPath, new WindowsRecordingFileClipboard());
-                SetTrayTooltip(copied
-                    ? AppUi($"ClipRay | 已保存并复制 {finalPath}", $"ClipRay | Saved and copied {finalPath}")
-                    : AppUi($"ClipRay | 已保存 {finalPath}", $"ClipRay | Saved {finalPath}"));
-                if (preview is not null)
-                {
-                    preview.AttachMedia(copied);
-                }
-                else
-                {
-                    ShowRecordingPreview(finalPath, copied);
-                }
-            }
-        }
-        catch
-        {
-            SetTrayTooltip($"ClipRay | partial: {_recordingPaths?.PartialPath}");
-            preview?.Fail(AppUi("收尾失败：成片没有写成，partial 文件已保留。",
-                "Finalizing failed. The video was not completed; the partial file was kept."));
-        }
-        finally
-        {
-            _recordingStopRequested = false;
-            if (ReferenceEquals(_recordingSession, session)) _recordingSession = null;
-            DismissRecordingFeedback();
-        }
-    }
-
-    private void ShowRecordingPreview(string finalPath, bool copied)
-    {
-        try
-        {
-            _recordingPreview?.Close();
-            _recordingPreview = new RecordingPreviewWindow(finalPath, initiallyCopied: copied,
-                interfaceLanguage: _settings?.InterfaceLanguage ?? "zh-CN");
-            _recordingPreview.Closed += (_, _) => _recordingPreview = null;
-            _recordingPreview.Show();
-            _recordingPreview.Activate();
-        }
-        catch
-        {
-            // 文件已经保存；预览失败时仍保留剪贴板文件投递结果。
-        }
-    }
-
-    private void DismissRecordingFeedback()
-    {
-        _recordingBorder?.Close();
-        _recordingBorder = null;
-        _recordingControl?.Close();
-        _recordingControl = null;
-        if (_stopRecordingMenuItem is not null) _stopRecordingMenuItem.Enabled = false;
+        try { await RecordingController.StopAsync(); }
+        catch (Exception error) { SetTrayTooltip($"ClipRay | recording stop: 0x{unchecked((uint)error.HResult):X8}"); }
     }
 
     private static void TryCancel(CancellationTokenSource? source)

@@ -6,7 +6,7 @@ namespace ClipRay.App.Ocr;
 internal sealed class ScriptSupplementalOcrRuntime(
     IOcrRuntime primary,
     IOcrRuntime supplemental,
-    Func<string, bool> belongsToSupplementalScript) : IOcrRuntime, IOcrWarmup, IDisposable
+    Func<string, bool> belongsToSupplementalScript) : IOcrRuntime, IOcrWarmup, IDisposable, IAsyncDisposable
 {
     public async Task<IReadOnlyList<OcrWord>> RecognizeAsync(Bitmap bitmap, CancellationToken cancellationToken)
     {
@@ -49,8 +49,12 @@ internal sealed class ScriptSupplementalOcrRuntime(
 
     public void Dispose()
     {
-        if (primary is IDisposable primaryDisposable) primaryDisposable.Dispose();
-        if (supplemental is IDisposable supplementalDisposable) supplementalDisposable.Dispose();
+        _ = DisposeAsync();
+    }
+    public async ValueTask DisposeAsync()
+    {
+        try { await OcrRuntimeRelease.ReleaseAsync(primary).ConfigureAwait(false); }
+        finally { await OcrRuntimeRelease.ReleaseAsync(supplemental).ConfigureAwait(false); }
     }
 }
 

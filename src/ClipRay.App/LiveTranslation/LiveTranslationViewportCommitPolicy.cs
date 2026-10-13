@@ -31,11 +31,12 @@ internal static class LiveTranslationViewportCommitPolicy
         IReadOnlyList<VisualTextRegion> sourceRegions,
         LiveTranslationRegionWitness candidate,
         LiveTranslationFrame frame,
-        Func<InPlaceLayoutItem, bool>? sameSourceText = null)
+        Func<InPlaceLayoutItem, bool>? sameSourceText = null,
+        bool sourceGeometryVerified = false)
     {
         var changes = LiveTranslationChangePlanner.Analyze(source, current, sourceRegions);
         var expected = frame.ExpectedLayoutCount > 0 ? frame.ExpectedLayoutCount : candidate.Count;
-        if (changes.IsViewportReplacement)
+        if (changes.IsViewportReplacement && !sourceGeometryVerified)
             return new(LiveTranslationViewportCommitState.Stale, LiveTranslationRegionWitness.Empty,
                 LiveTranslationViewportResultState.Stale,
                 new(expected, candidate.Count, 0, frame.RejectedLayoutCount), []);

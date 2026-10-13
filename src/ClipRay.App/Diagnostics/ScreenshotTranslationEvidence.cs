@@ -11,12 +11,17 @@ using ClipRay.App.Translation;
 namespace ClipRay.App.Diagnostics;
 
 /// <summary>
-/// A local, opt-in record of one screenshot translation. The rendered layer is an
+/// A local record of one screenshot translation. The rendered layer is an
 /// offscreen reconstruction; only a separate desktop observation can prove visibility.
 /// </summary>
 internal sealed class ScreenshotTranslationEvidence : IDisposable
 {
     internal const string SchemaVersion = "clipray.screenshot-evidence.v1";
+    internal const string DataSchemaVersion = "clipray.screenshot-evidence.v2-data";
+    private readonly bool _dataOnly;
+    private readonly bool _includeContent;
+    private readonly LocalDiagnosticSession _store;
+    private string ActiveSchema => _dataOnly ? DataSchemaVersion : SchemaVersion;
     private static readonly AsyncLocal<ScreenshotTranslationEvidence?> Active = new();
     private readonly object _gate = new();
     private readonly Stopwatch _clock = Stopwatch.StartNew();
@@ -43,8 +48,11 @@ internal sealed class ScreenshotTranslationEvidence : IDisposable
     internal string DirectoryPath => _directory;
     internal int WriteFailures => _writeFailures;
 
-    private ScreenshotTranslationEvidence(string root, string runId, DateTimeOffset startedUtc)
+    private ScreenshotTranslationEvidence(string root, string runId, DateTimeOffset startedUtc, bool dataOnly = false)
     {
+        _dataOnly = dataOnly;
+        _includeContent = !dataOnly || string.Equals(Environment.GetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_MODE"),"content",StringComparison.OrdinalIgnoreCase);
+        _store = new(root);
         if (!Guid.TryParseExact(runId, "N", out _))
             throw new ArgumentException("Evidence run ID must be a GUID in N format.", nameof(runId));
         _directory = Path.Combine(root, runId);
@@ -58,7 +66,20 @@ internal sealed class ScreenshotTranslationEvidence : IDisposable
     {
         var root = Environment.GetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_ROOT");
         if (!TryResolveLocalRoot(root, out var fullRoot)) return null;
-        try { return new ScreenshotTranslationEvidence(fullRoot, runId, startedUtc); }
+        try { return new ScreenshotTranslationEvidence(fullRoot, runId, startedUtc,
+            dataOnly: !string.Equals(Environment.GetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_MODE"),"images",StringComparison.OrdinalIgnoreCase)); }
+        catch { return null; }
+    }
+
+    internal static ScreenshotTranslationEvidence? StartForRuntime(string diagnosticsRoot,
+        string runId, DateTimeOffset startedUtc)
+    {
+        var root = Environment.GetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_ROOT")
+            ?? Path.Combine(diagnosticsRoot, "screenshot");
+        if (!TryResolveLocalRoot(root, out var localRoot)) return null;
+        var images = string.Equals(Environment.GetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_MODE"),
+            "images", StringComparison.OrdinalIgnoreCase);
+        try { return new ScreenshotTranslationEvidence(localRoot, runId, startedUtc, dataOnly: !images); }
         catch { return null; }
     }
 
@@ -111,9 +132,17 @@ internal sealed class ScreenshotTranslationEvidence : IDisposable
         {
             try
             {
+                if (_dataOnly)
+                {
+                    var fingerprint = PixelFingerprint.Create(bitmap);
+                    WriteEvent("source_frame_fingerprint", fingerprint);
+                    _sourceSha256 = fingerprint.sha256;
+                    _sourceSaved = true;
+                    return;
+                }
                 Directory.CreateDirectory(_directory);
                 var path = Path.Combine(_directory, "source.png");
-                bitmap.Save(path, ImageFormat.Png);
+                if (!_store.Image(path,stream=>bitmap.Save(stream,ImageFormat.Png))) throw new IOException("Diagnostic image budget.");
                 var hash = HashFile(path);
                 WriteEvent("source_image_saved", new
                 {
@@ -156,11 +185,21 @@ internal sealed class ScreenshotTranslationEvidence : IDisposable
             try
             {
                 var image = render();
+                if (_dataOnly)
+                {
+                    var fingerprint = PixelFingerprint.Create(image);
+                    WriteEvent("rendered_layer_fingerprint", new { fingerprint.sha256, fingerprint.width,
+                        fingerprint.height, fingerprint.pixel_format, fingerprint.byte_count,
+                        evidence_kind = "offscreen-layer-preview" });
+                    _renderSha256 = fingerprint.sha256;
+                    _renderSaved = true;
+                    return;
+                }
                 var encoder = new PngBitmapEncoder();
                 encoder.Frames.Add(BitmapFrame.Create(image));
                 Directory.CreateDirectory(_directory);
                 var path = Path.Combine(_directory, "rendered-layer.png");
-                using (var stream = File.Create(path)) encoder.Save(stream);
+                if (!_store.Image(path,encoder.Save)) throw new IOException("Diagnostic image budget.");
                 var hash = HashFile(path);
                 WriteEvent("rendered_layer_saved", new
                 {
@@ -269,16 +308,15 @@ internal sealed class ScreenshotTranslationEvidence : IDisposable
         if (_disposed) throw new ObjectDisposedException(nameof(ScreenshotTranslationEvidence));
         Directory.CreateDirectory(_directory);
         var next = _sequence + 1;
-        File.AppendAllText(Path.Combine(_directory, "events.jsonl"),
-            JsonSerializer.Serialize(new
+        if (!_store.Json(Path.Combine(_directory, "events.jsonl"), new
             {
-                schema_version = SchemaVersion,
+                schema_version = ActiveSchema,
                 sequence = next,
                 utc = DateTimeOffset.UtcNow,
                 elapsed_ms = _clock.ElapsedMilliseconds,
                 kind,
                 data
-            }) + Environment.NewLine);
+            },includeContent:_includeContent)) throw new IOException("Diagnostic event budget.");
         _sequence = next;
     }
 
@@ -294,18 +332,20 @@ internal sealed class ScreenshotTranslationEvidence : IDisposable
             {
                 var eventsPath = Path.Combine(_directory, "events.jsonl");
                 var manifestPath = Path.Combine(_directory, "manifest.json");
-                var complete = _writeFailures == 0 && _contextRecorded && _sourceSaved
+                var complete = !_store.Truncated && _writeFailures == 0 && _contextRecorded && _sourceSaved
                     && _terminalRecorded && _overlayDecisionRecorded
                     && (!_translationRequired || (_translationInputsRecorded && _translationOutputsRecorded))
                     && (!_renderExpected || _renderSaved);
                 Directory.CreateDirectory(_directory);
-                File.WriteAllText(manifestPath, JsonSerializer.Serialize(new
+                if (!_store.Json(manifestPath, new
                 {
-                    schema_version = SchemaVersion,
+                    schema_version = ActiveSchema,
+                    evidence_mode = _dataOnly ? "data" : "images",
                     run_id = _runId,
                     started_utc = _startedUtc,
                     ended_utc = DateTimeOffset.UtcNow,
                     complete,
+                    diagnostic_truncated = _store.Truncated,
                     write_failures = _writeFailures,
                     event_count = _sequence,
                     events_sha256 = HashFile(eventsPath),
@@ -321,9 +361,9 @@ internal sealed class ScreenshotTranslationEvidence : IDisposable
                     rendered_layer_required = _renderExpected,
                     has_rendered_layer = _renderSaved,
                     visibility_claim = "offscreen-only"
-                }));
-                File.WriteAllText(Path.Combine(_directory, "manifest.sha256"),
-                    HashFile(manifestPath) + Environment.NewLine);
+                },append:false)) throw new IOException("Diagnostic manifest budget.");
+                if (!_store.Text(Path.Combine(_directory, "manifest.sha256"), HashFile(manifestPath) + Environment.NewLine))
+                    throw new IOException("Diagnostic hash budget.");
             }
             catch { _writeFailures++; }
         }

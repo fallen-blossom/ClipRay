@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $workspace = Split-Path -Parent $PSScriptRoot
 $scriptPath = Join-Path $workspace 'scripts\Publish-Local.ps1'
-$testRoot = Join-Path $workspace ('artifacts\shortcut-test-' + [Guid]::NewGuid().ToString('N'))
+$testRoot = Join-Path ([IO.Path]::GetTempPath()) ('clipray-shortcut-test-' + [Guid]::NewGuid().ToString('N'))
 $desktop = Join-Path $testRoot 'Desktop'
 $publish = Join-Path $testRoot 'app'
 $displayName = [string]::Concat('ClipRay ', [char]0x622A, [char]0x5149)
@@ -64,6 +64,9 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) {
+        $resolved = [IO.Path]::GetFullPath($testRoot)
+        $temporaryPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $resolved.StartsWith($temporaryPrefix,[StringComparison]::OrdinalIgnoreCase) -or (Get-Item -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Unsafe test cleanup root.' }
         Remove-Item -LiteralPath $testRoot -Recurse -Force
     }
 }

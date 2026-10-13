@@ -9,7 +9,10 @@ public sealed record CleanupRunStatus(
     bool Succeeded,
     int DeletedFileCount,
     int SkippedPathCount,
-    int FailedPathCount);
+    int FailedPathCount)
+{
+    public IReadOnlyList<CleanupPathOutcome> Items { get; init; } = [];
+}
 
 public sealed class CleanupRunStatusStore(string path)
 {
@@ -21,7 +24,8 @@ public sealed class CleanupRunStatusStore(string path)
         if (!File.Exists(_path)) return null;
         try
         {
-            return JsonSerializer.Deserialize<CleanupRunStatus>(File.ReadAllText(_path));
+            var status=JsonSerializer.Deserialize<CleanupRunStatus>(File.ReadAllText(_path));
+            return status is null ? null : status with{Items=status.Items??[]};
         }
         catch
         {
@@ -58,11 +62,11 @@ public static class CleanupRunStatusFormatter
         var local = TimeZoneInfo.ConvertTime(status.CompletedAtUtc, zone);
         var outcome = english
             ? status.Succeeded
-                ? $"Succeeded; deleted {status.DeletedFileCount}, skipped {status.SkippedPathCount}"
-                : $"Partially failed; deleted {status.DeletedFileCount}, skipped {status.SkippedPathCount}, failed {status.FailedPathCount}"
+                ? $"Succeeded; recycled {status.DeletedFileCount}, skipped {status.SkippedPathCount}"
+                : $"Partially failed; recycled {status.DeletedFileCount}, skipped {status.SkippedPathCount}, failed {status.FailedPathCount}"
             : status.Succeeded
-            ? $"成功，删除 {status.DeletedFileCount}，跳过 {status.SkippedPathCount}"
-            : $"未完全成功，删除 {status.DeletedFileCount}，跳过 {status.SkippedPathCount}，失败 {status.FailedPathCount}";
+            ? $"成功，回收 {status.DeletedFileCount}，跳过 {status.SkippedPathCount}"
+            : $"未完全成功，回收 {status.DeletedFileCount}，跳过 {status.SkippedPathCount}，失败 {status.FailedPathCount}";
         return $"{local:yyyy-MM-dd HH:mm:ss} · {outcome}";
     }
 }

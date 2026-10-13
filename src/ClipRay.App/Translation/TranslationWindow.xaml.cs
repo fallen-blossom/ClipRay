@@ -4,6 +4,7 @@ using System.Windows.Media.Animation;
 using ClipRay.App.LiveTranslation;
 using ClipRay.App.Settings;
 using System.Globalization;
+using ClipRay.App.Capture;
 
 namespace ClipRay.App.Translation;
 
@@ -13,6 +14,10 @@ public partial class TranslationWindow : Window
     private readonly UiOperationOwner _operations = new();
     private readonly string _interfaceLanguage;
     private readonly IReadOnlyDictionary<TranslationRouteKind, TranslationFileCheck?> _routeFileChecks;
+    private readonly Action<string>? _copy;
+    private UiOperation? _pendingOperation;
+    private TranslationRequest? _pendingRequest;
+    private TranslationRouteKind _pendingRoute;
     private ComboBoxItem? _nonMachineSource;
     private ComboBoxItem? _nonMachineTarget;
     private bool _machineLanguageOptionsActive;
@@ -35,9 +40,11 @@ public partial class TranslationWindow : Window
         Func<TranslationRequest, TranslationRouteKind, CancellationToken, Task<TranslationResult>> translate,
         TranslationRouteKind initialRoute = TranslationRouteKind.LocalLmt,
         string interfaceLanguage = "zh-CN",
-        Func<TranslationRouteKind, TranslationFileCheck?>? fileCheck = null)
+        Func<TranslationRouteKind, TranslationFileCheck?>? fileCheck = null,
+        Action<string>? copy = null)
     {
         _translate = translate;
+        _copy = copy;
         _interfaceLanguage = AppInterfaceLanguage.Normalize(interfaceLanguage);
         _routeFileChecks = TranslationRouteCatalog.Options.ToDictionary(option => option.Kind,
             option => fileCheck?.Invoke(option.Kind));
@@ -58,6 +65,9 @@ public partial class TranslationWindow : Window
         RouteBox.SelectedItem = ((TranslationRouteOption[])RouteBox.ItemsSource).First(option => option.Kind == TranslationRouteCatalog.Get(initialRoute).Kind);
         SetAccessibleNames();
         UpdateRouteStatus();
+        InputText.TextChanged += (_, _) => InvalidatePendingTranslation();
+        SourceLanguageBox.SelectionChanged += (_, _) => InvalidatePendingTranslation();
+        TargetLanguageBox.SelectionChanged += (_, _) => InvalidatePendingTranslation();
         Closed += (_, _) =>
         {
             _closed = true;
@@ -81,8 +91,15 @@ public partial class TranslationWindow : Window
     public bool TrySetResult(UiOperation operation, string input, TranslationResult result)
     {
         if (_closed || !_operations.IsCurrent(operation.Version)) return false;
-        InputText.Text = input;
-        ResultText.Text = result.Text;
+        if (result.IsSuccess || ResultText.Text.Length == 0)
+        {
+            ResultText.Text = result.Text;
+            var route = _pendingRequest is not null ? _pendingRoute : SelectedRoute;
+            var source = _pendingRequest?.SourceLanguage ?? SelectedLanguage(SourceLanguageBox);
+            var target = _pendingRequest?.TargetLanguage ?? SelectedLanguage(TargetLanguageBox);
+            ResultText.ToolTip = T($"本次译文：{TranslationRouteCatalog.Get(route).ShortName} · {source} → {target}",
+                $"Result from {TranslationRouteCatalog.Get(route).ShortName} · {source} → {target}");
+        }
         var providerStatus = _interfaceLanguage == "en" ? TranslationStatusText.EnglishProviderStatus(result.Status) : TranslationStatusText.LocalizeProviderStatus(result.Status);
         var costStatus = _interfaceLanguage == "en" ? EnglishCostEstimate(result.CostEstimate) : TranslationStatusText.FormatCostEstimate(result.CostEstimate);
         ProgressStatus.Text = costStatus.Length == 0 ? providerStatus : $"{providerStatus} {costStatus}";
@@ -101,14 +118,21 @@ public partial class TranslationWindow : Window
 
     private async void OnTranslate(object sender, RoutedEventArgs e)
     {
-        if (RouteMissing(SelectedRoute)) return;
+        if (_closed || _pendingOperation is not null || RouteMissing(SelectedRoute)) return;
         if (string.IsNullOrWhiteSpace(InputText.Text))
         {
             ProgressStatus.Text = T("请输入需要翻译的文本。", "Enter text to translate.");
             return;
         }
 
+        var input = InputText.Text;
+        var route = SelectedRoute;
+        var request = new TranslationRequest(
+            SelectedLanguage(SourceLanguageBox), SelectedLanguage(TargetLanguageBox), input);
         var operation = BeginOperation();
+        _pendingOperation = operation;
+        _pendingRequest = request;
+        _pendingRoute = route;
         TranslateButton.IsEnabled = false;
         TranslateButton.Content = T("翻译中…", "Translating…");
         ProgressStatus.Text = T("正在翻译…", "Translating…");
@@ -116,11 +140,7 @@ public partial class TranslationWindow : Window
         AnimateTranslateButton(0.965);
         try
         {
-            var request = new TranslationRequest(
-                SelectedLanguage(SourceLanguageBox),
-                SelectedLanguage(TargetLanguageBox),
-                InputText.Text);
-            TrySetResult(operation, InputText.Text, await _translate(request, SelectedRoute, operation.Token));
+            TrySetResult(operation, input, await _translate(request, route, operation.Token));
         }
         catch (OperationCanceledException)
         {
@@ -134,6 +154,8 @@ public partial class TranslationWindow : Window
         {
             if (_operations.IsCurrent(operation.Version))
             {
+                _pendingOperation = null;
+                _pendingRequest = null;
                 TranslateButton.IsEnabled = !RouteMissing(SelectedRoute);
                 TranslateButton.Content = T("开始翻译", "Translate");
             }
@@ -152,7 +174,23 @@ public partial class TranslationWindow : Window
             new DoubleAnimation(emphasizedScale, 1, TimeSpan.FromMilliseconds(260)) { EasingFunction = easing });
     }
 
-    private void OnRouteChanged(object sender, SelectionChangedEventArgs e) => UpdateRouteStatus();
+    private void OnRouteChanged(object sender, SelectionChangedEventArgs e)
+    {
+        InvalidatePendingTranslation();
+        UpdateRouteStatus();
+    }
+
+    private void InvalidatePendingTranslation()
+    {
+        if (_closed || _pendingOperation is null) return;
+        _operations.CancelPending();
+        _pendingOperation = null;
+        _pendingRequest = null;
+        TranslateButton.IsEnabled = !RouteMissing(SelectedRoute);
+        TranslateButton.Content = T("开始翻译", "Translate");
+        ProgressStatus.Text = T("输入、模型或语言已改变，请重新翻译。", "Text, model or language changed. Translate again when ready.");
+        ProgressStatus.ToolTip = null;
+    }
 
     private void UpdateRouteStatus()
     {
@@ -167,13 +205,21 @@ public partial class TranslationWindow : Window
             ProviderStatus.ToolTip = details;
             ProgressStatus.Text = details;
             TranslateButton.IsEnabled = LiveTranslateButton.IsEnabled = false;
+            LiveTranslateButton.ToolTip = details;
+            System.Windows.Controls.ToolTipService.SetShowOnDisabled(LiveTranslateButton, true);
             _showingMissingRoute = true;
             return;
         }
         if (_showingMissingRoute) ProgressStatus.Text = T("就绪", "Ready");
         _showingMissingRoute = false;
         ProviderStatus.ToolTip = null;
-        TranslateButton.IsEnabled = LiveTranslateButton.IsEnabled = true;
+        TranslateButton.IsEnabled = _pendingOperation is null;
+        var liveSupported = LiveTranslationRoutePolicy.IsSupported(SelectedRoute);
+        LiveTranslateButton.IsEnabled = liveSupported;
+        LiveTranslateButton.ToolTip = liveSupported ? null : T(
+            "本地 LMT 不支持实时区域翻译；请选择本地机翻或 DeepSeek 后再开始。",
+            "Local LMT does not support live region translation. Select local machine translation or DeepSeek to start.");
+        System.Windows.Controls.ToolTipService.SetShowOnDisabled(LiveTranslateButton, true);
         ProviderStatus.Text = SelectedRoute switch
         {
             TranslationRouteKind.LocalLmt => T("本地 LMT", "Local LMT"),
@@ -219,11 +265,26 @@ public partial class TranslationWindow : Window
 
     private void OnCopy(object sender, RoutedEventArgs e)
     {
-        if (!_closed && !string.IsNullOrEmpty(ResultText.Text)) System.Windows.Clipboard.SetText(ResultText.Text);
+        if (_closed || string.IsNullOrEmpty(ResultText.Text)) return;
+        var copied = TextClipboardPublisher.TryCopy(ResultText.Text, _copy);
+        var message = copied switch
+        {
+            TextCopyResult.Copied => T("译文已复制。", "Translation copied."),
+            TextCopyResult.Busy => T("剪贴板暂忙，请稍后重试；译文已保留。", "Clipboard is busy. Try again shortly; the translation was kept."),
+            _ => T("剪贴板暂不可用，请重试；译文已保留。", "Clipboard is unavailable. Try again; the translation was kept."),
+        };
+        CopyButton.ToolTip = message;
+        ProgressStatus.Text = _pendingOperation is null ? message : T($"正在翻译… {message}", $"Translating… {message}");
     }
 
     private void OnLiveTranslate(object sender, RoutedEventArgs e)
     {
+        if (_closed) return;
+        if (!LiveTranslationRoutePolicy.IsSupported(SelectedRoute))
+        {
+            ProgressStatus.Text = LiveTranslateButton.ToolTip?.ToString();
+            return;
+        }
         if (!RouteMissing(SelectedRoute))
             LiveTranslationRequested?.Invoke(this, new LiveTranslationStartRequest(null, SelectedRoute, SelectedLanguage(TargetLanguageBox)));
     }

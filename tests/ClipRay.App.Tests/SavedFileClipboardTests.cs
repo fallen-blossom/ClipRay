@@ -8,6 +8,18 @@ internal static class SavedFileClipboardTests
 {
     public static void Run()
     {
+        try { RunCore(); }
+        catch (Exception exception)
+        {
+            // Do not print exception messages or clipboard data; retain the failing call site.
+            Console.Error.WriteLine($"SAVED_FILE_CLIPBOARD_FAILURE: {exception.GetType().Name} HResult={exception.HResult:X8}");
+            Console.Error.WriteLine(exception.StackTrace);
+            throw;
+        }
+    }
+
+    private static void RunCore()
+    {
         var root = Path.Combine(Path.GetTempPath(), "ClipRay 剪贴板文件 " + Guid.NewGuid());
         Directory.CreateDirectory(root);
         var previous = Clipboard.GetDataObject();
@@ -79,6 +91,10 @@ internal static class SavedFileClipboardTests
 
     private static void Check(bool condition, string message)
     {
-        if (!condition) throw new InvalidOperationException(message);
+        if (!condition)
+        {
+            Console.Error.WriteLine("SAVED_FILE_CLIPBOARD_ASSERTION: " + message);
+            throw new InvalidOperationException(message);
+        }
     }
 }

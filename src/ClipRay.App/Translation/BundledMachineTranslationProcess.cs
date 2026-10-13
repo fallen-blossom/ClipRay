@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using ClipRay.App.Infrastructure;
 
 namespace ClipRay.App.Translation;
 
@@ -11,7 +12,7 @@ public sealed class BundledMachineTranslationProcess(
     string modelPath,
     TimeSpan? workerTimeout = null,
     bool keepAlive = false,
-    string? gpuLibraryDirectory = null) : IMachineTranslationProcess, IDisposable
+    string? gpuLibraryDirectory = null) : IMachineTranslationProcess, IDisposable, IAsyncDisposable
 {
     private readonly string? _gpuLibraryDirectory = gpuLibraryDirectory is null ? null : Path.GetFullPath(gpuLibraryDirectory);
     private readonly string _pythonPath = Path.GetFullPath(pythonPath);
@@ -23,8 +24,9 @@ public sealed class BundledMachineTranslationProcess(
 
     private readonly SemaphoreSlim _workerGate = new(1, 1);
     private Process? _persistentProcess;
-    private Task? _stderrDrain;
+    private TranslationChildLifetime? _child;
     private bool _disposed;
+    private readonly AsyncResourceLifetime _lifetime = new();
     public int ProcessStartCount { get; private set; }
     public MachineTranslationBackendStatus? LastBackendStatus { get; private set; }
 
@@ -36,8 +38,20 @@ public sealed class BundledMachineTranslationProcess(
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
+        using var admission = _lifetime.Enter();
+        using var stopped = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        cancellationToken = stopped.Token;
+        await _workerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { return await TranslateOwnedAsync(request, cancellationToken).ConfigureAwait(false); }
+        finally { _workerGate.Release(); }
+    }
+
+    private async Task<MachineTranslationProcessResult> TranslateOwnedAsync(
+        MachineTranslationProcessRequest request, CancellationToken cancellationToken)
+    {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (keepAlive) return await TranslatePersistentAsync(request, cancellationToken).ConfigureAwait(false);
+        await ResetWorkerAsync().ConfigureAwait(false);
         LastBackendStatus = null;
         EnsureRequiredPath(_pythonPath);
         EnsureRequiredPath(_workerPath);
@@ -65,11 +79,11 @@ public sealed class BundledMachineTranslationProcess(
         startInfo.ArgumentList.Add(_workerPath);
         startInfo.ArgumentList.Add(_modelPath);
 
-        using var process = new Process { StartInfo = startInfo };
-        if (!process.Start()) throw new InvalidOperationException("machine-worker-start-failed");
+        var process = TranslationChildLifetime.Start(startInfo, () => new InvalidOperationException("machine-worker-start-failed"));
         ProcessStartCount++;
         // Drain concurrently without retaining worker stderr (which may contain user text).
-        var stderrDrain = process.StandardError.BaseStream.CopyToAsync(Stream.Null, workerToken);
+        var stderrDrain = process.StandardError.BaseStream.CopyToAsync(Stream.Null);
+        _child = TranslationChildLifetime.Own(process, stderrDrain);
         try
         {
             var payload = JsonSerializer.Serialize(request, new JsonSerializerOptions
@@ -98,21 +112,17 @@ public sealed class BundledMachineTranslationProcess(
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            TryKill(process);
             throw new TimeoutException("machine-worker-timeout");
         }
         finally
         {
-            TryKill(process);
-            try { await stderrDrain.ConfigureAwait(false); }
-            catch { /* Only the protocol result matters; stderr is intentionally discarded. */ }
+            await ResetWorkerAsync().ConfigureAwait(false);
         }
     }
 
     private async Task<MachineTranslationProcessResult> TranslatePersistentAsync(
         MachineTranslationProcessRequest request, CancellationToken cancellationToken)
     {
-        await _workerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(_workerTimeout);
         try
@@ -120,7 +130,7 @@ public sealed class BundledMachineTranslationProcess(
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_persistentProcess is null || _persistentProcess.HasExited)
             {
-                ResetWorker();
+                await ResetWorkerAsync().ConfigureAwait(false);
                 EnsureRequiredPath(_pythonPath);
                 EnsureRequiredPath(_workerPath);
                 EnsureRequiredPath(_modelPath);
@@ -137,10 +147,10 @@ public sealed class BundledMachineTranslationProcess(
                 info.ArgumentList.Add(_workerPath);
                 info.ArgumentList.Add(_modelPath);
                 info.ArgumentList.Add("--persistent");
-                _persistentProcess = new Process { StartInfo = info };
-                if (!_persistentProcess.Start()) throw new InvalidOperationException("machine-worker-start-failed");
+                _persistentProcess = TranslationChildLifetime.Start(info, () => new InvalidOperationException("machine-worker-start-failed"));
                 ProcessStartCount++;
-                _stderrDrain = _persistentProcess.StandardError.BaseStream.CopyToAsync(Stream.Null);
+                _child = TranslationChildLifetime.Own(_persistentProcess,
+                    _persistentProcess.StandardError.BaseStream.CopyToAsync(Stream.Null));
             }
             var process = _persistentProcess;
             var payload = JsonSerializer.Serialize(request, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
@@ -157,15 +167,14 @@ public sealed class BundledMachineTranslationProcess(
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            ResetWorker();
+            await ResetWorkerAsync().ConfigureAwait(false);
             throw new TimeoutException("machine-worker-timeout");
         }
         catch
         {
-            ResetWorker();
+            await ResetWorkerAsync().ConfigureAwait(false);
             throw;
         }
-        finally { _workerGate.Release(); }
     }
 
     private MachineTranslationProcessResult WithEvidence(WorkerResponse response, string requestedBackend)
@@ -177,43 +186,28 @@ public sealed class BundledMachineTranslationProcess(
         // the backend that produced a cached text. Do not infer per-text evidence.
         return new(response.Texts, TextEvidence: response.TextBackends?.Select(Describe).ToArray());
     }
-    private void ResetWorker()
+    private async Task ResetWorkerAsync()
     {
         LastBackendStatus = null;
-        if (_persistentProcess is { } process)
+        if (_child is { } child)
         {
-            TryKill(process);
-            process.Dispose();
+            await child.RetireAsync().ConfigureAwait(false);
+            _child = null;
             _persistentProcess = null;
         }
-        if (_stderrDrain is { } drain)
-            _ = drain.ContinueWith(static task => { _ = task.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
-        _stderrDrain = null;
     }
 
     public void Dispose()
     {
-        _workerGate.Wait();
-        try { _disposed = true; ResetWorker(); }
-        finally { _workerGate.Release(); }
+        _ = DisposeAsync();
     }
+    public ValueTask DisposeAsync() => new(_lifetime.RetireAsync(async () =>
+    { _disposed = true; await ResetWorkerAsync().ConfigureAwait(false); }));
 
     private static void EnsureRequiredPath(string path)
     {
         if (!File.Exists(path) && !Directory.Exists(path))
             throw new FileNotFoundException("Bundled machine translation component is unavailable.");
-    }
-
-    private static void TryKill(Process process)
-    {
-        try
-        {
-            if (!process.HasExited) process.Kill(entireProcessTree: true);
-        }
-        catch
-        {
-            // Cancellation is already in progress; process cleanup is best effort.
-        }
     }
 
     private static void ThrowStartupFailure(WorkerResponse? response)

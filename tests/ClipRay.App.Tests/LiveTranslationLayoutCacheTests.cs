@@ -6,6 +6,46 @@ using ClipRay.Core.Geometry;
 
 internal static class LiveTranslationLayoutCacheTests
 {
+    public static void ConstrainedParagraphCannotSetUnrelatedBodyFontTier()
+    {
+        var style = new SourceVisualStyle(Color.White, 18, 30,
+            SourceFontWeight.Normal, SourceFontCategory.SansSerif, false,
+            SourceTextAlignment.Left, 0, VisualStyleConfidence.High, 24);
+        InPlaceLayoutItem Item(string id, PixelRect bounds, double fontSize, double lineHeight)
+        {
+            var block = new OcrTextBlock(id + " source paragraph", bounds, []);
+            var region = new VisualTextRegion(id, block.Text, [block], bounds,
+                VisualTextRole.Body, VisualStructureConfidence.High);
+            var layout = new TranslationTextLayout(true, fontSize, lineHeight,
+                style.FontWeight, style.FontCategory, false, style.Alignment, 0,
+                "Segoe UI, Microsoft YaHei UI");
+            return new(block, "完整的中文段落。", bounds,
+                InPlaceBackgroundMode.FlatSampled, Color.Black, Color.White,
+                SourceStyle: style, TextLayout: layout, SourceRegion: region);
+        }
+
+        var compressed = Item("sidebar", new(10, 10, 145, 28), 16, 20);
+        var article = Item("article", new(700, 10, 600, 60), 24, 30);
+        var viewport = new Rectangle(0, 0, 1400, 300);
+        var cache = new LiveTranslationLayoutCache();
+        var first = cache.Update(new("Machine", "completed", [compressed, article]), [viewport]);
+        var articleFont = first.LayoutItems.Single(item => item.SourceRegion!.Id == "article")
+            .TextLayout!.FontSizePixels;
+        if (articleFont != 24)
+            throw new Exception($"Constrained sidebar poisoned a distant body font: expected 24, got {articleFont}.");
+
+        var next = Item("next-article", new(700, 100, 600, 60), 24, 30);
+        var second = cache.Update(new("Machine", "completed", [next]), [viewport]);
+        if (second.LayoutItems.Single().TextLayout!.FontSizePixels != 24)
+            throw new Exception("A constrained paragraph poisoned a later frame's body font tier.");
+
+        cache = new LiveTranslationLayoutCache();
+        cache.Update(new("Machine", "completed", [compressed]), [viewport]);
+        var afterCompressedOnly = cache.Update(new("Machine", "completed", [article]), [viewport]);
+        if (afterCompressedOnly.LayoutItems.Single().TextLayout!.FontSizePixels != 24)
+            throw new Exception("A compressed first viewport shrank a later unconstrained paragraph.");
+    }
+
     public static void ChangedTextWithTighterOcrBoundsKeepsItsTranslation()
     {
         var oldBounds = new PixelRect(45, 137, 857, 42);

@@ -22,6 +22,10 @@ public sealed class ScrollCaptureResultWindow : Window
     private readonly TextBlock _saveStatus = new() { Foreground = System.Windows.Media.Brushes.LightGray, Margin = new Thickness(10, 6, 10, 4), TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.Wrap, MaxHeight = 96 };
     private readonly string _savedPath;
     private readonly Func<bool>? _copyAgain;
+    private readonly Func<Func<bool>, Task<bool>>? _copyAgainAsync;
+    private bool _copyPending;
+    private bool _closed;
+    internal Task LastCopyOperation { get; private set; } = Task.CompletedTask;
     private bool _fitWidth = true;
     private double _zoom = 1;
     private bool _isMousePanning;
@@ -30,13 +34,16 @@ public sealed class ScrollCaptureResultWindow : Window
     private double _panStartVerticalOffset;
     private readonly string _language;
 
-    public ScrollCaptureResultWindow(Bitmap bitmap, ScrollCaptureStopReason reason, string savedPath, bool clipboardCopied, Func<bool>? copyAgain = null, string interfaceLanguage = "zh-CN", bool clipboardRequested = true)
+    public ScrollCaptureResultWindow(Bitmap bitmap, ScrollCaptureStopReason reason, string savedPath, bool clipboardCopied, Func<bool>? copyAgain = null, string interfaceLanguage = "zh-CN", bool clipboardRequested = true, System.Windows.Media.Imaging.BitmapSource? previewSource = null, Func<Func<bool>, Task<bool>>? copyAgainAsync = null)
     {
         _language = AppInterfaceLanguage.Normalize(interfaceLanguage);
         ArgumentNullException.ThrowIfNull(bitmap);
         _savedPath = Path.GetFullPath(savedPath ?? throw new ArgumentNullException(nameof(savedPath)));
         _copyAgain = copyAgain;
-        Title = reason == ScrollCaptureStopReason.EndOfScroll ? T("长截图结果", "Scrolling capture result") : T("长截图部分结果", "Partial scrolling capture");
+        _copyAgainAsync = copyAgainAsync;
+        Closed += (_, _) => _closed = true;
+        Title = reason is ScrollCaptureStopReason.EndOfScroll or ScrollCaptureStopReason.CompletedByUser
+            ? T("长截图结果", "Scrolling capture result") : T("长截图部分结果", "Partial scrolling capture");
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         var workArea = Forms.Screen.FromPoint(Forms.Cursor.Position).WorkingArea;
         Width = Math.Min(1200, workArea.Width * 0.90);
@@ -45,7 +52,7 @@ public sealed class ScrollCaptureResultWindow : Window
         MinHeight = 400;
         Background = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x10, 0x13, 0x1B));
 
-        var source = BitmapSourceFactory.Create(bitmap);
+        var source = previewSource ?? BitmapSourceFactory.Create(bitmap);
         _sourceWidth = source.Width;
         _image = new System.Windows.Controls.Image
         {
@@ -114,7 +121,24 @@ public sealed class ScrollCaptureResultWindow : Window
 
     private void CopyAgain()
     {
-        var copied = _copyAgain?.Invoke() == true;
+        if (_closed || _copyPending) return;
+        LastCopyOperation = CopyAgainCoreAsync();
+    }
+
+    private async Task CopyAgainCoreAsync()
+    {
+        _copyPending = true;
+        var copied = false;
+        try
+        {
+            _saveStatus.Text = T("正在复制…", "Copying…");
+            copied = _copyAgainAsync is not null
+                ? await _copyAgainAsync(() => !_closed)
+                : _copyAgain?.Invoke() == true;
+        }
+        catch { }
+        finally { _copyPending = false; }
+        if (_closed) return;
         _saveStatus.Text = copied ? T($"已重新复制：\n{_savedPath}", $"Copied again:\n{_savedPath}") : T($"复制未完成：\n{_savedPath}", $"Copy did not complete:\n{_savedPath}");
         _saveStatus.ToolTip = _saveStatus.Text;
         _saveStatus.Foreground = copied ? System.Windows.Media.Brushes.LightGreen : System.Windows.Media.Brushes.OrangeRed;

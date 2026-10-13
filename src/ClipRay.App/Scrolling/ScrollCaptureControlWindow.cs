@@ -36,6 +36,7 @@ public sealed class ScrollCaptureControlWindow : Window
         string interfaceLanguage = "zh-CN")
     {
         _language = AppInterfaceLanguage.Normalize(interfaceLanguage);
+        Title = T("ClipRay 长截图控制", "ClipRay scrolling capture controls");
         _stopHotkey = stopHotkey ?? GlobalHotkey.Parse("Escape");
         _secondaryStopHotkey = secondaryStopHotkey;
         _automaticScrolling = mode == ScrollCaptureMode.Automatic;
@@ -44,9 +45,10 @@ public sealed class ScrollCaptureControlWindow : Window
         WindowStyle = WindowStyle.None;
         ResizeMode = ResizeMode.NoResize;
         ShowInTaskbar = false;
+        ShowActivated = false;
         Topmost = true;
         SizeToContent = SizeToContent.Height;
-        Width = 760;
+        Width = 510;
         Background = System.Windows.Media.Brushes.Transparent;
         AllowsTransparency = true;
 
@@ -65,18 +67,11 @@ public sealed class ScrollCaptureControlWindow : Window
         };
         Grid.SetRow(Status, 0);
         root.Children.Add(Status);
-        var controls = new StackPanel
+        var controls = new WrapPanel
         {
             Orientation = System.Windows.Controls.Orientation.Horizontal,
-            HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Left,
         };
-        controls.Children.Add(new TextBlock
-        {
-            Text = T("手动滚动", "Manual scrolling"),
-            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0xB9, 0xC5, 0xD8)),
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(5, 0, 3, 0),
-        });
         _automaticButton = CreateLabeledButton(
             _automaticScrolling ? ToolbarIconKind.Pause : ToolbarIconKind.Play,
             ToolbarIconTone.Primary,
@@ -84,15 +79,12 @@ public sealed class ScrollCaptureControlWindow : Window
         _automaticButton.Click += (_, _) => ToggleAutomaticScrolling();
         controls.Children.Add(_automaticButton);
 
-        var viewResult = CreateLabeledButton(ToolbarIconKind.ViewResult, ToolbarIconTone.Primary, T("点击查看结果", "View result"));
-        viewResult.Click += (_, _) => StopRequested?.Invoke(this, EventArgs.Empty);
         var cancel = CreateLabeledButton(ToolbarIconKind.Cancel, ToolbarIconTone.Danger, T("取消", "Cancel"));
         cancel.Click += (_, _) => CancelRequested?.Invoke(this, EventArgs.Empty);
-        var confirm = CreateLabeledButton(ToolbarIconKind.Complete, ToolbarIconTone.Confirm, T("完成", "Finish"));
-        confirm.Click += (_, _) => StopRequested?.Invoke(this, EventArgs.Empty);
-        controls.Children.Add(viewResult);
         controls.Children.Add(cancel);
-        controls.Children.Add(confirm);
+        var complete = CreateLabeledButton(ToolbarIconKind.Complete, ToolbarIconTone.Confirm, T("完成", "Finish"));
+        complete.Click += (_, _) => StopRequested?.Invoke(this, EventArgs.Empty);
+        controls.Children.Add(complete);
         Grid.SetRow(controls, 1);
         root.Children.Add(controls);
         Content = new Border
@@ -118,12 +110,22 @@ public sealed class ScrollCaptureControlWindow : Window
     private string T(string chinese, string english) => AppInterfaceLanguage.Text(_language, chinese, english);
     public void SetProgress(ScrollCaptureProgress progress)
     {
+        if (progress.AutomaticScrolling is {} automatic && automatic != _automaticScrolling)
+        {
+            _automaticScrolling = automatic;
+            var label = AutomaticControlLabel();
+            _automaticButton.Content = CreateLabeledButton(automatic ? ToolbarIconKind.Pause : ToolbarIconKind.Play, ToolbarIconTone.Primary, label).Content;
+            _automaticButton.ToolTip = label;
+            AutomationProperties.SetName(_automaticButton, label);
+        }
         var detail = progress.Status ?? "";
         if (_language == "en") detail = detail switch
         {
             "当前画面暂时无法可靠拼接；仍在等待手动滚动或完成。" => "Cannot stitch this view reliably yet. Scroll manually or finish.",
             "尚未检测到可拼接滚动；自动滚动仍在继续。" => "No stitchable scroll detected yet. Automatic scrolling continues.",
             "暂时无法确认新内容；自动滚动仍在继续。" => "New content is not confirmed yet. Automatic scrolling continues.",
+            "未检测到滚动，自动滚动已暂停；可手动滚动或完成。" => "No scroll detected. Automatic scrolling paused; scroll manually or finish.",
+            "来源已变化，自动滚动已暂停；可手动滚动或完成。" => "Source changed. Automatic scrolling paused; scroll manually or finish.",
             _ => detail
         };
         Status.Text = T($"{progress.AcceptedFrameCount} 帧", $"{progress.AcceptedFrameCount} frames")
@@ -133,10 +135,12 @@ public sealed class ScrollCaptureControlWindow : Window
 
     public bool PlaceOutside(System.Drawing.Rectangle region)
     {
-        UpdateLayout();
         var source = PresentationSource.FromVisual(this)?.CompositionTarget;
         if (source is null) return false;
         var scale = source.TransformToDevice;
+        var workingArea = Forms.Screen.FromRectangle(region).WorkingArea;
+        Width = Math.Min(510, Math.Max(160, (workingArea.Width - 20) / scale.M11));
+        UpdateLayout();
         var size = new System.Drawing.Size((int)Math.Ceiling(ActualWidth * scale.M11), (int)Math.Ceiling(ActualHeight * scale.M22));
         var areas = Forms.Screen.AllScreens.Select(static screen => screen.WorkingArea).ToArray();
         var placement = ScrollCapturePlacementPolicy.PlaceToolbar(region, size, areas);
@@ -147,7 +151,7 @@ public sealed class ScrollCaptureControlWindow : Window
     private static System.Windows.Controls.Button CreateLabeledButton(ToolbarIconKind icon, ToolbarIconTone tone, string label)
     {
         var content = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
-        content.Children.Add(ToolbarIconFactory.Create(icon, tone));
+        content.Children.Add(CreateButtonIcon(icon, tone));
         content.Children.Add(new TextBlock { Text = label, Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center });
         var button = new System.Windows.Controls.Button
         {
@@ -163,6 +167,31 @@ public sealed class ScrollCaptureControlWindow : Window
         };
         AutomationProperties.SetName(button, label);
         return button;
+    }
+
+    private static FrameworkElement CreateButtonIcon(ToolbarIconKind icon, ToolbarIconTone tone)
+    {
+        if (icon is not (ToolbarIconKind.Cancel or ToolbarIconKind.Complete))
+            return ToolbarIconFactory.Create(icon, tone);
+
+        return new Viewbox
+        {
+            Width = 28,
+            Height = 28,
+            Child = new System.Windows.Shapes.Path
+            {
+                Data = System.Windows.Media.Geometry.Parse(icon == ToolbarIconKind.Cancel
+                    ? "M5,5 L23,23 M23,5 L5,23"
+                    : "M4,15 L11,22 L24,6"),
+                Stroke = new System.Windows.Media.SolidColorBrush(icon == ToolbarIconKind.Cancel
+                    ? System.Windows.Media.Color.FromRgb(0xFF, 0x6D, 0x72)
+                    : System.Windows.Media.Color.FromRgb(0x5E, 0xE0, 0xA0)),
+                StrokeThickness = 2.8,
+                StrokeStartLineCap = System.Windows.Media.PenLineCap.Round,
+                StrokeEndLineCap = System.Windows.Media.PenLineCap.Round,
+                StrokeLineJoin = System.Windows.Media.PenLineJoin.Round,
+            },
+        };
     }
 
     private void ToggleAutomaticScrolling()

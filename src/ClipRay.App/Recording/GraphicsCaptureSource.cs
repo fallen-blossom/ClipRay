@@ -17,10 +17,16 @@ public sealed record VideoRecordingSample(
     int Width,
     int Height,
     long Timestamp100Nanoseconds,
-    long Duration100Nanoseconds);
+    long Duration100Nanoseconds) : IDisposable
+{
+    private Action? _release;
+    internal VideoRecordingSample Own(Action release) { _release = release; return this; }
+    public void Dispose() => Interlocked.Exchange(ref _release,null)?.Invoke();
+}
 
 public interface IGraphicsCaptureSource : IAsyncDisposable
 {
+    void RequestStop() { }
     Task StartAsync(Func<VideoRecordingSample, ValueTask> onSample, CancellationToken cancellationToken);
 
     Task StopAsync();
@@ -45,6 +51,11 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
     private GraphicsCaptureSession? _captureSession;
     private RecordingVideoPump? _videoPump;
     private readonly RecordingFramePacer _pacer = new(RecordingFrameRatePolicy.FramesPerSecond, Stopwatch.Frequency);
+    private readonly object _lifetime = new();
+    private Task? _stopTask, _disposeTask;
+    private readonly List<Exception> _releaseErrors = [];
+    private readonly RecordingFaultSignal _faults = new();
+    private RecordingPixelBuffers? _buffers;
     private int _frameBusy;
     private int _started;
     private int _stopped;
@@ -52,7 +63,7 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
     public GraphicsCaptureSource(
         RecordingMonitorMapping mapping,
         RecordingTimeline timeline,
-        bool normalizeForEncoder = true)
+        bool normalizeForEncoder = true, Action<Exception>? onFault = null, bool reuseBuffers = false)
         : this(
             mapping.MonitorBounds,
             normalizeForEncoder
@@ -61,9 +72,10 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
             timeline,
             () => GraphicsCaptureInterop.CreateForMonitor(MonitorFromRectangle(mapping.MonitorBounds)),
             RecordingCapturePolicy.IncludeCursor,
-            enforceSourceSize: false,
-            onFault: null)
+            enforceSourceSize: true,
+            onFault)
     {
+        if (reuseBuffers) _buffers = new RecordingPixelBuffers(checked(_crop.Width * _crop.Height * 4));
     }
 
     private GraphicsCaptureSource(
@@ -86,6 +98,7 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
         _includeCursor = includeCursor;
         _enforceSourceSize = enforceSourceSize;
         _onFault = onFault;
+        _faults.Raised += fault => ReportFault(fault.Error);
     }
 
     public static GraphicsCaptureSource ForWindow(
@@ -113,6 +126,9 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
         cancellationToken.ThrowIfCancellationRequested();
         if (Interlocked.Exchange(ref _started, 1) != 0) throw new InvalidOperationException("Graphics capture already started.");
         if (!GraphicsCaptureSession.IsSupported()) throw new PlatformNotSupportedException("Windows.Graphics.Capture is unavailable.");
+        lock (_lifetime)
+        {
+        if (_stopped != 0) throw new OperationCanceledException();
         _onSample = onSample;
         CreateDevices();
         _item = _createItem();
@@ -129,57 +145,42 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
         _framePool.FrameArrived += OnFrameArrived;
         _captureSession = _framePool.CreateCaptureSession(_item);
         _captureSession.IsCursorCaptureEnabled = _includeCursor;
-        _videoPump = new RecordingVideoPump(onSample);
+        _videoPump = new RecordingVideoPump(onSample, _faults);
         _captureSession.StartCapture();
         return Task.CompletedTask;
+        }
     }
 
-    public async Task StopAsync()
+    public void RequestStop() { Interlocked.Exchange(ref _stopped,1); _videoPump?.RequestStop(); }
+    public Task StopAsync()
     {
-        if (Interlocked.Exchange(ref _stopped, 1) != 0) return;
-        if (_framePool is not null) _framePool.FrameArrived -= OnFrameArrived;
-        // The callback checks stopped again after acquiring busy, so no new GPU
-        // access can begin after this wait and no devices close during a readback.
-        while (Volatile.Read(ref _frameBusy) != 0) await Task.Delay(1).ConfigureAwait(false);
-        _captureSession?.Dispose();
-        _captureSession = null;
-        _framePool?.Dispose();
-        _framePool = null;
-        if (_item is not null) _item.Closed -= OnItemClosed;
-        if (_videoPump is not null) await _videoPump.CompleteAsync().ConfigureAwait(false);
+        RequestStop();
+        lock (_lifetime) return _stopTask ??= Task.Run(async () =>
+        {
+            var errors = _releaseErrors;
+            if (_framePool is not null) _framePool.FrameArrived -= OnFrameArrived;
+            while (Volatile.Read(ref _frameBusy) != 0) await Task.Delay(1).ConfigureAwait(false);
+            void Release(Action action) { try { action(); } catch(Exception error) { errors.Add(error); } }
+            Release(() => _captureSession?.Dispose()); _captureSession = null;
+            Release(() => _framePool?.Dispose()); _framePool = null;
+            if (_item is not null) _item.Closed -= OnItemClosed;
+            try { if (_videoPump is not null) await _videoPump.CompleteAsync().ConfigureAwait(false); }
+            catch(Exception error) { _faults.TrySet("video-drain",error); }
+            if (errors.Count > 0) throw new AggregateException(errors);
+        });
     }
-
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync() { lock (_lifetime) return new(_disposeTask ??= DisposeCoreAsync()); }
+    private async Task DisposeCoreAsync()
     {
-        try
-        {
-            await StopAsync().ConfigureAwait(false);
-        }
-        finally
-        {
-            _item = null;
-            try { _staging?.Dispose(); }
-            finally
-            {
-                _staging = null;
-                try
-                {
-                    if (_winrtDevice is not null && Marshal.IsComObject(_winrtDevice))
-                        Marshal.FinalReleaseComObject(_winrtDevice);
-                }
-                finally
-                {
-                    _winrtDevice = null;
-                    try { _context?.Dispose(); }
-                    finally
-                    {
-                        _context = null;
-                        _nativeDevice?.Dispose();
-                        _nativeDevice = null;
-                    }
-                }
-            }
-        }
+        try { await StopAsync().ConfigureAwait(false); } catch { }
+        var errors = _releaseErrors;
+        void Release(Action action) { try { action(); } catch(Exception error) { errors.Add(error); } }
+        _item = null;
+        Release(() => _staging?.Dispose()); _staging = null;
+        Release(() => { if (_winrtDevice is not null && Marshal.IsComObject(_winrtDevice)) Marshal.FinalReleaseComObject(_winrtDevice); }); _winrtDevice = null;
+        Release(() => _context?.Dispose()); _context = null;
+        Release(() => _nativeDevice?.Dispose()); _nativeDevice = null;
+        if (errors.Count > 0) throw new AggregateException(errors);
     }
 
     private void CreateDevices()
@@ -214,6 +215,7 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
     {
         if (Volatile.Read(ref _stopped) != 0 || Interlocked.Exchange(ref _frameBusy, 1) != 0) return;
+        byte[]? leased = null;
         try
         {
             if (Volatile.Read(ref _stopped) != 0) return;
@@ -223,7 +225,7 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
             if (_enforceSourceSize &&
                 (frame.ContentSize.Width != _sourceBounds.Width || frame.ContentSize.Height != _sourceBounds.Height))
             {
-                ReportFault(new InvalidOperationException("window-capture-geometry-changed"));
+                ReportFault(new InvalidOperationException("graphics-capture-geometry-changed"));
                 return;
             }
             var access = WinRT.CastExtensions.As<IDirect3DDxgiInterfaceAccess>(frame.Surface);
@@ -235,7 +237,9 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
             try
             {
                 var destinationStride = _crop.Width * 4;
-                pixels = new byte[destinationStride * _crop.Height];
+                pixels = _buffers is null ? new byte[checked(destinationStride * _crop.Height)] : _buffers.Rent()!;
+                if (pixels is null) return;
+                if (_buffers is not null) leased = pixels;
                 for (var row = 0; row < _crop.Height; row++)
                 {
                     var source = IntPtr.Add(mapped.DataPointer, checked((_crop.Y + row) * (int)mapped.RowPitch + _crop.X * 4));
@@ -249,23 +253,27 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
 
             var timestamp = _timeline.GetTimestamp100Nanoseconds(RecordingStream.Video, qpc);
             var sample = new VideoRecordingSample(pixels, _crop.Width, _crop.Height, timestamp, RecordingFrameRatePolicy.SampleDuration100Nanoseconds);
-            _videoPump!.TryPost(sample);
+            if (leased is not null) { var owned = leased; sample.Own(() => _buffers!.Return(owned)); leased = null; }
+            if (!_videoPump!.TryPost(sample) && Volatile.Read(ref _stopped) == 0)
+                ReportFault(new InvalidOperationException("capture-video-admission-closed"));
         }
-        catch (Exception exception) when (_onFault is not null)
+        catch (Exception exception)
         {
-            ReportFault(new InvalidOperationException("window-capture-frame-failed", exception));
+            ReportFault(new InvalidOperationException("graphics-capture-frame-failed", exception));
         }
         finally
         {
+            if (leased is not null) _buffers!.Return(leased);
             Volatile.Write(ref _frameBusy, 0);
         }
     }
 
-    private void OnItemClosed(GraphicsCaptureItem sender, object args) =>
-        ReportFault(new InvalidOperationException("window-capture-source-closed"));
+    private void OnItemClosed(GraphicsCaptureItem sender, object args)
+    { if (Volatile.Read(ref _stopped) == 0) ReportFault(new InvalidOperationException("graphics-capture-source-closed")); }
 
     private void ReportFault(Exception exception)
     {
+        RequestStop();
         try { _onFault?.Invoke(exception); }
         catch { /* A fault observer cannot escape the WGC callback. */ }
     }

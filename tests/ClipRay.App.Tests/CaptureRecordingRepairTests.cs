@@ -141,7 +141,7 @@ internal static class CaptureRecordingRepairTests
         }
     }
 
-    public static void RecordingEncoderUsesHardwareTransformsWithoutSinkThrottling()
+    public static void RecordingEncoderUsesHardwareTransformsWithNativeBackpressure()
     {
         MediaFactory.MFStartup();
         try
@@ -153,8 +153,8 @@ internal static class CaptureRecordingRepairTests
                 throw new Exception("MP4 写入器没有请求 Media Foundation 硬件编码。");
             var throttling = new Guid("08b845d8-2b74-4afe-9d53-be16d2d5ae4f");
             var throttlingLookup = attributes.GetUInt32(throttling, out var throttlingValue);
-            if (!throttlingLookup.Success || throttlingValue != 1u)
-                throw new Exception("MP4 写入器没有关闭 Media Foundation 节流：WriteSample 会退化成每帧约一秒。");
+            if (throttlingLookup.Success && throttlingValue != 0u)
+                throw new Exception("Daily recording must retain default native backpressure.");
             var root = WorkspaceLocator.Find(AppContext.BaseDirectory);
             var recorder = File.ReadAllText(Path.Combine(root, "src", "ClipRay.App", "Recording", "MediaFoundationRecorder.cs"));
             if (!recorder.Contains("MFCreateSinkWriterFromURL(_paths.PartialPath, null, attributes)", StringComparison.Ordinal))
@@ -290,62 +290,21 @@ internal static class CaptureRecordingRepairTests
         if (accepted is < 59 or > 61) throw new Exception("30fps target collapsed on near-60Hz input: " + accepted);
     }
 
-    public static void RecordingPipelineTargetsSixtyFramesPerSecond()
+    public static void RecordingPipelineTargetsDailyFramesPerSecond()
     {
-        if (RecordingFrameRatePolicy.FramesPerSecond != 60)
-            throw new Exception("录制目标帧率不是 60fps。");
-        if (RecordingFrameRatePolicy.SampleDuration100Nanoseconds != 10_000_000L / 60)
-            throw new Exception("录制样本时长与 60fps 不一致。");
-        var pacer = new RecordingFramePacer(RecordingFrameRatePolicy.FramesPerSecond, 1_000_000L);
-        var exact = 0;
-        for (var index = 0; index < 120; index++)
-            if (pacer.ShouldCapture(index * 16_666L)) exact++;
-        if (exact != 120)
-            throw new Exception("60fps 目标在 60Hz 输入上丢失刷新节拍：" + exact);
-        var jittered = new RecordingFramePacer(RecordingFrameRatePolicy.FramesPerSecond, 1_000_000L);
-        var near = 0;
-        for (var index = 0; index < 120; index++)
-            if (jittered.ShouldCapture(index * 16_600L)) near++;
-        if (near < 118)
-            throw new Exception("60fps 目标在接近 60Hz 的输入上丢弃过多刷新节拍：" + near);
-
+        if (BackgroundTask5Tests.Run(["--background-task-5-tests","daily-policy","clock-pacer"]) != 0)
+            throw new Exception("Daily frame-rate/bitrate/timeline contract failed.");
         var root = WorkspaceLocator.Find(AppContext.BaseDirectory);
-        var capture = File.ReadAllText(Path.Combine(root, "src", "ClipRay.App", "Recording", "GraphicsCaptureSource.cs"));
-        var recorder = File.ReadAllText(Path.Combine(root, "src", "ClipRay.App", "Recording", "MediaFoundationRecorder.cs"));
-        if (!capture.Contains("RecordingFrameRatePolicy.FramesPerSecond", StringComparison.Ordinal)
-            || !capture.Contains("RecordingFrameRatePolicy.SampleDuration100Nanoseconds", StringComparison.Ordinal)
-            || !recorder.Contains("RecordingFrameRatePolicy.FramesPerSecond", StringComparison.Ordinal))
-            throw new Exception("采集或编码绕过统一帧率契约。");
-        if (capture.Contains("10_000_000 / 30", StringComparison.Ordinal)
-            || capture.Contains("new(30, Stopwatch.Frequency)", StringComparison.Ordinal)
-            || recorder.Contains("PackRatio(30, 1)", StringComparison.Ordinal)
-            || recorder.Contains("ForFrameSize(_width, _height, 30)", StringComparison.Ordinal))
-            throw new Exception("录制管线仍写死 30fps。");
+        var capture = File.ReadAllText(Path.Combine(root,"src","ClipRay.App","Recording","GraphicsCaptureSource.cs"));
+        var encoder = File.ReadAllText(Path.Combine(root,"src","ClipRay.App","Recording","MediaFoundationRecorder.cs"));
+        if (!capture.Contains("RecordingFrameRatePolicy.FramesPerSecond") || !capture.Contains("RecordingFrameRatePolicy.SampleDuration100Nanoseconds")
+            || !encoder.Contains("RecordingFrameRatePolicy.FramesPerSecond")) throw new Exception("Capture or encoder bypassed shared daily clock.");
     }
 
     public static void StopShowsPreviewBeforeFinalizeFinishes()
     {
-        var root = WorkspaceLocator.Find(AppContext.BaseDirectory);
-        var source = File.ReadAllText(Path.Combine(root, "src", "ClipRay.App", "App.xaml.cs"));
-        var start = source.IndexOf("private async void StopRecording()", StringComparison.Ordinal);
-        if (start < 0) throw new Exception("停止录屏入口不存在。");
-        var end = source.IndexOf("private void DismissRecordingFeedback()", start, StringComparison.Ordinal);
-        if (end < 0) throw new Exception("停止录屏没有把录制反馈收拢成单独的收起步骤。");
-        var body = source[start..end];
-        var dismiss = body.IndexOf("DismissRecordingFeedback();", StringComparison.Ordinal);
-        var preview = body.IndexOf("pending: true", StringComparison.Ordinal);
-        var finalize = body.IndexOf("Task.Run(session.StopAsync)", StringComparison.Ordinal);
-        var attach = body.IndexOf("preview.AttachMedia(", StringComparison.Ordinal);
-        if (dismiss < 0 || preview < 0 || finalize < 0 || attach < 0)
-            throw new Exception("停止录屏没有先收起录制反馈、立刻亮出预览窗、在线程池收尾并接上成片。");
-        if (!body.Contains("_recordingStopRequested", StringComparison.Ordinal))
-            throw new Exception("停止录屏缺少重复触发保护。");
-        if (dismiss > preview)
-            throw new Exception("录制边框和计时条仍要等预览窗出现才消失。");
-        if (preview > finalize)
-            throw new Exception("预览窗口仍在等 finalize 结束才创建，停止后会有可见空档。");
-        if (attach < finalize)
-            throw new Exception("成片还没收尾完就被接给预览窗。");
+        if (BackgroundTask5Tests.Run(["--background-task-5-tests","app-pending"]) != 0)
+            throw new Exception("Actual stop failed pending preview/physical ownership checks.");
     }
 
     public static void EncoderQueueIsBoundedAndRunsOffCaptureThread()

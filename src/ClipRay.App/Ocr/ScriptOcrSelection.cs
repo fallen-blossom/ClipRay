@@ -1,6 +1,11 @@
 namespace ClipRay.App.Ocr;
 
-public sealed record ScriptOcrCandidate(string Text, double Confidence, string Script);
+public sealed record ScriptOcrCandidate(string Text, double Confidence, string Script)
+{
+    public bool HasRawConfidence { get; init; } = true;
+    internal static ScriptOcrCandidate FromRecognition(string text,float[]? scores,string script)
+    { var score=OcrQualityPolicy.RawConfidence(scores);return new(text,score??0,script) { HasRawConfidence=score.HasValue }; }
+}
 public sealed record ScriptOcrSelectionResult(ScriptOcrCandidate? Candidate, string? AlternativeText = null);
 
 public static class ScriptOcrSelection

@@ -10,6 +10,13 @@ public sealed class LiveTranslationLayoutCache
     private readonly List<InPlaceLayoutItem> _items=[];
     private readonly List<FontTier> _fontTiers=[];
 
+    internal LiveTranslationLayoutCache Fork()
+    {
+        var copy = new LiveTranslationLayoutCache();
+        copy._items.AddRange(_items); copy._fontTiers.AddRange(_fontTiers);
+        return copy;
+    }
+
     public LiveTranslationFrame Update(LiveTranslationFrame candidate,IReadOnlyList<Rectangle> windows)
     {
         var layouts=candidate.LayoutItems.Select(item=>
@@ -33,8 +40,14 @@ public sealed class LiveTranslationLayoutCache
                 .OrderBy(t => Math.Abs(t.SourceSize-sourceSize)).FirstOrDefault();
             if(tier is null)
             {
+                // A font reduced to fit this rectangle is local to that text.
+                // Learning it as a session-wide tier shrinks unrelated body
+                // paragraphs, including paragraphs on later viewports.
                 if(item.TextLayout.ShouldRender && item.TextLayout.FontSizePixels
-                    >= TranslationTextLayoutPolicy.MinimumReadableFontSizePixels)
+                    >= TranslationTextLayoutPolicy.MinimumReadableFontSizePixels
+                    && (item.TextLayout.FontSizePixels >= sourceSize
+                        || TranslationTextLayoutPolicy.FitAtSize(item.Text,item.Bounds,item.SourceStyle,
+                            sourceSize,item.SourceStyle.LineHeightPixels).ShouldRender))
                     _fontTiers.Add(new(sourceSize,item.SourceStyle.FontCategory,item.TextLayout.FontSizePixels,
                         item.TextLayout.LineHeightPixels));
                 return item;

@@ -33,7 +33,8 @@ public static class AppInterfaceLanguage
             ["区域截图"] = "Capture region", ["全屏截图（含任务栏）"] = "Capture screen (with taskbar)",
             ["全屏截图（不含任务栏）"] = "Capture screen (without taskbar)", ["截取全部屏幕"] = "Capture all screens",
             ["翻译"] = "Translate", ["实时区域翻译"] = "Live region translation", ["设置"] = "Settings",
-            ["停止实时翻译"] = "Stop live translation", ["停止录屏"] = "Stop recording", ["退出 ClipRay"] = "Exit ClipRay"
+            ["停止实时翻译"] = "Stop live translation", ["停止录屏"] = "Stop recording", ["退出 ClipRay"] = "Exit ClipRay",
+            ["最近截取"] = "Recent captures", ["恢复长截图"] = "Recover scrolling capture"
         };
         foreach (Forms.ToolStripItem item in items)
         {

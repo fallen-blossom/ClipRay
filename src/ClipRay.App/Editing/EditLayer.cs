@@ -10,6 +10,12 @@ public enum EditTool
     Pen,
     Mosaic,
     Picker,
+    Arrow,
+    Rectangle,
+    Ellipse,
+    Circle,
+    Text,
+    Line,
 }
 
 public sealed class EditLayer
@@ -42,6 +48,8 @@ public sealed class EditLayer
 
     internal IReadOnlyList<EditOperation> Operations => _operations;
 
+    public bool HasEdits => _operations.Count > 0;
+
     public void SwitchTool(EditTool tool) => ActiveTool = tool;
 
     public void AddPenStroke(PenStroke stroke)
@@ -53,6 +61,12 @@ public sealed class EditLayer
     public void AddMosaicStroke(MosaicStroke stroke)
     {
         AddOperation(new MosaicEditOperation(stroke));
+        _redoOperations.Clear();
+    }
+
+    public void AddAnnotation(Annotation annotation)
+    {
+        AddOperation(new AnnotationEditOperation(annotation));
         _redoOperations.Clear();
     }
 
@@ -106,6 +120,8 @@ internal abstract record EditOperation;
 internal sealed record PenEditOperation(PenStroke Stroke) : EditOperation;
 
 internal sealed record MosaicEditOperation(MosaicStroke Stroke) : EditOperation;
+
+internal sealed record AnnotationEditOperation(Annotation Annotation) : EditOperation;
 
 public interface IClipboardTextSink
 {

@@ -5,7 +5,7 @@
   #error OutputDir must be defined
 #endif
 #ifndef SetupFlavor
-  #define SetupFlavor "Full"
+  #define SetupFlavor "Lite"
 #endif
 #define AppVersion "1.0.6"
 #define AppExeName "ClipRay.App.exe"
@@ -60,8 +60,8 @@ en.CleanupGroup=Cleanup settings:
 chinesesimp.CleanupGroup=清理设置：
 en.LaunchSettings=Launch ClipRay and open Settings
 chinesesimp.LaunchSettings=启动 ClipRay 并打开设置
-en.AlreadyInstalled=ClipRay is already installed. To avoid replacing a running installation, uninstall it from Windows Settings before running this setup again.%n%nDeveloper directories are not treated as installed releases.
-chinesesimp.AlreadyInstalled=已安装正式版 ClipRay。为避免覆盖正在使用的安装，请先在 Windows 设置中卸载它，再运行此安装程序。%n%n开发者目录不会被识别为正式安装。
+en.UpgradeDirectory=An existing ClipRay installation was found. Upgrade in its current folder to keep settings and output locations.
+chinesesimp.UpgradeDirectory=检测到已安装的 ClipRay。请在原目录升级，保留设置和成果位置。
 en.DeveloperCaption=ClipRay · Developer: 落花 φ(>ω<*)
 chinesesimp.DeveloperCaption=ClipRay 截光 · 开发者：落花 φ(>ω<*)
 en.ChooseInstallDirectory=Choose installation folder
@@ -84,11 +84,13 @@ en.OutputsRecycleFailed=The default ClipRay Outputs folder could not be moved to
 chinesesimp.OutputsRecycleFailed=ClipRay 默认 Outputs 文件夹未能整体移入回收站，卸载已停止。请关闭正在使用其中文件的程序后重试。
 en.UninstallCleanupFailed=ClipRay uninstall cleanup did not finish. Uninstallation has stopped. Restart Windows and try again; if it still fails, keep this message and contact the developer.
 chinesesimp.UninstallCleanupFailed=ClipRay 卸载清理未能完成，卸载已停止。请重新启动电脑后重试；若仍失败，请保留此提示并联系开发者。
+en.InstallExitFailed=ClipRay could not confirm that this installation has exited. Finish active work and exit ClipRay from its tray menu, then retry. You do not need to uninstall. No process will be force terminated.
+chinesesimp.InstallExitFailed=无法确认此安装的 ClipRay 已退出。请完成当前操作，从托盘退出后重试，无需卸载。不会强制终止进程。
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:DesktopShortcut}"; GroupDescription: "{cm:ShortcutsGroup}"; Flags: unchecked
-Name: "startup"; Description: "{cm:StartupTask}"; GroupDescription: "{cm:StartupGroup}"; Flags: unchecked
-Name: "cleanup"; Description: "{cm:CleanupTask}"; GroupDescription: "{cm:CleanupGroup}"; Flags: unchecked
+Name: "startup"; Description: "{cm:StartupTask}"; GroupDescription: "{cm:StartupGroup}"; Flags: unchecked; Check: IsFreshInstall
+Name: "cleanup"; Description: "{cm:CleanupTask}"; GroupDescription: "{cm:CleanupGroup}"; Flags: unchecked; Check: IsFreshInstall
 
 [Files]
 Source: "{#StagingDir}\*"; DestDir: "{app}\app"; Excludes: "licenses\*"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -104,7 +106,7 @@ Name: "{group}\ClipRay 截光"; Filename: "{app}\app\{#AppExeName}"; WorkingDir:
 Name: "{autodesktop}\ClipRay 截光"; Filename: "{app}\app\{#AppExeName}"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\Assets\ClipRay-v2.ico"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ClipRay"; ValueData: """{app}\app\{#AppExeName}"" --startup"; Flags: uninsdeletevalue; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ClipRay"; ValueData: """{app}\app\{#AppExeName}"" --startup"; Flags: uninsdeletevalue; Tasks: startup; Check: IsFreshInstall
 
 [Run]
 Filename: "{app}\app\{#AppExeName}"; Parameters: "--open-settings"; Description: "{cm:LaunchSettings}"; Flags: nowait postinstall skipifsilent
@@ -117,12 +119,21 @@ function CreateMutex(lpMutexAttributes: Longint; bInitialOwner: Boolean; lpName:
   external 'CreateMutexW@kernel32.dll stdcall';
 function GetLastError: Cardinal;
   external 'GetLastError@kernel32.dll stdcall';
+function CreateFileForUpdate(lpFileName: String; dwDesiredAccess, dwShareMode: Cardinal;
+  lpSecurityAttributes: Longint; dwCreationDisposition, dwFlagsAndAttributes: Cardinal;
+  hTemplateFile: Longint): Longint;
+  external 'CreateFileW@kernel32.dll stdcall';
+function CloseUpdateHandle(hObject: Longint): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
 
 var
   RecycleOutputs: Boolean;
   SetupMutexHandle: Longint;
+  UpgradeMutexHandle: Longint;
   DeveloperLabel: TNewStaticText;
   LicenseDescriptionLabel: TNewStaticText;
+  UpgradeInstallLocation: String;
+  IsUpgrade: Boolean;
 
 procedure BrowseDirectoryButtonClick(Sender: TObject); forward;
 procedure BrowseInstallationDirectory; forward;
@@ -139,13 +150,11 @@ var
 begin
   Result := '';
   if RegQueryStringValue(HKCU, '{#AppUninstallKey}', 'InstallLocation', InstallLocation) and
-     FileExists(AddBackslash(InstallLocation) + 'app\{#AppExeName}') then
+     (Trim(InstallLocation) <> '') then
     Result := InstallLocation;
 end;
 
 function InitializeSetup(): Boolean;
-var
-  ExistingInstall: String;
 begin
   if IsAnotherClipRaySetupRunning then
   begin
@@ -153,14 +162,93 @@ begin
     exit;
   end;
 
-  ExistingInstall := ExistingInstallLocation;
-  Result := ExistingInstall = '';
-  if not Result then
-    MsgBox(CustomMessage('AlreadyInstalled'), mbError, MB_OK);
+  UpgradeInstallLocation := ExistingInstallLocation;
+  IsUpgrade := UpgradeInstallLocation <> '';
+  Result := True;
+end;
+
+function IsFreshInstall(): Boolean;
+begin
+  Result := not IsUpgrade;
+end;
+
+procedure ReleaseUpgradeLock;
+begin
+  if UpgradeMutexHandle <> 0 then
+  begin
+    CloseUpdateHandle(UpgradeMutexHandle);
+    UpgradeMutexHandle := 0;
+  end;
+end;
+
+procedure DeinitializeSetup;
+begin
+  ReleaseUpgradeLock;
+  if SetupMutexHandle <> 0 then CloseUpdateHandle(SetupMutexHandle);
+end;
+
+function CanReplaceInstalledExecutable(const FileName: String): Boolean;
+var
+  FileHandle: Longint;
+begin
+  { Open for write without writing: running image mappings must not be overwritten. }
+  FileHandle := CreateFileForUpdate(FileName, $40000000, 0, 0, 3, $80, 0);
+  Result := FileHandle <> -1;
+  if Result then CloseUpdateHandle(FileHandle);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  InstalledExecutable: String;
+  ProtocolMarker: AnsiString;
+  ExitRequestCode: Integer;
+begin
+  Result := '';
+  if IsUpgrade and (CompareText(AddBackslash(ExpandConstant('{app}')),
+      AddBackslash(UpgradeInstallLocation)) <> 0) then
+  begin
+    Result := CustomMessage('UpgradeDirectory');
+    exit;
+  end;
+  InstalledExecutable := ExpandConstant('{app}\app\{#AppExeName}');
+  if UpgradeMutexHandle = 0 then
+    UpgradeMutexHandle := CreateMutex(0, False, 'Local\ClipRayUpgrade-C5C7914B-7566-4912-A9E0-4D09E724BDA1');
+  if UpgradeMutexHandle = 0 then
+  begin
+    Result := CustomMessage('InstallExitFailed');
+    exit;
+  end;
+  if not FileExists(InstalledExecutable) then exit;
+  { Also preserve data when upgrading an unregistered/portable installation. }
+  IsUpgrade := True;
+  if UpgradeInstallLocation = '' then UpgradeInstallLocation := ExpandConstant('{app}');
+  if LoadStringFromFile(ExpandConstant('{app}\app\install-exit-protocol.txt'), ProtocolMarker)
+      and (Trim(ProtocolMarker) = 'ClipRay.InstallExit.1') then
+  begin
+    if (not Exec(InstalledExecutable, '--request-install-exit', ExpandConstant('{app}\app'),
+        SW_HIDE, ewWaitUntilTerminated, ExitRequestCode)) or (ExitRequestCode <> 0) then
+    begin
+      Result := CustomMessage('InstallExitFailed');
+      ReleaseUpgradeLock;
+      exit;
+    end;
+  end;
+  { Legacy versions without the protocol can upgrade after a manual tray exit. }
+  if not CanReplaceInstalledExecutable(InstalledExecutable) then
+  begin
+    Result := CustomMessage('InstallExitFailed');
+    ReleaseUpgradeLock;
+  end;
 end;
 
 procedure InitializeWizard;
 begin
+  if IsUpgrade then
+  begin
+    WizardForm.DirEdit.Text := UpgradeInstallLocation;
+    WizardForm.DirEdit.Enabled := False;
+    WizardForm.DirBrowseButton.Enabled := False;
+  end;
   LicenseDescriptionLabel := TNewStaticText(WizardForm.FindComponent('LicenseLabel3'));
   if LicenseDescriptionLabel <> nil then LicenseDescriptionLabel.Visible := False;
 
@@ -201,7 +289,15 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ConfigurationExitCode: Integer;
 begin
-  if (CurStep = ssPostInstall) and WizardIsTaskSelected('cleanup') then
+  if (CurStep = ssInstall) and FileExists(ExpandConstant('{app}\app\{#AppExeName}')) and
+      (not CanReplaceInstalledExecutable(ExpandConstant('{app}\app\{#AppExeName}'))) then
+  begin
+    MsgBox(CustomMessage('InstallExitFailed'), mbError, MB_OK);
+    Abort;
+  end;
+  { Release before post-install helpers or the optional launch checkbox execute. }
+  if CurStep = ssPostInstall then ReleaseUpgradeLock;
+  if (CurStep = ssPostInstall) and IsFreshInstall() and WizardIsTaskSelected('cleanup') then
   begin
     if (not Exec(
       ExpandConstant('{app}\app\{#AppExeName}'),
@@ -270,20 +366,31 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  TerminateExitCode: Integer;
+  ExitRequestCode: Integer;
   CleanupExitCode: Integer;
   CleanupArguments: String;
+  ProtocolMarker: AnsiString;
 begin
   if CurUninstallStep = usUninstall then
   begin
+    if (not LoadStringFromFile(ExpandConstant('{app}\app\install-exit-protocol.txt'), ProtocolMarker)) or
+       (Trim(ProtocolMarker) <> 'ClipRay.InstallExit.1') then
+    begin
+      MsgBox(CustomMessage('InstallExitFailed'), mbError, MB_OK);
+      Abort;
+    end;
     { 卸载时才读取复选框；[UninstallRun] 中的 scripted constant 会在安装时固化。 }
-    Exec(
-      ExpandConstant('{sys}\taskkill.exe'),
-      '/F /T /IM "{#AppExeName}"',
-      '',
+    if (not Exec(
+      ExpandConstant('{app}\app\{#AppExeName}'),
+      '--request-install-exit',
+      ExpandConstant('{app}\app'),
       SW_HIDE,
       ewWaitUntilTerminated,
-      TerminateExitCode);
+      ExitRequestCode)) or (ExitRequestCode <> 0) then
+    begin
+      MsgBox(CustomMessage('InstallExitFailed'), mbError, MB_OK);
+      Abort;
+    end;
 
     CleanupArguments := '--uninstall-cleanup';
     if RecycleOutputs then
@@ -303,7 +410,9 @@ begin
 
     if CleanupExitCode <> 0 then
     begin
-      if CleanupExitCode = 2 then
+      if CleanupExitCode = 3 then
+        MsgBox(CustomMessage('InstallExitFailed'), mbError, MB_OK)
+      else if CleanupExitCode = 2 then
         MsgBox(CustomMessage('OutputsRecycleFailed'), mbError, MB_OK)
       else
         MsgBox(CustomMessage('UninstallCleanupFailed'), mbError, MB_OK);

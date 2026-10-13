@@ -238,8 +238,12 @@ def validate_bundle(events_path, events):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ["manifest-missing-or-invalid"]
-    if manifest.get("schema_version") != "clipray.live-evidence.v1":
+    schema = manifest.get("schema_version")
+    data_only = schema == "clipray.live-evidence.v2-data"
+    if schema not in ("clipray.live-evidence.v1", "clipray.live-evidence.v2-data"):
         issues.append("manifest-schema-unknown")
+    if data_only and manifest.get("evidence_mode") != "data":
+        issues.append("evidence-mode-mismatch")
     if manifest.get("complete") is not True:
         issues.append("trace-manifest-incomplete")
     if (not isinstance(manifest.get("write_failures"), int)
@@ -274,7 +278,7 @@ def validate_bundle(events_path, events):
         if not isinstance(event, dict):
             issues.append(f"invalid-event:{number}")
             continue
-        if event.get("schema_version") != "clipray.live-evidence.v1":
+        if event.get("schema_version") != schema:
             issues.append(f"event-schema-unknown:{number}")
         if event.get("sequence") != number:
             issues.append(f"event-sequence-gap:{number}")
@@ -283,6 +287,8 @@ def validate_bundle(events_path, events):
         generation = event.get("generation")
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         if kind in ("source_image_saved", "rendered_image_saved"):
+            if data_only:
+                issues.append(f"unexpected-image-in-data-mode:{number}")
             name = data.get("name")
             expected = data.get("sha256")
             if not isinstance(name, str) or Path(name).name != name or not name.endswith(".png"):
@@ -304,6 +310,23 @@ def validate_bundle(events_path, events):
             if key is None:
                 issues.append(f"image-identity-missing:{number}")
             elif kind == "source_image_saved":
+                source_keys.add(key)
+            else:
+                rendered.add((key, generation))
+        elif kind in ("source_frame_fingerprint", "rendered_frame_fingerprint"):
+            if not data_only:
+                issues.append(f"fingerprint-schema-mismatch:{number}")
+            digest = data.get("sha256")
+            width, height = data.get("width"), data.get("height")
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(c not in "0123456789abcdef" for c in digest)
+                    or type(width) is not int or type(height) is not int
+                    or width <= 0 or height <= 0 or data.get("pixel_format") != "BGRA32"
+                    or data.get("byte_count") != width * height * 4):
+                issues.append(f"frame-fingerprint-invalid:{number}")
+            if key is None:
+                issues.append(f"fingerprint-identity-missing:{number}")
+            elif kind == "source_frame_fingerprint":
                 source_keys.add(key)
             else:
                 rendered.add((key, generation))
@@ -331,6 +354,13 @@ def validate_bundle(events_path, events):
         issues.append(f"rendered-image-without-apply:{key[0]}:{generation}")
     for key, generation in applied - rendered:
         issues.append(f"apply-without-rendered-image:{key[0]}:{generation}")
+    if data_only:
+        count = sum(e.get("kind") == "source_frame_fingerprint" for e in events if isinstance(e, dict))
+        if manifest.get("source_frame_count") != count:
+            issues.append("source-frame-count-mismatch")
+        for key, generation in applied:
+            if key not in source_keys:
+                issues.append(f"apply-without-source-fingerprint:{key[0]}:{generation}")
     return issues
 
 
@@ -365,7 +395,7 @@ def analyze(events):
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
         if kind == "presentation":
             presentation = elapsed if presentation is None else presentation
-        elif kind == "source_image_saved":
+        elif kind in ("source_image_saved", "source_frame_fingerprint"):
             if key is None:
                 issues.append(f"source-missing-identity:{line_number}")
             else:

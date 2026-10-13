@@ -9,6 +9,36 @@ public static class EditRenderer
 {
     public static Bitmap Composite(Bitmap source, EditLayer layer) => CompositeCore(source, layer, null);
 
+    // Retained operations keep screen coordinates. OCR padding must keep their masks, too.
+    public static Bitmap CompositeCapture(Bitmap source, EditLayer layer, PixelRect captureBounds)
+    {
+        var capture = ToRectangle(captureBounds, source);
+        // Round dots and wide-line centers may lie outside the crop while their ink reaches it.
+        // Replay with enough room for the full pen width, then crop without changing export rules.
+        var margin = layer.PenStrokes.Count == 0 ? 0 : (int)Math.Clamp(
+            Math.Ceiling(layer.PenStrokes.Max(stroke => stroke.Width)), 1, Math.Max(source.Width, source.Height));
+        var working = Rectangle.FromLTRB(
+            Math.Max(0, capture.Left - margin), Math.Max(0, capture.Top - margin),
+            (int)Math.Min(source.Width, (long)capture.Right + margin),
+            (int)Math.Min(source.Height, (long)capture.Bottom + margin));
+        var output = source.Clone(working, PixelFormat.Format32bppPArgb);
+        ApplyOperations(source, output, layer, null, new PixelRect(working.X, working.Y, working.Width, working.Height));
+        if (working == capture) return output;
+        using (output)
+        {
+            return output.Clone(new Rectangle(capture.X - working.X, capture.Y - working.Y, capture.Width, capture.Height),
+                PixelFormat.Format32bppPArgb);
+        }
+    }
+
+    public static Bitmap RenderOverlay(Bitmap source, EditLayer layer, MosaicStroke? activeMosaic = null)
+    {
+        var bounds = ToRectangle(layer.Selection, source);
+        var output = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppPArgb);
+        ApplyOperations(source, output, layer, activeMosaic);
+        return output;
+    }
+
     public static Bitmap CompositeSelection(Bitmap selectionBase, Bitmap mosaicSource, EditLayer layer)
     {
         ArgumentNullException.ThrowIfNull(selectionBase);
@@ -35,24 +65,73 @@ public static class EditRenderer
         return output;
     }
 
-    private static void ApplyOperations(Bitmap mosaicSource, Bitmap output, EditLayer layer, MosaicStroke? activeMosaic)
+    private static void ApplyOperations(Bitmap mosaicSource, Bitmap output, EditLayer layer, MosaicStroke? activeMosaic, PixelRect? outputBounds = null)
     {
+        var selection = outputBounds ?? layer.Selection;
         foreach (var operation in layer.Operations)
         {
             switch (operation)
             {
                 case PenEditOperation pen:
-                    DrawPenStroke(output, pen.Stroke, layer.Selection);
+                    DrawPenStroke(output, pen.Stroke, selection);
                     break;
                 case MosaicEditOperation mosaic:
-                    DrawMosaicStroke(mosaicSource, output, mosaic.Stroke, layer.Selection);
+                    DrawMosaicStroke(mosaicSource, output, mosaic.Stroke, selection);
+                    break;
+                case AnnotationEditOperation annotation:
+                    DrawAnnotation(output, annotation.Annotation, selection);
                     break;
             }
         }
 
         if (activeMosaic is not null)
         {
-            DrawMosaicStroke(mosaicSource, output, activeMosaic, layer.Selection);
+            DrawMosaicStroke(mosaicSource, output, activeMosaic, selection);
+        }
+    }
+
+    internal static void DrawOperation(Bitmap source, Bitmap output, EditOperation operation, PixelRect selection)
+    {
+        if(operation is PenEditOperation pen) DrawPenStroke(output,pen.Stroke,selection);
+        else if(operation is MosaicEditOperation mosaic) DrawMosaicStroke(source,output,mosaic.Stroke,selection);
+        else if(operation is AnnotationEditOperation annotation) DrawAnnotation(output,annotation.Annotation,selection);
+    }
+
+    private static void DrawAnnotation(Bitmap output, Annotation annotation, PixelRect selection)
+    {
+        using var graphics = Graphics.FromImage(output);
+        graphics.SetClip(new Rectangle(0, 0, output.Width, output.Height));
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using var brush = new SolidBrush(annotation.Color);
+        using var pen = new Pen(annotation.Color, annotation.Width);
+        var bounds = annotation.Bounds;
+        var rectangle = new RectangleF((float)(bounds.X - selection.X), (float)(bounds.Y - selection.Y),
+            (float)bounds.Width, (float)bounds.Height);
+        switch (annotation.Kind)
+        {
+            case AnnotationKind.Line:
+                pen.StartCap = pen.EndCap = LineCap.Round;
+                graphics.PixelOffsetMode = PixelOffsetMode.Half;
+                graphics.DrawLine(pen, ToOutputPoint(annotation.Start, selection), ToOutputPoint(annotation.End, selection));
+                break;
+            case AnnotationKind.Arrow:
+                var points = AnnotationGeometry.Arrow(annotation.Start, annotation.End, annotation.Width);
+                if (points.Length >= 3) graphics.FillPolygon(brush, points.Select(p => ToOutputPoint(p, selection)).ToArray());
+                break;
+            case AnnotationKind.Rectangle when bounds.Width > 0 && bounds.Height > 0:
+                graphics.DrawRectangle(pen, rectangle.X, rectangle.Y, rectangle.Width, rectangle.Height);
+                break;
+            case AnnotationKind.Ellipse when bounds.Width > 0 && bounds.Height > 0:
+                graphics.DrawEllipse(pen, rectangle);
+                break;
+            case AnnotationKind.Text when bounds.Width > 0 && bounds.Height > 0:
+                using (var font = new Font("Segoe UI", annotation.FontSize, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var format = new StringFormat(StringFormat.GenericTypographic))
+                {
+                    graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                    graphics.DrawString(annotation.Text, font, brush, rectangle, format);
+                }
+                break;
         }
     }
 
@@ -60,98 +139,35 @@ public static class EditRenderer
     {
         using var graphics = Graphics.FromImage(output);
         graphics.SetClip(new Rectangle(0, 0, output.Width, output.Height));
-        graphics.SmoothingMode = SmoothingMode.None;
-        graphics.PixelOffsetMode = PixelOffsetMode.Default;
-        using var pen = new Pen(stroke.Color, stroke.Width) { LineJoin = LineJoin.Round };
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        graphics.PixelOffsetMode = PixelOffsetMode.Half;
+        using var pen = new Pen(stroke.Color, stroke.Width)
+        {
+            LineJoin = LineJoin.Round,
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round,
+        };
         if (stroke.Points.Count == 1)
         {
             var point = ToOutputPoint(stroke.Points[0], selection);
-            DrawPenStamp(graphics, stroke.Color, stroke.Width, point, selection);
+            var radius = stroke.Width / 2;
+            using var brush = new SolidBrush(stroke.Color);
+            graphics.FillEllipse(brush, point.X - radius, point.Y - radius, stroke.Width, stroke.Width);
             return;
         }
 
-        for (var index = 1; index < stroke.Points.Count; index++)
+        if (stroke.Points.Count > 1)
         {
-            var start = ToOutputPoint(stroke.Points[index - 1], selection);
-            var end = ToOutputPoint(stroke.Points[index], selection);
-            if (TryClipLine(ref start, ref end, selection))
-            {
-                graphics.DrawLine(pen, start, end);
-            }
-        }
-
-        foreach (var point in stroke.Points)
-        {
-            DrawPenStamp(graphics, stroke.Color, stroke.Width, ToOutputPoint(point, selection), selection);
+            // Keep original centers and let the bitmap clip the complete rounded path.
+            graphics.DrawLines(pen, stroke.Points.Select(point => ToOutputPoint(point, selection)).ToArray());
         }
     }
 
-    private static void DrawPenStamp(Graphics graphics, Color color, float width, PointF point, PixelRect selection)
+    internal static void DrawMosaicStroke(Bitmap source, Bitmap output, MosaicStroke stroke, PixelRect selection, MosaicPaintState? retained = null)
     {
-        if (point.X < 0 || point.Y < 0 || point.X >= selection.Width || point.Y >= selection.Height)
-        {
-            return;
-        }
-
-        var size = Math.Max(1, (int)Math.Ceiling(width));
-        using var brush = new SolidBrush(color);
-        graphics.FillRectangle(brush, (int)Math.Floor(point.X), (int)Math.Floor(point.Y), size, size);
-    }
-
-    private static bool TryClipLine(ref PointF start, ref PointF end, PixelRect selection)
-    {
-        var deltaX = end.X - start.X;
-        var deltaY = end.Y - start.Y;
-        var entering = 0f;
-        var leaving = 1f;
-        return Clip(-deltaX, start.X, ref entering, ref leaving)
-            && Clip(deltaX, (float)(selection.Width - 1 - start.X), ref entering, ref leaving)
-            && Clip(-deltaY, start.Y, ref entering, ref leaving)
-            && Clip(deltaY, (float)(selection.Height - 1 - start.Y), ref entering, ref leaving)
-            && ApplyClip(ref start, ref end, entering, leaving);
-    }
-
-    private static bool Clip(float delta, float edge, ref float entering, ref float leaving)
-    {
-        if (delta == 0)
-        {
-            return edge >= 0;
-        }
-
-        var ratio = edge / delta;
-        if (delta < 0)
-        {
-            if (ratio > leaving) return false;
-            entering = Math.Max(entering, ratio);
-        }
-        else
-        {
-            if (ratio < entering) return false;
-            leaving = Math.Min(leaving, ratio);
-        }
-
-        return true;
-    }
-
-    private static bool ApplyClip(ref PointF start, ref PointF end, float entering, float leaving)
-    {
-        if (entering > leaving)
-        {
-            return false;
-        }
-
-        var originalStart = start;
-        var deltaX = end.X - originalStart.X;
-        var deltaY = end.Y - originalStart.Y;
-        start = new PointF(originalStart.X + entering * deltaX, originalStart.Y + entering * deltaY);
-        end = new PointF(originalStart.X + leaving * deltaX, originalStart.Y + leaving * deltaY);
-        return true;
-    }
-
-    private static void DrawMosaicStroke(Bitmap source, Bitmap output, MosaicStroke stroke, PixelRect selection)
-    {
-        var visited = new HashSet<(int X, int Y)>();
-        var brushes = new Dictionary<int, SolidBrush>();
+        var state=retained??new MosaicPaintState();
+        var visited = state.Visited;
+        var brushes = state.Brushes;
         using var graphics = Graphics.FromImage(output);
         graphics.CompositingMode = CompositingMode.SourceCopy;
         graphics.SmoothingMode = SmoothingMode.None;
@@ -172,21 +188,21 @@ public static class EditRenderer
                         var deltaX = x + 0.5 - point.X;
                         var deltaY = y + 0.5 - point.Y;
                         if (deltaX * deltaX + deltaY * deltaY > radius * radius || !visited.Add((x, y))) continue;
-                        FillMosaicPixel(source, graphics, brushes, x, y, stroke.BlockSize, selection);
+                        FillMosaicPixel(source, graphics, state, x, y, stroke.BlockSize, selection);
                     }
                 }
             }
         }
         finally
         {
-            foreach (var brush in brushes.Values) brush.Dispose();
+            if(retained is null) state.Dispose();
         }
     }
 
     private static void FillMosaicPixel(
         Bitmap source,
         Graphics graphics,
-        IDictionary<int, SolidBrush> brushes,
+        MosaicPaintState state,
         int x,
         int y,
         int blockSize,
@@ -197,7 +213,9 @@ public static class EditRenderer
         var blockY = FloorToBlock(y, blockSize);
         var sourceLeft = Math.Clamp(blockX, 0, source.Width - 1);
         var sourceTop = Math.Clamp(blockY, 0, source.Height - 1);
-        var color = source.GetPixel(sourceLeft, sourceTop);
+        if(!state.Colors.TryGetValue((sourceLeft,sourceTop),out var color))
+        { color=source.GetPixel(sourceLeft, sourceTop);state.Colors.Add((sourceLeft,sourceTop),color);state.SourceSamples++; }
+        var brushes=state.Brushes;
         if (!brushes.TryGetValue(color.ToArgb(), out var brush))
         {
             brush = new SolidBrush(color);
@@ -221,4 +239,13 @@ public static class EditRenderer
 
     private static int FloorToBlock(int value, int blockSize) =>
         (int)Math.Floor(value / (double)blockSize) * blockSize;
+}
+
+internal sealed class MosaicPaintState : IDisposable
+{
+    internal readonly HashSet<(int X,int Y)> Visited=[];
+    internal readonly Dictionary<(int X,int Y),Color> Colors=[];
+    internal readonly Dictionary<int,SolidBrush> Brushes=[];
+    internal int SourceSamples;
+    public void Dispose() {foreach(var brush in Brushes.Values)brush.Dispose();Brushes.Clear();}
 }

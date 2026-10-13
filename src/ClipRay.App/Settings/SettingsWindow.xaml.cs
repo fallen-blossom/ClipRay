@@ -26,6 +26,16 @@ public partial class SettingsWindow : Window
     private readonly Func<CleanupScheduleRegistrationStatus> _loadCleanupScheduleStatus;
     private readonly Func<bool> _loadStartupStatus;
     private readonly InstalledUninstallState _installedUninstall;
+    private readonly SettingsWindowEnvironment _environment;
+    private HotkeyRegistrationResult _hotkeyRegistration = HotkeyRegistrationResult.Empty;
+    private bool _showingHotkeyFailureStatus;
+    private bool _connectionDeliveryClosed;
+    internal Task? ConnectionOperationTask { get; private set; }
+    internal Func<SettingsDraftCloseChoice>? DraftDecision { get; set; }
+    internal Func<string, string, bool>? CredentialDeletionConfirmation { get; set; }
+    internal Func<bool>? UninstallConfirmation { get; set; }
+    internal Action? LaunchUninstaller { get; set; }
+    internal Func<Action, Task<bool>>? RequestApplicationExit { get; set; }
     private readonly UiOperationOwner _connectionOperations = new();
     private readonly Dictionary<System.Windows.Controls.TextBox, GlobalHotkey?> _hotkeyValues = [];
     private AppSettings _settings;
@@ -33,6 +43,7 @@ public partial class SettingsWindow : Window
     private SettingsDraftState? _draftState;
     private string _savedNonLanguageDraft = "";
     private bool _lastApplyInterfaceOnly;
+    private bool _outputDirectoriesEdited;
     private CleanupRunStatus? _lastCleanupRun;
     private CleanupScheduleRegistrationStatus? _lastCleanupSchedule;
     private bool _lastStartupEnabled;
@@ -62,7 +73,8 @@ public partial class SettingsWindow : Window
         Func<DeepSeekCostSummary> loadDeepSeekCostSummary,
         Func<DeepSeekCostSummary> resetDeepSeekCostSummary,
         Func<CleanupScheduleRegistrationStatus>? loadCleanupScheduleStatus = null,
-        Func<bool>? loadStartupStatus = null)
+        Func<bool>? loadStartupStatus = null,
+        SettingsWindowEnvironment? environment = null)
     {
         InitializeComponent();
         _applyCoordinator = applyCoordinator;
@@ -72,6 +84,7 @@ public partial class SettingsWindow : Window
         _loadDeepSeekCostSummary = loadDeepSeekCostSummary;
         _resetDeepSeekCostSummary = resetDeepSeekCostSummary;
         _settings = initialSettings;
+        _environment = environment ?? SettingsWindowEnvironment.Default();
         _loadCleanupScheduleStatus = loadCleanupScheduleStatus
             ?? (() => new WindowsCleanupScheduleRegistration().ReadStatus(
                 CleanupScheduleOptions.FromSettings(_settings),
@@ -79,11 +92,9 @@ public partial class SettingsWindow : Window
         _loadStartupStatus = loadStartupStatus
             ?? (() => StartupRegistration.IsEnabled(
                 Environment.ProcessPath ?? throw new InvalidOperationException("无法确定 ClipRay 可执行文件路径。")));
-        _installedUninstall = InstalledUninstallLauncher.Resolve(
-            AppContext.BaseDirectory,
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+        _installedUninstall = _environment.ResolveUninstall();
         UninstallButton.Visibility = _installedUninstall.IsAvailable ? Visibility.Visible : Visibility.Collapsed;
-        _selectedCredentialName = CredentialVault.FixedDeepSeekSlot;
+        _selectedCredentialName = initialSettings.CredentialName ?? CredentialVault.FixedDeepSeekSlot;
         System.Windows.DataObject.AddPastingHandler(CleanupDailyTimeBox, CleanupDailyTimeBox_Pasting);
         _lastCostSummary = deepSeekCostSummary;
         LoadControls();
@@ -99,29 +110,70 @@ public partial class SettingsWindow : Window
         if (!string.IsNullOrWhiteSpace(loadWarning))
             ShowStatus(SettingsLoadWarningText.ForInterface(loadWarning, _settings.InterfaceLanguage), success: false);
         Loaded += (_, _) => StartSignatureMotion();
-        Closing += (_, args) =>
-        {
-            if (DiscardDraftOnClose || _draftState?.Action != SettingsPrimaryAction.Save) return;
-            var decision = System.Windows.MessageBox.Show(this,
-                Ui("设置尚未保存。选择“是”保存并关闭，“否”放弃修改，“取消”返回继续编辑。", "Unsaved settings. Choose Yes to save and close, No to discard changes, or Cancel to keep editing."), Ui("未保存的设置", "Unsaved settings"),
-                MessageBoxButton.YesNoCancel, MessageBoxImage.Question, MessageBoxResult.Cancel);
-            args.Cancel = !_draftState.CanClose(decision switch
-            {
-                MessageBoxResult.Yes => SettingsDraftCloseChoice.Save,
-                MessageBoxResult.No => SettingsDraftCloseChoice.Discard,
-                _ => SettingsDraftCloseChoice.Cancel,
-            }, TryApplyCurrentSettings);
-        };
+        Closing += SettingsClosing;
         Closed += (_, _) =>
         {
             StopSignatureMotion();
-            _connectionOperations.Close();
+            CloseConnectionDelivery();
         };
     }
 
     public event EventHandler<AppSettings>? SettingsApplied;
 
     public event EventHandler<bool>? HotkeyCaptureFocusChanged;
+
+    internal void SettingsClosing(object? sender, System.ComponentModel.CancelEventArgs args) =>
+        args.Cancel = !TryPrepareDraftClose();
+
+    internal bool TryPrepareDraftClose()
+    {
+        if (DiscardDraftOnClose || _draftState?.Action != SettingsPrimaryAction.Save) return true;
+        return _draftState.CanClose((DraftDecision ?? AskDraftDecision)(), TryApplyCurrentSettings);
+    }
+
+    private SettingsDraftCloseChoice AskDraftDecision() => System.Windows.MessageBox.Show(this,
+        Ui("设置尚未保存。选择“是”保存并关闭，“否”放弃修改，“取消”返回继续编辑。", "Unsaved settings. Choose Yes to save and close, No to discard changes, or Cancel to keep editing."),
+        Ui("未保存的设置", "Unsaved settings"), MessageBoxButton.YesNoCancel, MessageBoxImage.Question, MessageBoxResult.Cancel) switch
+        { MessageBoxResult.Yes => SettingsDraftCloseChoice.Save, MessageBoxResult.No => SettingsDraftCloseChoice.Discard, _ => SettingsDraftCloseChoice.Cancel };
+
+    internal void BeginApplicationExit()
+    {
+        CloseConnectionDelivery();
+        DiscardDraftOnClose = true; IsEnabled = false;
+    }
+    internal void PrepareForCommittedShutdown()
+    {
+        CloseConnectionDelivery();
+        DiscardDraftOnClose = true;
+    }
+    private void CloseConnectionDelivery()
+    {
+        _connectionDeliveryClosed = true;
+        _connectionOperations.Close();
+    }
+    private bool CanDeliverConnection(UiOperation? operation) => !_connectionDeliveryClosed
+        && (operation is null || _connectionOperations.IsCurrent(operation.Value.Version));
+    internal void ReportExitWarning(string message) => ShowStatus(message, success: false);
+    internal void ReportHotkeyRegistration(HotkeyRegistrationResult result)
+    {
+        var recovered = _hotkeyRegistration.Failures.Count > 0 && result.Failures.Count == 0;
+        _hotkeyRegistration = result;
+        RenderHotkeyRegistration();
+        if (recovered && _showingHotkeyFailureStatus && !_connectionDeliveryClosed)
+            ShowInfoStatus(Ui("快捷键已全部生效。", "All shortcuts are now applied."));
+    }
+    private string HotkeyRegistrationWarning() => Ui(
+        $"以下快捷键未能生效：{string.Join("；", _hotkeyRegistration.Failures)}。"
+            + (_hotkeyRegistration.Retained.Count == 0 ? "" : $"原绑定仍可用：{string.Join("；", _hotkeyRegistration.Retained)}。")
+            + "可通过托盘停止录屏或实时翻译。",
+        $"These shortcuts could not be applied: {string.Join("; ", _hotkeyRegistration.Failures)}. "
+            + (_hotkeyRegistration.Retained.Count == 0 ? "" : $"Previous bindings remain available: {string.Join("; ", _hotkeyRegistration.Retained)}. ")
+            + "Use the tray to stop recording or live translation.");
+    private void RenderHotkeyRegistration()
+    {
+        HotkeyRegistrationWarningText.Visibility = _hotkeyRegistration.Failures.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+        HotkeyRegistrationWarningText.Text = _hotkeyRegistration.Failures.Count == 0 ? "" : HotkeyRegistrationWarning();
+    }
 
     public void ShowLocalProviderPreview()
     {
@@ -172,7 +224,7 @@ public partial class SettingsWindow : Window
         SetHotkeyValue(StopLongCaptureHotkeyBox, _settings.StopLongCaptureHotkey);
         SetHotkeyValue(StopLongCaptureSecondaryHotkeyBox, _settings.StopLongCaptureSecondaryHotkey);
         WireHotkeyCaptureFocus();
-        LocalLmtModelPathBox.Text = LocalLmtOptions.Discover(_settings.LocalLmtModelPath).ModelPath;
+        LocalLmtModelPathBox.Text = _environment.ResolveLocalModelPath(_settings.LocalLmtModelPath);
         SelectProviderChoice(_settings.Provider, LocalLmtModelPathBox.Text);
         SelectComboValue(LiveProviderBox, _settings.LiveTranslationProvider);
         SelectComboValue(ModelBox, _settings.DeepSeekModel);
@@ -200,7 +252,13 @@ public partial class SettingsWindow : Window
         {
             SaveSettingsDraft();
             if (!_lastApplyInterfaceOnly) RefreshRuntimeData();
-            ShowStatus(Ui("设置已保存并立即生效。", "Settings saved and applied."), success: true);
+            if (_hotkeyRegistration.Failures.Count == 0)
+                ShowStatus(Ui("设置已保存并立即生效。", "Settings saved and applied."), success: true);
+            else
+            {
+                ShowStatus(Ui("设置已保存；", "Settings saved; ") + HotkeyRegistrationWarning(), success: false);
+                _showingHotkeyFailureStatus = true;
+            }
             return true;
         }
         catch (Exception exception)
@@ -255,14 +313,22 @@ public partial class SettingsWindow : Window
         RenderCostSummary();
         RefreshCleanupStatus();
         RefreshCredentials();
+        RenderHotkeyRegistration();
     }
 
     private async void SaveCredential_Click(object sender, RoutedEventArgs e)
     {
+        ConnectionOperationTask = SaveCredentialAsync();
+        await ConnectionOperationTask;
+    }
+
+    private async Task SaveCredentialAsync()
+    {
+        if (_connectionDeliveryClosed) return;
         UiOperation? operation = null;
         try
         {
-            const string name = CredentialVault.FixedDeepSeekSlot;
+            var name = _selectedCredentialName ?? CredentialVault.FixedDeepSeekSlot;
             const string provider = "DeepSeek";
             var candidate = CredentialValueBox.Password;
             CredentialSecretPolicy.ValidateCandidate(provider, candidate);
@@ -274,7 +340,7 @@ public partial class SettingsWindow : Window
                 candidate,
                 SelectedValue(ModelBox),
                 operation.Value.Token);
-            if (!_connectionOperations.IsCurrent(operation.Value.Version)) return;
+            if (!CanDeliverConnection(operation)) return;
             if (!verified.IsSuccess)
             {
                 ShowStatus(
@@ -297,6 +363,7 @@ public partial class SettingsWindow : Window
         }
         catch (Exception exception)
         {
+            if (!CanDeliverConnection(operation)) return;
             var english = operation is null && exception is ArgumentException
                 ? "Enter a DeepSeek API key beginning with sk- and containing no spaces. The saved key was not changed."
                 : "Could not save the credential; the existing key was not replaced.";
@@ -304,38 +371,37 @@ public partial class SettingsWindow : Window
         }
         finally
         {
-            if (SaveCredentialButton is not null && (operation is null || _connectionOperations.IsCurrent(operation.Value.Version))) SaveCredentialButton.IsEnabled = true;
+            if (SaveCredentialButton is not null && CanDeliverConnection(operation)) SaveCredentialButton.IsEnabled = true;
         }
     }
 
     private void DeleteCredential_Click(object sender, RoutedEventArgs e)
     {
+        if (_connectionDeliveryClosed) return;
         try
         {
-            const string name = CredentialVault.FixedDeepSeekSlot;
+            var name = _selectedCredentialName ?? CredentialVault.FixedDeepSeekSlot;
             _connectionOperations.CancelPending();
-            var confirmed = CredentialDeletionPolicy.Confirm(name, (message, title) =>
+            var confirmed = CredentialDeletionPolicy.Confirm(name, CredentialDeletionConfirmation ?? ((message, title) =>
                 System.Windows.MessageBox.Show(
                     this,
                     message,
                     title,
                     MessageBoxButton.YesNo,
                     MessageBoxImage.Warning,
-                    MessageBoxResult.No) == MessageBoxResult.Yes, _settings.InterfaceLanguage);
-            if (!confirmed) return;
+                    MessageBoxResult.No) == MessageBoxResult.Yes), _settings.InterfaceLanguage);
+            if (!confirmed || _connectionDeliveryClosed) return;
 
             _credentialVault.Delete(name);
-            if (string.Equals(_selectedCredentialName, name, StringComparison.OrdinalIgnoreCase))
-            {
-                _selectedCredentialName = null;
-                ObserveSettingsDraft();
-            }
+            // Clearing a selected legacy slot must not silently select a different
+            // existing fixed slot. The next import/verification still targets B.
             CredentialValueBox.Clear();
             RefreshCredentials();
             ShowStatus(CredentialDeletionPolicy.Success(name, _settings.InterfaceLanguage), success: true);
         }
         catch (Exception exception)
         {
+            if (_connectionDeliveryClosed) return;
             ShowStatus(Ui($"无法删除凭据：{exception.Message}", "Could not delete the local credential."), success: false);
         }
     }
@@ -369,6 +435,13 @@ public partial class SettingsWindow : Window
 
     private async void TestConnection_Click(object sender, RoutedEventArgs e)
     {
+        ConnectionOperationTask = TestConnectionAsync();
+        await ConnectionOperationTask;
+    }
+
+    private async Task TestConnectionAsync()
+    {
+        if (_connectionDeliveryClosed) return;
         UiOperation? operation = null;
         string? provider = null;
         try
@@ -389,11 +462,11 @@ public partial class SettingsWindow : Window
                 provider,
                 token => _localProviderTest(LocalTrialInputBox.Text, token),
                 token => _connectionTester.TestAsync(
-                    CredentialVault.FixedDeepSeekSlot,
+                    _selectedCredentialName ?? CredentialVault.FixedDeepSeekSlot,
                     SelectedValue(ModelBox),
                     token),
                 operation.Value.Token);
-            if (_connectionOperations.IsCurrent(operation.Value.Version))
+            if (CanDeliverConnection(operation))
             {
                 ShowStatus(
                     result.IsSuccess && provider is "Local LMT" or "Machine"
@@ -411,7 +484,7 @@ public partial class SettingsWindow : Window
         catch (OperationCanceledException)
         {
             // Closing or superseding Settings owns cancellation and suppresses late UI updates.
-            if (operation is not null && _connectionOperations.IsCurrent(operation.Value.Version))
+            if (operation is not null && CanDeliverConnection(operation))
             {
                 ShowStatus(Ui("本次测试已取消，可以重试。", "This test was cancelled. You can retry."), success: false);
                 if (provider is "Local LMT" or "Machine")
@@ -423,11 +496,12 @@ public partial class SettingsWindow : Window
         }
         catch
         {
+            if (!CanDeliverConnection(operation)) return;
             if (operation is null)
             {
                 ShowStatus(Ui("无法保存测试设置；未启动翻译测试。", "Could not save test settings; translation test was not started."), success: false);
             }
-            else if (_connectionOperations.IsCurrent(operation.Value.Version))
+            else
             {
                 ShowStatus(Ui("连接测试失败，未显示任何私密诊断。", "Connection test failed. Private diagnostics are hidden."), success: false);
                 if (provider is "Local LMT" or "Machine")
@@ -439,7 +513,7 @@ public partial class SettingsWindow : Window
         }
         finally
         {
-            if (TestProviderButton is not null && (operation is null || _connectionOperations.IsCurrent(operation.Value.Version))) TestProviderButton.IsEnabled = true;
+            if (TestProviderButton is not null && CanDeliverConnection(operation)) TestProviderButton.IsEnabled = true;
         }
     }
 
@@ -472,23 +546,22 @@ public partial class SettingsWindow : Window
 
     private void OpenRecordingFolder_Click(object sender, RoutedEventArgs e) => OpenOutputFolder(RecordingDirectoryBox);
 
-    private void Uninstall_Click(object sender, RoutedEventArgs e)
+    private async void Uninstall_Click(object sender, RoutedEventArgs e)
     {
-        var choice = System.Windows.MessageBox.Show(
+        var confirmed = (UninstallConfirmation ?? (() => System.Windows.MessageBox.Show(
             this,
             Ui("将打开 ClipRay 卸载程序。截图、长截图和录屏默认保留；是否移入回收站可在卸载确认页选择。",
                 "ClipRay's uninstaller will open. Screenshots, scrolling captures and recordings are kept by default; the uninstall confirmation lets you choose whether to move them to the Recycle Bin."),
             Ui("卸载 ClipRay", "Uninstall ClipRay"),
             MessageBoxButton.YesNo,
             MessageBoxImage.Warning,
-            MessageBoxResult.No);
-        if (choice != MessageBoxResult.Yes) return;
+            MessageBoxResult.No) == MessageBoxResult.Yes))();
+        if (!confirmed) return;
 
         try
         {
-            InstalledUninstallLauncher.Launch(_installedUninstall);
-            Close();
-            System.Windows.Application.Current.Shutdown();
+            if (RequestApplicationExit is null) throw new InvalidOperationException("应用退出入口不可用。");
+            await RequestApplicationExit(LaunchUninstaller ?? (() => InstalledUninstallLauncher.Launch(_installedUninstall)));
         }
         catch (Exception exception)
         {
@@ -633,14 +706,12 @@ public partial class SettingsWindow : Window
     {
         var selectedPath = LocalLmtModelPathBox.Text;
         ComboBoxItem? selectedItem = null;
-        var options = LocalLmtModelCatalog.ResolveProviderModels(
-                     AppContext.BaseDirectory,
-                     WorkspaceLocator.TryFind(AppContext.BaseDirectory)).ToList();
+        var options = _environment.ResolveLocalModels().ToList();
         if (_settings.Provider == "Local LMT" && !options.Any(option =>
                 string.Equals(option.Path, selectedPath, StringComparison.OrdinalIgnoreCase)))
         {
             options.Add(new LocalLmtDevelopmentModelOption(
-                LocalLmtModelCatalog.ProviderChoiceNameFor(selectedPath), selectedPath, File.Exists(selectedPath)));
+                LocalLmtModelCatalog.ProviderChoiceNameFor(selectedPath), selectedPath, _environment.ModelExists(selectedPath)));
         }
         foreach (var option in options)
         {
@@ -778,6 +849,8 @@ public partial class SettingsWindow : Window
             LocalLmtModelPathBox,
         ];
         foreach (var box in textBoxes) box.TextChanged += (_, _) => ObserveSettingsDraft();
+        foreach (var box in new[] { ScreenshotDirectoryBox, LongCaptureDirectoryBox, RecordingDirectoryBox })
+            box.TextChanged += (_, _) => _outputDirectoriesEdited = true;
 
         System.Windows.Controls.CheckBox[] checkBoxes =
         [
@@ -830,6 +903,7 @@ public partial class SettingsWindow : Window
         RenderCleanupStatus();
         RenderCostSummary();
         RenderCredentialStatus();
+        RenderHotkeyRegistration();
         LocalModelStatusText.Text = Ui(_localStatusChinese, _localStatusEnglish);
         foreach (var entry in _hotkeyValues)
             entry.Key.Text = entry.Value is null ? Ui("未设置", "Not set") : HotkeyDisplayFormatter.Format(entry.Value);
@@ -940,7 +1014,7 @@ public partial class SettingsWindow : Window
         SelectedValue(ModelBox),
         SelectedValue(TranslationTargetLanguageBox),
         LocalLmtModelPathBox.Text,
-        CredentialVault.FixedDeepSeekSlot);
+        _selectedCredentialName ?? string.Empty);
 
     private string DraftHotkey(System.Windows.Controls.TextBox box) =>
         _hotkeyValues.TryGetValue(box, out var hotkey) ? hotkey?.ToString() ?? string.Empty : string.Empty;
@@ -959,13 +1033,7 @@ public partial class SettingsWindow : Window
 
     private void RefreshCleanupStatus()
     {
-        var dataRoot = ApplicationPaths.Create(
-            AppContext.BaseDirectory,
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)).DataRoot;
-        var cleanupStatusPath = Path.Combine(
-            dataRoot,
-            "cleanup-status.json");
-        _lastCleanupRun = new CleanupRunStatusStore(cleanupStatusPath).Load();
+        _lastCleanupRun = _environment.LoadCleanupRun();
         _lastCleanupSchedule = _loadCleanupScheduleStatus();
         _lastStartupEnabled = _loadStartupStatus();
         RenderCleanupStatus();
@@ -975,6 +1043,8 @@ public partial class SettingsWindow : Window
     {
         if (_lastCleanupSchedule is null) return;
         CleanupLastRunText.Text = CleanupRunStatusFormatter.Format(_lastCleanupRun, interfaceLanguage: _settings.InterfaceLanguage);
+        CleanupLastRunText.ToolTip = _lastCleanupRun is null ? null : string.Join(Environment.NewLine,
+            _lastCleanupRun.Items.Select(item => $"{item.Status}: {item.Path} ({item.Reason})"));
         CleanupScheduleStateText.Text = CleanupScheduleStatusFormatter.Format(
             _settings.CleanupScheduleEnabled,
             _lastCleanupSchedule, _settings.InterfaceLanguage);
@@ -1029,6 +1099,7 @@ public partial class SettingsWindow : Window
             ScreenshotDirectory = Path.GetFullPath(ScreenshotDirectoryBox.Text),
             LongCaptureDirectory = Path.GetFullPath(LongCaptureDirectoryBox.Text),
             RecordingDirectory = Path.GetFullPath(RecordingDirectoryBox.Text),
+            DefaultOutputLayoutRoot = _outputDirectoriesEdited ? null : _settings.DefaultOutputLayoutRoot,
             CopyToClipboard = CopyToClipboardBox.IsChecked == true,
             ShowBorderFeedback = BorderFeedbackBox.IsChecked == true,
             ShowLiveTranslationStopControl = LiveStopControlBox.IsChecked == true,
@@ -1048,11 +1119,12 @@ public partial class SettingsWindow : Window
             TranslationTargetLanguage = SelectedValue(TranslationTargetLanguageBox),
             MachineTranslationFallbackEnabled = MachineFallbackBox.IsChecked == true,
             LocalLmtModelPath = NullIfWhiteSpace(LocalLmtModelPathBox.Text),
-            CredentialName = CredentialVault.FixedDeepSeekSlot,
+            CredentialName = _selectedCredentialName,
         };
         updated.Validate();
         _applyCoordinator.Apply(_settings, updated);
         _settings = updated;
+        _outputDirectoriesEdited = false;
         SettingsApplied?.Invoke(this, updated);
     }
 
@@ -1098,14 +1170,25 @@ public partial class SettingsWindow : Window
     private void RefreshCredentials()
     {
         var slot = _credentialVault.List().FirstOrDefault(item =>
-            string.Equals(item.Name, CredentialVault.FixedDeepSeekSlot, StringComparison.OrdinalIgnoreCase));
+            string.Equals(item.Name, _selectedCredentialName ?? CredentialVault.FixedDeepSeekSlot, StringComparison.OrdinalIgnoreCase));
         _credentialSuffix = slot?.MaskedSuffix;
         RenderCredentialStatus();
     }
 
-    private void RenderCredentialStatus() => CredentialSlotStatusText.Text = _credentialSuffix is null
-        ? Ui("固定本机凭据槽：未保存", "Local credential slot: empty")
-        : Ui($"固定本机凭据槽：已保存（{_credentialSuffix}）", $"Local credential slot: saved ({_credentialSuffix})");
+    private void RenderCredentialStatus()
+    {
+        var name = _selectedCredentialName ?? CredentialVault.FixedDeepSeekSlot;
+        var fixedSlot = string.Equals(name, CredentialVault.FixedDeepSeekSlot, StringComparison.OrdinalIgnoreCase);
+        CredentialSlotStatusText.Text = _credentialSuffix is null
+            ? fixedSlot ? Ui("固定本机凭据槽：未保存", "Local credential slot: empty")
+                : Ui($"当前本机凭据（{name}）：未保存", $"Selected local credential ({name}): empty")
+            : fixedSlot ? Ui($"固定本机凭据槽：已保存（{_credentialSuffix}）", $"Local credential slot: saved ({_credentialSuffix})")
+                : Ui($"当前本机凭据（{name}）：已保存（{_credentialSuffix}）", $"Selected local credential ({name}): saved ({_credentialSuffix})");
+        SaveCredentialButton.Content = Ui(fixedSlot ? "验证并保存/替换固定凭据" : "验证并保存/替换当前凭据",
+            "Verify and save or replace credential");
+        SaveCredentialButton.ToolTip = Ui($"验证并替换本机凭据：{name}", $"Verify and replace local credential: {name}");
+        DeleteCredentialButton.ToolTip = Ui($"删除本机凭据：{name}", $"Delete local credential: {name}");
+    }
 
     private static string SelectedValue(System.Windows.Controls.ComboBox box) =>
         box.SelectedItem is System.Windows.Controls.ComboBoxItem { Tag: string value }
@@ -1157,6 +1240,7 @@ public partial class SettingsWindow : Window
 
     private void ShowStatus(string message, bool? success)
     {
+        _showingHotkeyFailureStatus = false;
         StatusText.Text = message;
         StatusIcon.Data = Geometry.Parse(success switch
         {

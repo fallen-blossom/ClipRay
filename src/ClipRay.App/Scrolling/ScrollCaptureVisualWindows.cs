@@ -126,15 +126,20 @@ public sealed class ScrollCapturePreviewWindow : Window
 
     public void ShowPreview(Bitmap bitmap)
     {
-        _image.Source = BitmapSourceFactory.Create(bitmap);
+        ShowPreview(BitmapSourceFactory.Create(bitmap), bitmap.Size);
+    }
+
+    public void ShowPreview(System.Windows.Media.Imaging.BitmapSource sourceBitmap, System.Drawing.Size compositeSize)
+    {
+        _image.Source = sourceBitmap;
         var workArea = Forms.Screen.FromRectangle(_region).WorkingArea;
-        var placement = ScrollCapturePreviewLayout.Calculate(_region, bitmap.Size, workArea).Bounds;
+        var placement = ScrollCapturePreviewLayout.Calculate(_region, compositeSize, workArea).Bounds;
         var source = PresentationSource.FromVisual(this)?.CompositionTarget;
         var scaleX = source?.TransformToDevice.M11 ?? 1;
         var scaleY = source?.TransformToDevice.M22 ?? 1;
         Width = placement.Width / scaleX;
         Height = placement.Height / scaleY;
-        _viewportBand.Height = Math.Max(2, placement.Height * Math.Min(1d, _region.Height / (double)bitmap.Height) / scaleY);
+        _viewportBand.Height = Math.Max(2, placement.Height * Math.Min(1d, _region.Height / (double)compositeSize.Height) / scaleY);
         UpdateLayout();
         _ = SetWindowPos(new WindowInteropHelper(this).Handle, HwndTopmost, placement.X, placement.Y, placement.Width, placement.Height, 0x0010);
     }

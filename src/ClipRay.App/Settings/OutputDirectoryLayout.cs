@@ -27,11 +27,38 @@ public static class OutputDirectoryLayout
         Directory.CreateDirectory(settings.RecordingDirectory);
     }
 
+    public static IReadOnlyList<string> TryEnsure(AppSettings settings, Action<string>? ensure = null)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        ensure ??= path => Directory.CreateDirectory(path);
+        var failures = new List<string>();
+        foreach (var (kind, path) in new[] { ("Screenshot", settings.ScreenshotDirectory),
+            ("LongCapture", settings.LongCaptureDirectory), ("Recording", settings.RecordingDirectory) })
+        {
+            try { ensure(path); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            { failures.Add($"{kind}: 0x{unchecked((uint)error.HResult):X8}"); }
+        }
+        return failures;
+    }
+
+    public static bool HasConfirmedDefaultLayout(AppSettings settings)
+    {
+        if (string.IsNullOrWhiteSpace(settings.DefaultOutputLayoutRoot)) return false;
+        var expected = Create(settings.DefaultOutputLayoutRoot);
+        return Same(settings.ScreenshotDirectory, expected.Screenshots)
+            && Same(settings.LongCaptureDirectory, expected.LongCaptures)
+            && Same(settings.RecordingDirectory, expected.Recordings);
+    }
+
+    private static bool Same(string path, string expected) => !string.IsNullOrWhiteSpace(path)
+        && string.Equals(Path.GetFullPath(path), expected, StringComparison.OrdinalIgnoreCase);
+
     public static bool IsCompleteLegacyLayout(AppSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
-        // 旧版 settings 没有“默认/自定义”来源字段；产品迁移契约因此只把这组三个
-        // 同根、精确旧名称视为旧默认签名。任一名称或根不同都必须保留为自定义配置。
+        // This describes a shape only. It is not evidence of default/user intent
+        // and must never authorize rebasing unmarked persisted directories.
         if (string.IsNullOrWhiteSpace(settings.ScreenshotDirectory)
             || string.IsNullOrWhiteSpace(settings.LongCaptureDirectory)
             || string.IsNullOrWhiteSpace(settings.RecordingDirectory))

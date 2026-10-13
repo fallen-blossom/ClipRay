@@ -1,6 +1,7 @@
 using System.IO;
 using System.IO.Pipes;
 using System.Security.Principal;
+using System.Text.Json;
 
 namespace ClipRay.App.Infrastructure;
 
@@ -21,7 +22,7 @@ public enum SingleInstanceStartResult
 public static class AppActivationPolicy
 {
     private static readonly string[] MaintenanceArguments =
-        ["--cleanup-scheduled", "--configure-install-cleanup", "--uninstall-cleanup"];
+        ["--cleanup-scheduled", "--configure-install-cleanup", "--uninstall-cleanup", "--request-install-exit"];
 
     private static readonly string[] DebugPreviewArguments =
     [
@@ -29,6 +30,8 @@ public static class AppActivationPolicy
         "--long-capture-live-preview",
         "--long-capture-preview",
         "--long-capture-runtime-probe",
+        "--long-capture-runtime-ui-probe",
+        "--live-logged-runtime-probe",
         "--modern-overlay-preview",
         "--overlay-preview",
         "--picker-preview",
@@ -84,10 +87,12 @@ public sealed class SingleInstanceCoordinator : IDisposable
         var safeScope = string.Concat(scope.Select(character =>
             char.IsLetterOrDigit(character) || character is '.' or '-' ? character : '.'));
         _mutexName = $"Local\\{safeScope}.Mutex";
-        _pipeName = $"{safeScope}.Activation";
+        _pipeName = InstallExitProtocol.PipeName(scope);
     }
 
     public event Action<AppActivationCommand>? ActivationRequested;
+    public Func<InstallExitRequest, Task<InstallExitResponse>>? InstallExitRequested { get; set; }
+    public event Action? InstallExitResponseCompleted;
 
     public SingleInstanceStartResult Start(
         AppActivationCommand command,
@@ -154,7 +159,7 @@ public sealed class SingleInstanceCoordinator : IDisposable
             {
                 server = new NamedPipeServerStream(
                     _pipeName,
-                    PipeDirection.In,
+                    PipeDirection.InOut,
                     maxNumberOfServerInstances: 1,
                     PipeTransmissionMode.Byte,
                     PipeOptions.Asynchronous);
@@ -168,9 +173,30 @@ public sealed class SingleInstanceCoordinator : IDisposable
                     _activeServer = server;
                 }
                 await server.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
-                using var reader = new StreamReader(server);
+                using var reader = new StreamReader(server,leaveOpen:true);
                 var value = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
-                if (Enum.TryParse<AppActivationCommand>(value, ignoreCase: false, out var command))
+                if (value?.StartsWith('{') == true)
+                {
+                    InstallExitResponse? response = null;
+                    try
+                    {
+                        var request = JsonSerializer.Deserialize<InstallExitRequest>(value);
+                        if (request is not null && InstallExitRequested is not null)
+                        {
+                            response = await InstallExitRequested(request).ConfigureAwait(false);
+                            using var writer = new StreamWriter(server,leaveOpen:true) { AutoFlush = true };
+                            await writer.WriteLineAsync(JsonSerializer.Serialize(response).AsMemory(), cancellationToken).ConfigureAwait(false);
+                        }
+                    }
+                    catch (JsonException) { }
+                    catch (ArgumentException) { }
+                    finally
+                    {
+                        // Retirement precedes the reply. Shutdown is scheduled only after the flush attempt.
+                        if (response?.Status == "retired") InstallExitResponseCompleted?.Invoke();
+                    }
+                }
+                else if (Enum.TryParse<AppActivationCommand>(value, ignoreCase: false, out var command) && Enum.IsDefined(command))
                 {
                     ActivationRequested?.Invoke(command);
                 }

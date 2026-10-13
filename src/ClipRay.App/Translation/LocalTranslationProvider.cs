@@ -173,6 +173,7 @@ public interface ILocalLmtSession : IDisposable
 {
     bool IsAlive { get; }
     Task<string> TranslateAsync(string prompt, CancellationToken cancellationToken);
+    Task RetireAsync() => Task.Run(Dispose);
 }
 
 public interface ILocalLmtSessionFactory
@@ -235,34 +236,23 @@ public sealed class LocalLmtOneShotRunner : ILocalLmtOneShotRunner
     public async Task<string> TranslateAsync(LocalLmtSessionStart start, string prompt, CancellationToken cancellationToken)
     {
         using var promptFile = LocalLmtPromptFile.Create(prompt);
-        using var process = new Process { StartInfo = LocalLmtProcessSession.CreateStartInfo(WithPromptFile(start, promptFile.Path)) };
-        if (!process.Start()) throw new LocalLmtProcessException(LocalLmtProcessFailureKind.StartupFailed);
-        var stdout = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderr = process.StandardError.ReadToEndAsync(cancellationToken);
-        process.StandardInput.Close();
+        var process = TranslationChildLifetime.Start(LocalLmtProcessSession.CreateStartInfo(WithPromptFile(start, promptFile.Path)),
+            () => new LocalLmtProcessException(LocalLmtProcessFailureKind.StartupFailed));
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.BaseStream.CopyToAsync(Stream.Null);
+        var child = TranslationChildLifetime.Own(process, Task.WhenAll(stdout, stderr));
         try
         {
+            process.StandardInput.Close();
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-            _ = await stderr.ConfigureAwait(false);
+            await stderr.ConfigureAwait(false);
             if (process.ExitCode != 0) throw new LocalLmtProcessException(LocalLmtProcessFailureKind.SessionExited);
             var output = await stdout.ConfigureAwait(false);
             return RemoveCurrentPromptEcho(output, prompt);
         }
         finally
         {
-            if (!process.HasExited)
-            {
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                    using var cleanupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-                    await process.WaitForExitAsync(cleanupTimeout.Token).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // Preserve the original cancellation or translation failure.
-                }
-            }
+            await child.RetireAsync().ConfigureAwait(false);
         }
     }
 
@@ -305,14 +295,18 @@ public sealed class LocalLmtBatchRunner : ILocalLmtBatchRunner
         // Wait for the actual interactive prompt before sending the first request.
         // With --file, llama-cli can emit a startup prompt/banner before it has
         // answered the file input, shifting every batch response by one item.
-        using var session = await LocalLmtProcessSession.StartAsync(start, cancellationToken).ConfigureAwait(false);
-        var responses = new List<string>(prompts.Count);
-        for (var index = 0; index < prompts.Count; index++)
+        var session = await LocalLmtProcessSession.StartAsync(start, cancellationToken).ConfigureAwait(false);
+        try
         {
-            var oneLinePrompt = Regex.Replace(prompts[index], @"\s+", " ").Trim();
-            responses.Add(await session.TranslateAsync(oneLinePrompt, cancellationToken).ConfigureAwait(false));
+            var responses = new List<string>(prompts.Count);
+            for (var index = 0; index < prompts.Count; index++)
+            {
+                var oneLinePrompt = Regex.Replace(prompts[index], @"\s+", " ").Trim();
+                responses.Add(await session.TranslateAsync(oneLinePrompt, cancellationToken).ConfigureAwait(false));
+            }
+            return responses;
         }
-        return responses;
+        finally { await session.RetireAsync().ConfigureAwait(false); }
     }
 }
 
@@ -322,7 +316,7 @@ public sealed class LocalLmtProcessSessionFactory : ILocalLmtSessionFactory
         LocalLmtProcessSession.StartAsync(start, cancellationToken);
 }
 
-public sealed class LocalLmtProcessSession : ILocalLmtSession
+public sealed class LocalLmtProcessSession : ILocalLmtSession, IAsyncDisposable
 {
     private static readonly Regex PromptStatisticsPattern = new(
         @"\s*\[\s*Prompt:.*?\]\s*$",
@@ -330,21 +324,24 @@ public sealed class LocalLmtProcessSession : ILocalLmtSession
     private static readonly Regex SessionControlLinePattern = new(
         @"(?im)^\s*Chat history cleared\.\s*\n?",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private readonly Process _process;
+    private readonly Process? _process;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
-    private readonly Task _stderrDrain;
+    private readonly TranslationChildLifetime _child;
+    private readonly AsyncResourceLifetime _lifetime = new();
     private readonly bool _clearAfterEachResponse;
     private bool _disposed;
 
     private LocalLmtProcessSession(LocalLmtSessionStart start)
     {
         _clearAfterEachResponse = start.ClearAfterEachResponse;
-        _process = new Process { StartInfo = CreateStartInfo(start), EnableRaisingEvents = true };
-        if (!_process.Start()) throw new LocalLmtProcessException(LocalLmtProcessFailureKind.StartupFailed);
-        _stderrDrain = _process.StandardError.ReadToEndAsync();
+        _process = TranslationChildLifetime.Start(CreateStartInfo(start),
+            () => new LocalLmtProcessException(LocalLmtProcessFailureKind.StartupFailed));
+        _child = TranslationChildLifetime.Own(_process, _process.StandardError.BaseStream.CopyToAsync(Stream.Null));
     }
 
-    public bool IsAlive => !_disposed && !_process.HasExited;
+    internal LocalLmtProcessSession(TranslationChildLifetime child) => _child = child;
+
+    public bool IsAlive => !_disposed && (_process is null || !_process.HasExited);
 
     public static ProcessStartInfo CreateStartInfo(LocalLmtSessionStart start) => new(start.FileName)
     {
@@ -372,17 +369,17 @@ public sealed class LocalLmtProcessSession : ILocalLmtSession
         }
         catch (OperationCanceledException)
         {
-            session?.Dispose();
+            if (session is not null) await session.RetireAsync().ConfigureAwait(false);
             throw;
         }
         catch (LocalLmtProcessException)
         {
-            session?.Dispose();
+            if (session is not null) await session.RetireAsync().ConfigureAwait(false);
             throw;
         }
         catch
         {
-            session?.Dispose();
+            if (session is not null) await session.RetireAsync().ConfigureAwait(false);
             throw new LocalLmtProcessException(LocalLmtProcessFailureKind.StartupFailed);
         }
     }
@@ -402,23 +399,26 @@ public sealed class LocalLmtProcessSession : ILocalLmtSession
         }
         catch (OperationCanceledException)
         {
-            session?.Dispose();
+            if (session is not null) await session.RetireAsync().ConfigureAwait(false);
             throw;
         }
         catch (LocalLmtProcessException)
         {
-            session?.Dispose();
+            if (session is not null) await session.RetireAsync().ConfigureAwait(false);
             throw;
         }
         catch
         {
-            session?.Dispose();
+            if (session is not null) await session.RetireAsync().ConfigureAwait(false);
             throw new LocalLmtProcessException(LocalLmtProcessFailureKind.StartupFailed);
         }
     }
 
     public async Task<string> TranslateAsync(string prompt, CancellationToken cancellationToken)
     {
+        using var admission = _lifetime.Enter();
+        using var stopped = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        cancellationToken = stopped.Token;
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (prompt.Contains('\r') || prompt.Contains('\n'))
             throw new ArgumentException("A Local LMT interactive prompt must be one line.", nameof(prompt));
@@ -427,7 +427,7 @@ public sealed class LocalLmtProcessSession : ILocalLmtSession
         try
         {
             if (!IsAlive) throw new LocalLmtProcessException(LocalLmtProcessFailureKind.SessionExited);
-            await _process.StandardInput.WriteLineAsync(prompt.AsMemory(), cancellationToken).ConfigureAwait(false);
+            await _process!.StandardInput.WriteLineAsync(prompt.AsMemory(), cancellationToken).ConfigureAwait(false);
             await _process.StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
             var raw = await ReadUntilPromptAsync(cancellationToken, LocalLmtProcessFailureKind.ResponseBoundaryLost).ConfigureAwait(false);
             if (_clearAfterEachResponse)
@@ -457,19 +457,15 @@ public sealed class LocalLmtProcessSession : ILocalLmtSession
 
     public void Dispose()
     {
-        if (_disposed) return;
         _disposed = true;
-        try
-        {
-            if (!_process.HasExited) _process.Kill(entireProcessTree: true);
-        }
-        catch (InvalidOperationException) { }
-        finally
-        {
-            _process.Dispose();
-            _ = _stderrDrain.Exception;
-        }
+        _ = RetireAsync();
     }
+    public Task RetireAsync()
+    {
+        _disposed = true;
+        return _lifetime.RetireAsync(_child.RetireAsync);
+    }
+    public ValueTask DisposeAsync() => new(RetireAsync());
 
     private async Task<string> ReadUntilPromptAsync(
         CancellationToken cancellationToken,
@@ -479,7 +475,7 @@ public sealed class LocalLmtProcessSession : ILocalLmtSession
         var buffer = new char[1];
         while (true)
         {
-            var read = await _process.StandardOutput.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+            var read = await _process!.StandardOutput.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
             if (read == 0)
             {
                 throw new LocalLmtProcessException(failure);
@@ -564,6 +560,8 @@ public sealed class LocalTranslationProvider : IDisposable
     private readonly SemaphoreSlim _translationGate = new(1, 1);
     private readonly System.Threading.Timer _idleTimer;
     private ILocalLmtSession? _session;
+    private Task? _sessionRetirement;
+    private TranslationChildRetirementException? _failedChildRetirement;
     private string _backend = string.Empty;
     private string? _localLmtInputMode;
     private int _currentProtectedTokenCount;
@@ -572,6 +570,7 @@ public sealed class LocalTranslationProvider : IDisposable
     private bool? _artifactsVerified;
     private ArtifactSnapshot? _verifiedArtifactSnapshot;
     private bool _disposed;
+    private readonly AsyncResourceLifetime _lifetime = new();
 
     public LocalTranslationProvider(
         LocalLmtOptions options,
@@ -600,6 +599,9 @@ public sealed class LocalTranslationProvider : IDisposable
         IReadOnlyList<TranslationRequest> requests,
         CancellationToken cancellationToken)
     {
+        using var admission = _lifetime.Enter();
+        using var stopped = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        cancellationToken = stopped.Token;
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(requests);
         if (requests.Count == 0) return [];
@@ -611,12 +613,13 @@ public sealed class LocalTranslationProvider : IDisposable
         await _translationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (_failedChildRetirement is { } failure) throw failure;
             var snapshot = CaptureArtifactSnapshot();
             if (_artifactsVerified == true && snapshot != _verifiedArtifactSnapshot)
             {
                 _artifactsVerified = false;
                 _verifiedArtifactSnapshot = null;
-                StopSession();
+                await StopSessionAsync().ConfigureAwait(false);
             }
             // Missing or invalid artifacts can be repaired while this provider lives.
             // Serialize verification with inference, and never cache a failed check.
@@ -652,14 +655,15 @@ public sealed class LocalTranslationProvider : IDisposable
                     _lastUse = DateTimeOffset.UtcNow;
                     results[item.Index] = result;
                 }
+                catch (TranslationChildRetirementException) { throw; }
                 catch (OperationCanceledException)
                 {
-                    StopSession();
+                    await StopSessionAsync().ConfigureAwait(false);
                     throw;
                 }
                 catch
                 {
-                    StopSession();
+                    await StopSessionAsync().ConfigureAwait(false);
                     results[item.Index] = Failure(
                         "Local LMT failed without exposing private text.",
                         TranslationDiagnosticKind.ProcessFailure,
@@ -668,6 +672,11 @@ public sealed class LocalTranslationProvider : IDisposable
             }
             ArmIdleTimer();
             return results;
+        }
+        catch (TranslationChildRetirementException failure)
+        {
+            _failedChildRetirement = failure;
+            throw;
         }
         finally
         {
@@ -680,11 +689,14 @@ public sealed class LocalTranslationProvider : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _idleTimer.Dispose();
-        StopSession();
+        _ = RetireAsync();
     }
+    public Task RetireAsync() => _lifetime.RetireAsync(async () =>
+    {
+        _disposed = true;
+        await _idleTimer.DisposeAsync().ConfigureAwait(false);
+        await StopSessionAsync().ConfigureAwait(false);
+    });
 
     private List<LocalTranslationWorkItem> BuildWork(
         IReadOnlyList<TranslationRequest> requests,
@@ -725,30 +737,40 @@ public sealed class LocalTranslationProvider : IDisposable
 
     private async Task<ILocalLmtSession> GetOrStartSessionAsync(CancellationToken cancellationToken)
     {
+        if (_failedChildRetirement is { } failure) throw failure;
+        if (_sessionRetirement is not null) await StopSessionAsync().ConfigureAwait(false);
         if (_session is { IsAlive: true }) return _session;
-        StopSession();
+        await StopSessionAsync().ConfigureAwait(false);
         var preferVulkan = _options.PreferredBackend == LocalLmtBackend.Vulkan;
         try
         {
             _session = await StartSessionAsync(preferVulkan, cancellationToken).ConfigureAwait(false);
             _backend = preferVulkan ? "Vulkan" : "CPU";
         }
-        catch when (preferVulkan && !cancellationToken.IsCancellationRequested)
+        catch when (preferVulkan && !cancellationToken.IsCancellationRequested && _failedChildRetirement is null)
         {
-            StopSession();
+            await StopSessionAsync().ConfigureAwait(false);
             _session = await StartSessionAsync(false, cancellationToken).ConfigureAwait(false);
             _backend = "CPU fallback after Vulkan startup failure";
         }
         return _session;
     }
 
-    private Task<ILocalLmtSession> StartSessionAsync(bool vulkan, CancellationToken cancellationToken)
+    private async Task<ILocalLmtSession> StartSessionAsync(bool vulkan, CancellationToken cancellationToken)
     {
         // LMT is based on Qwen3.  Translation needs a direct answer, not a reasoning trace
         // that can consume the small model's entire output budget before the translation begins.
-        return _sessionFactory.StartAsync(
-            new LocalLmtSessionStart(_options.LlamaCliPath, BuildSessionArguments(vulkan)),
-            cancellationToken);
+        try
+        {
+            return await _sessionFactory.StartAsync(
+                new LocalLmtSessionStart(_options.LlamaCliPath, BuildSessionArguments(vulkan)),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (TranslationChildRetirementException failure)
+        {
+            _failedChildRetirement = failure;
+            throw;
+        }
     }
 
     private string BuildSessionArguments(bool vulkan = true)
@@ -1002,12 +1024,12 @@ public sealed class LocalTranslationProvider : IDisposable
         }
         if (ShouldRetryShortBodyStrictly(item, result))
         {
-            StopSession();
+            await StopSessionAsync().ConfigureAwait(false);
             var retried = await RetryShortBodyStrictlyAsync(item, cancellationToken).ConfigureAwait(false);
             return WithLocalLmtContext(retried);
         }
         if (!ShouldRetryBodyInChunks(item, result)) return WithLocalLmtContext(result);
-        StopSession();
+        await StopSessionAsync().ConfigureAwait(false);
         return WithLocalLmtContext(await RetryBodyInChunksAsync(item, result, cancellationToken).ConfigureAwait(false));
     }
 
@@ -1039,7 +1061,7 @@ public sealed class LocalTranslationProvider : IDisposable
                 {
                     return result;
                 }
-                StopSession();
+                await StopSessionAsync().ConfigureAwait(false);
             }
             catch (LocalLmtProcessException failure)
             {
@@ -1050,7 +1072,7 @@ public sealed class LocalTranslationProvider : IDisposable
                 var result = OutputFailure(failure, TranslationDiagnosticStage.RetryChunk);
                 if (failure.Kind is TranslationDiagnosticKind.EmptyTranslation or TranslationDiagnosticKind.OutputTooLong && attempt == 0)
                 {
-                    StopSession();
+                    await StopSessionAsync().ConfigureAwait(false);
                     continue;
                 }
                 return result;
@@ -1109,6 +1131,10 @@ public sealed class LocalTranslationProvider : IDisposable
                 return OutputFailure(failure, TranslationDiagnosticStage.RetryChunk, index + 1)
                     with { ChunkDiagnostics = diagnostics };
             }
+            // Physical retirement belongs to the provider, not a recoverable
+            // translation result. Preserve its owner and stop admission there.
+            catch (TranslationChildRetirementException) { throw; }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch
             {
                 diagnostics.Add(ChunkDiagnostic(index + 1, chunk, string.Empty, "chunking-failed"));
@@ -1168,7 +1194,7 @@ public sealed class LocalTranslationProvider : IDisposable
         catch (LocalLmtOutputException failure)
             when (failure.Kind is TranslationDiagnosticKind.EmptyTranslation or TranslationDiagnosticKind.OutputTooLong)
         {
-            StopSession();
+            await StopSessionAsync().ConfigureAwait(false);
             return await TranslateModelTextWithTokenRepairAsync(
                 item, chunk, cancellationToken, diagnostics, chunkIndex, "chunk-retry-restarted").ConfigureAwait(false);
         }
@@ -1591,6 +1617,10 @@ public sealed class LocalTranslationProvider : IDisposable
 
     private void StopIdleSession(object? state)
     {
+        IDisposable admission;
+        try { admission = _lifetime.Enter(); }
+        catch (ObjectDisposedException) { return; }
+        using var ownedCallback = admission;
         if (_disposed || !_translationGate.Wait(0))
         {
             if (!_disposed) _idleTimer.Change(TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan);
@@ -1598,9 +1628,10 @@ public sealed class LocalTranslationProvider : IDisposable
         }
         try
         {
-            if (IsIdleShutdownDue(DateTimeOffset.UtcNow)) StopSession();
+            if (IsIdleShutdownDue(DateTimeOffset.UtcNow)) StopSessionAsync().GetAwaiter().GetResult();
             else ArmIdleTimer();
         }
+        catch { /* The retained _sessionRetirement reports failure to model change/exit. */ }
         finally
         {
             _translationGate.Release();
@@ -1621,11 +1652,18 @@ public sealed class LocalTranslationProvider : IDisposable
         }
     }
 
-    private void StopSession()
+    private async Task StopSessionAsync()
     {
-        var session = Interlocked.Exchange(ref _session, null);
-        session?.Dispose();
+        var session = _session;
+        if (session is not null)
+        {
+            _sessionRetirement ??= session.RetireAsync();
+            await _sessionRetirement.ConfigureAwait(false);
+            _session = null;
+            _sessionRetirement = null;
+        }
         _backend = string.Empty;
+        if (_failedChildRetirement is { } failure) throw failure;
     }
 
     private sealed record LocalTranslationWorkItem(

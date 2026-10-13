@@ -3,25 +3,31 @@ using System.IO;
 using ClipRay.Core.Geometry;
 using RapidOcrNet;
 using SkiaSharp;
+using ClipRay.App.Infrastructure;
 
 namespace ClipRay.App.Ocr;
 
 // All recognizers see the same complete detected line. Supplemental fragments
 // cannot remove a primary line merely because a tiny box overlaps it.
-internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<PixelRect, IReadOnlyList<ScriptOcrCandidate>>? observeCandidates = null) : IOcrRuntime, IOcrWarmup, IDisposable
+internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<PixelRect, IReadOnlyList<ScriptOcrCandidate>>? observeCandidates = null,
+    Action? initializeBackend = null, Func<SKBitmap, CancellationToken, IReadOnlyList<OcrWord>>? recognizeBackend = null,
+    Action? releaseBackend = null) : IOcrRuntime, IOcrWarmup, IDisposable, IAsyncDisposable
 {
     internal static IReadOnlyList<string> RecognitionScripts { get; } = ["latin", "cjk"];
 
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly AsyncResourceLifetime _lifetime = new();
     private RapidOcr? _detector;
     private readonly List<(string Script, string ModelId, TextRecognizer Recognizer)> _recognizers = [];
 
     private void Initialize()
     {
+        if (initializeBackend is not null) { initializeBackend(); return; }
         if (_detector is not null) return;
         var v5 = Path.Combine(AppContext.BaseDirectory, "models", "v5");
         var cjk = RapidOcrModelPaths.ResolveForRuntime();
-        using var options = RapidOcr.GetDefaultSessionOptions(4);
+        using var options = RapidOcr.GetDefaultSessionOptions(OcrExecutionPolicy.SelectThreads(Environment.ProcessorCount));
+        foreach (var entry in OcrExecutionPolicy.SessionEntries) options.AddSessionConfigEntry(entry.Key, entry.Value);
         var detector = new RapidOcr();
         try
         {
@@ -59,14 +65,19 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
 
     public async Task<IReadOnlyList<OcrWord>> RecognizeAsync(Bitmap bitmap, CancellationToken cancellationToken)
     {
+        using var admission = _lifetime.Enter();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        cancellationToken = linked.Token;
         using var prepared = OcrPolarityPlan.CreatePreparedBitmap(bitmap);
-        using var image = SKBitmap.Decode(await OcrBitmapEncoder.EncodePngAsync(prepared, null, cancellationToken));
+        using var image = SKBitmap.Decode(await OcrBitmapEncoder.EncodePngAsync(prepared, null, cancellationToken).ConfigureAwait(false));
         if (image is null) throw new OcrUnavailableException("The local OCR image could not be decoded.");
-        await _gate.WaitAsync(cancellationToken);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             Initialize();
-            return await Task.Run(() => Recognize(image, cancellationToken), cancellationToken);
+            return await Task.Run(() => recognizeBackend is null ? Recognize(image, cancellationToken)
+                : recognizeBackend(image, cancellationToken), cancellationToken).ConfigureAwait(false);
         }
         finally { _gate.Release(); }
     }
@@ -102,8 +113,8 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
                 if(indices.Length == 0) break;
                 var lines = entry.Recognizer.GetTextLines(indices.Select(i=>crops[i]).ToArray());
                 for (var i = 0; i < lines.Length; i++)
-                    candidates[indices[i]].Add(new(ScriptOcrSelection.RestoreReadingOrder(string.Concat(lines[i].Chars ?? []), entry.Script),
-                        lines[i].CharScores is { Length: > 0 } scores ? scores.Average() : 0, entry.Script));
+                    candidates[indices[i]].Add(ScriptOcrCandidate.FromRecognition(ScriptOcrSelection.RestoreReadingOrder(string.Concat(lines[i].Chars ?? []), entry.Script),
+                        lines[i].CharScores, entry.Script));
             }
             if (observeCandidates is not null)
                 for (var i = 0; i < candidates.Length; i++) observeCandidates(bounds[i], candidates[i].ToArray());
@@ -122,15 +133,22 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
 
     public async Task WarmupAsync(CancellationToken token)
     {
-        await _gate.WaitAsync(token);
-        try { await Task.Run(Initialize, token); }
+        using var admission = _lifetime.Enter();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, _lifetime.Token);
+        await _gate.WaitAsync(linked.Token).ConfigureAwait(false);
+        try { await Task.Run(Initialize, linked.Token).ConfigureAwait(false); }
         finally { _gate.Release(); }
     }
 
-    public void Dispose()
+    public void Dispose() => _ = DisposeAsync();
+    public ValueTask DisposeAsync() => new(_lifetime.RetireAsync(() => Task.Run(() =>
     {
-        _gate.Wait();
-        try { _detector?.Dispose(); foreach (var entry in _recognizers) entry.Recognizer.Dispose(); }
-        finally { _gate.Release(); }
-    }
+        if (releaseBackend is not null) releaseBackend();
+        else
+        {
+            try { _detector?.Dispose(); }
+            finally { foreach (var entry in _recognizers) entry.Recognizer.Dispose(); }
+        }
+        _detector = null; _recognizers.Clear();
+    })));
 }

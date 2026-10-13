@@ -8,11 +8,17 @@ using ClipRay.App.Diagnostics;
 
 namespace ClipRay.App.LiveTranslation;
 
-// Opt-in local evidence for the actual session; capture affinity stays enabled.
+// Local frame data with optional image artifacts; capture affinity stays enabled.
 internal sealed class LiveTranslationAcceptanceTrace : IDisposable
 {
     internal const string SchemaVersion = "clipray.live-evidence.v1";
+    internal const string DataSchemaVersion = "clipray.live-evidence.v2-data";
+    private readonly bool _dataOnly;
+    private readonly bool _includeContent;
+    private readonly LocalDiagnosticSession? _store;
+    private string ActiveSchema => _dataOnly ? DataSchemaVersion : SchemaVersion;
     private static readonly object FailureGate = new();
+    private static readonly Dictionary<string,LocalDiagnosticSession> FailureStores=new(StringComparer.OrdinalIgnoreCase);
     public static void RecordIntegrityFailure(string source, string restored,
         ClipRay.App.Translation.TranslationInvariantMismatch mismatch)
         => RecordMachineFailure(source, restored, "machine-content-integrity-failed", mismatch.ToString());
@@ -44,9 +50,9 @@ internal sealed class LiveTranslationAcceptanceTrace : IDisposable
         {
             lock (FailureGate)
             {
-                Directory.CreateDirectory(localRoot);
-                File.AppendAllText(Path.Combine(localRoot, "integrity-failures.jsonl"),
-                    JsonSerializer.Serialize(evidence) + "\n");
+                if(!FailureStores.TryGetValue(localRoot,out var store)) FailureStores[localRoot]=store=new(localRoot);
+                store.Json(Path.Combine(localRoot, "integrity-failures.jsonl"),evidence,
+                    includeContent: string.Equals(Environment.GetEnvironmentVariable("CLIPRAY_LIVE_EVIDENCE_MODE"),"content",StringComparison.OrdinalIgnoreCase));
             }
         }
         catch { }
@@ -83,26 +89,43 @@ internal sealed class LiveTranslationAcceptanceTrace : IDisposable
     internal string? SessionDirectory => _root;
     internal int WriteFailures => _writeFailures;
 
+    internal static LiveTranslationAcceptanceTrace ForRuntime(string diagnosticsRoot)
+    {
+        var root = Environment.GetEnvironmentVariable("CLIPRAY_LIVE_ACCEPTANCE_ROOT");
+        var images = string.Equals(Environment.GetEnvironmentVariable("CLIPRAY_LIVE_EVIDENCE_MODE"),
+            "images", StringComparison.OrdinalIgnoreCase);
+        return new(root ?? Path.Combine(diagnosticsRoot, "live"), dataOnlyOverride: !images);
+    }
+
     public void SaveSource(System.Drawing.Bitmap source, LiveTranslationWorkIdentity? identity = null)
     {
         if(_root is null) return;
         lock (_gate)
         {
+            if (_disposed) return;
             try
             {
                 Directory.CreateDirectory(_root);
                 identity ??= LiveTranslationWorkContext.Current;
+                if (_dataOnly)
+                {
+                    _sourceIndex++;
+                    WriteEvent("source_frame_fingerprint", null, identity, PixelFingerprint.Create(source));
+                }
+                else
+                {
                 var suffix = identity is null ? string.Empty
                     : $"-c{identity.CaptureId}-p{identity.PipelineId}-v{identity.ViewportGeneration}";
                 var name=$"source-{++_sourceIndex}{suffix}.png";
                 var path = Path.Combine(_root,name);
-                source.Save(path,System.Drawing.Imaging.ImageFormat.Png);
+                if (!_store!.Image(path,stream=>source.Save(stream,System.Drawing.Imaging.ImageFormat.Png))) throw new IOException("Diagnostic image budget.");
                 WriteEvent("source_image_saved", null, identity, new {
                     name,
                     sha256 = HashFile(path),
                     width = source.Width,
                     height = source.Height
                 });
+                }
                 if (identity is null) _missingIdentityEvents++;
                 else _firstSource ??= new SourceKey(identity.CaptureId,
                     identity.PipelineId, identity.ViewportGeneration);
@@ -111,11 +134,14 @@ internal sealed class LiveTranslationAcceptanceTrace : IDisposable
         }
     }
 
-    public LiveTranslationAcceptanceTrace(string? rootOverride = null)
+    public LiveTranslationAcceptanceTrace(string? rootOverride = null, bool? dataOnlyOverride = null)
     {
+        _dataOnly = dataOnlyOverride ?? !string.Equals(
+            Environment.GetEnvironmentVariable("CLIPRAY_LIVE_EVIDENCE_MODE"), "images", StringComparison.OrdinalIgnoreCase);
+        _includeContent = !_dataOnly || string.Equals(Environment.GetEnvironmentVariable("CLIPRAY_LIVE_EVIDENCE_MODE"),"content",StringComparison.OrdinalIgnoreCase);
         var root = rootOverride ?? Environment.GetEnvironmentVariable("CLIPRAY_LIVE_ACCEPTANCE_ROOT");
         if (ScreenshotTranslationEvidence.TryResolveLocalRoot(root, out var localRoot))
-            _root = Path.Combine(localRoot, Guid.NewGuid().ToString("N"));
+        { _root = Path.Combine(localRoot, Guid.NewGuid().ToString("N")); _store = new(localRoot); }
         Record("started");
     }
 
@@ -213,20 +239,29 @@ internal sealed class LiveTranslationAcceptanceTrace : IDisposable
         if (_root is null || image is null) return;
         lock (_gate)
         {
+            if (_disposed) return;
             try
             {
+                if (_dataOnly)
+                {
+                    _imageIndex++;
+                    WriteEvent("rendered_frame_fingerprint", generation, identity, PixelFingerprint.Create(image));
+                }
+                else
+                {
                 var encoder = new PngBitmapEncoder();
                 encoder.Frames.Add(BitmapFrame.Create(image));
                 var name = $"rendered-{++_imageIndex}-{generation}.png";
                 Directory.CreateDirectory(_root);
                 var path = Path.Combine(_root, name);
-                using (var stream = File.Create(path)) encoder.Save(stream);
+                if (!_store!.Image(path,encoder.Save)) throw new IOException("Diagnostic image budget.");
                 WriteEvent("rendered_image_saved", generation, identity, new {
                     name,
                     sha256 = HashFile(path),
                     width = image.PixelWidth,
                     height = image.PixelHeight
                 });
+                }
                 if (TryFrameKey(identity, generation, out var key)) _renderedFrames.Add(key);
                 else _missingIdentityEvents++;
             }
@@ -240,9 +275,8 @@ internal sealed class LiveTranslationAcceptanceTrace : IDisposable
         if (_root is null || _disposed) return;
         Directory.CreateDirectory(_root);
         var nextSequence = _sequence + 1;
-        File.AppendAllText(Path.Combine(_root, "events.jsonl"),
-            JsonSerializer.Serialize(new {
-                schema_version = SchemaVersion,
+        if (!_store!.Json(Path.Combine(_root, "events.jsonl"), new {
+                schema_version = ActiveSchema,
                 sequence = nextSequence,
                 utc = DateTimeOffset.UtcNow,
                 kind,
@@ -252,7 +286,7 @@ internal sealed class LiveTranslationAcceptanceTrace : IDisposable
                 viewport_generation = identity?.ViewportGeneration,
                 elapsed_ms = _clock.ElapsedMilliseconds,
                 data
-            }) + "\n");
+            },includeContent:_includeContent)) throw new IOException("Diagnostic event budget.");
         _sequence = nextSequence;
     }
 
@@ -279,10 +313,13 @@ internal sealed class LiveTranslationAcceptanceTrace : IDisposable
                 var firstSourceWasFirstRender = firstSourceRendered
                     && _firstObservedSource == _firstSource;
                 Directory.CreateDirectory(_root);
-                File.WriteAllText(Path.Combine(_root, "manifest.json"),
-                    JsonSerializer.Serialize(new {
-                        schema_version = SchemaVersion,
-                        complete = _writeFailures == 0 && _missingIdentityEvents == 0
+                if (!_store!.Json(Path.Combine(_root, "manifest.json"), new {
+                        schema_version = ActiveSchema,
+                        evidence_mode = _dataOnly ? "data" : "images",
+                        diagnostic_truncated = _store.Truncated,
+                        recording_complete = !_store.Truncated && _writeFailures == 0 && _missingIdentityEvents == 0
+                            && _contextRecorded && _terminalRecorded,
+                        complete = !_store.Truncated && _writeFailures == 0 && _missingIdentityEvents == 0
                             && _contextRecorded && _terminalRecorded && firstSourceWasFirstRender
                             && missingRendered == 0 && missingRenderCycle == 0
                             && unpairedRendered == 0 && unpairedRenderCycle == 0
@@ -305,7 +342,7 @@ internal sealed class LiveTranslationAcceptanceTrace : IDisposable
                         failed_render_cycle_count = _unobservedFrames.Count,
                         ended_utc = DateTimeOffset.UtcNow,
                         events_sha256 = HashFile(Path.Combine(_root, "events.jsonl"))
-                    }));
+                    },append:false)) throw new IOException("Diagnostic manifest budget.");
             }
             catch { _writeFailures++; }
         }

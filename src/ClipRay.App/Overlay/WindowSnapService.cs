@@ -80,6 +80,9 @@ public sealed class WindowSnapService
             : [_frozenMonitorBounds];
     }
 
+    internal Task<IReadOnlyList<PixelRect>> GetCandidatesAsync(Point point,IntPtr overlayHwnd,SnapDetectionMode mode,
+        UiQueryScheduler scheduler,TimeSpan budget,CancellationToken token) => scheduler.QueryAsync(() => GetCandidates(point,overlayHwnd,mode),budget,token);
+
     private WindowCandidateMatch? TryGetWindowCandidate(Point point, IntPtr overlayHwnd)
     {
         foreach (var candidate in _windowCandidates)

@@ -3,7 +3,13 @@ using System.Windows.Interop;
 
 namespace ClipRay.App.Infrastructure;
 
-public sealed class HotkeyHost : IDisposable
+public interface IGlobalHotkeyHost : IDisposable
+{
+    bool TryRegister(GlobalHotkey hotkey, Action action);
+    bool TryUnregister(GlobalHotkey hotkey);
+}
+
+public sealed class HotkeyHost : IGlobalHotkeyHost
 {
     private const int WmHotkey = 0x0312;
     private const uint ModAlt = 0x0001;
@@ -14,6 +20,7 @@ public sealed class HotkeyHost : IDisposable
 
     private readonly HwndSource _source;
     private readonly Dictionary<int, Action> _actions = [];
+    private readonly Dictionary<GlobalHotkey, int> _bindings = [];
     private int _nextId = 1;
 
     public HotkeyHost()
@@ -46,7 +53,15 @@ public sealed class HotkeyHost : IDisposable
         }
 
         _actions[id] = action;
+        _bindings[hotkey] = id;
         return true;
+    }
+
+    public bool TryUnregister(GlobalHotkey hotkey)
+    {
+        if (!_bindings.TryGetValue(hotkey, out var id)) return true;
+        if (!UnregisterHotKey(_source.Handle, id)) return false;
+        _actions.Remove(id); _bindings.Remove(hotkey); return true;
     }
 
     public void Dispose()
@@ -57,6 +72,7 @@ public sealed class HotkeyHost : IDisposable
         }
 
         _actions.Clear();
+        _bindings.Clear();
         _source.RemoveHook(WindowHook);
         _source.Dispose();
     }
@@ -76,7 +92,7 @@ public sealed class HotkeyHost : IDisposable
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint virtualKey);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool UnregisterHotKey(IntPtr window, int id);
 }

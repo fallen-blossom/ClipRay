@@ -58,7 +58,8 @@ internal static class TranslationBlockContract
         return true;
     }
 
-    public static bool TryParseResults(TranslationBlock[] blocks, string response, out TranslationResult[] results)
+    public static bool TryParseResults(TranslationBlock[] blocks, string response, out TranslationResult[] results,
+        bool allowMissingIds = false)
     {
         results = [];
         if (!TryNormalizeJsonTransport(response, out var normalized)) return false;
@@ -92,7 +93,9 @@ internal static class TranslationBlockContract
                 }
             }
             else return false;
-            if (returned.Count != blocks.Length) return false;
+            if (!allowMissingIds && returned.Count != blocks.Length) return false;
+            if (allowMissingIds && (returned.Count > blocks.Length
+                || returned.Keys.Any(id => !blocks.Any(block => block.Id == id)))) return false;
 
             results = new TranslationResult[blocks.Length];
             for (var index = 0; index < blocks.Length; index++)
@@ -106,7 +109,9 @@ internal static class TranslationBlockContract
                         "DeepSeek returned an invalid translation block response.");
                     continue;
                 }
-                if (!block.ProtectedText.TryRestore(value, out var restored))
+                if (!block.ProtectedText.TryRestore(value, out var restored)
+                    || TranslationContentIntegrity.FindMismatch(block.Request.OcrText, restored)
+                        is TranslationInvariantMismatch.ModelToken or TranslationInvariantMismatch.Hotkey)
                 {
                     results[index] = new TranslationResult(
                         false,
@@ -140,9 +145,10 @@ internal static class TranslationBlockContract
         }
     }
 
-    public static TranslationContractParseResult ParseResults(TranslationBlock[] blocks, string response)
+    public static TranslationContractParseResult ParseResults(TranslationBlock[] blocks, string response,
+        bool allowMissingIds = false)
     {
-        if (TryParseResults(blocks, response, out var results))
+        if (TryParseResults(blocks, response, out var results, allowMissingIds))
         {
             return new TranslationContractParseResult(true, results, TranslationFailureKind.None);
         }
@@ -458,15 +464,18 @@ public sealed class DeepSeekTranslationProvider : IDeepSeekTranslationProvider
     private readonly ICredentialVault _vault;
     private readonly HttpMessageHandler _handler;
     private readonly TimeSpan _timeout;
+    private readonly bool _deferVisualPartialRetries;
 
     public DeepSeekTranslationProvider(
         ICredentialVault vault,
         HttpMessageHandler? handler = null,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null,
+        bool deferVisualPartialRetries = false)
     {
         _vault = vault;
         _handler = handler ?? CreateProductionHandler();
         _timeout = timeout ?? TimeSpan.FromSeconds(30);
+        _deferVisualPartialRetries = deferVisualPartialRetries;
         if (_timeout <= TimeSpan.Zero || _timeout > TimeSpan.FromMinutes(2))
         {
             throw new ArgumentOutOfRangeException(nameof(timeout));
@@ -520,7 +529,10 @@ public sealed class DeepSeekTranslationProvider : IDeepSeekTranslationProvider
             .Where(static item => !item.result.IsSuccess)
             .Select(static item => item.index)
             .ToArray();
-        if (ShouldRetryFailedSiblings(merged, failedIndices))
+        // Live translation publishes successful siblings now; its session cache
+        // retries missing blocks later. Waiting here can lose those successes
+        // when the enclosing cloud budget expires during the focused retry.
+        if (!(visualBatch && _deferVisualPartialRetries) && ShouldRetryFailedSiblings(merged, failedIndices))
         {
             var failedBlocks = failedIndices.Select(index => blocks[index]).ToArray();
             var focusedRetry = await TranslationBatchCoordinator.TranslateAsync(
@@ -642,7 +654,9 @@ public sealed class DeepSeekTranslationProvider : IDeepSeekTranslationProvider
                     TranslationFailureKind.MalformedJson);
             }
 
-            var parsed = TranslationBlockContract.ParseResults(blocks.ToArray(), response.Content);
+            var parsed = TranslationBlockContract.ParseResults(blocks.ToArray(), response.Content,
+                allowMissingIds: _deferVisualPartialRetries
+                    && blocks.All(static block => block.Request.Scene is "screen_capture" or "social_media"));
             if (parsed.IsStructuralSuccess)
             {
                 return TranslationBatchAttempt.Succeeded(parsed.Results);
@@ -918,12 +932,23 @@ public sealed class TranslationRuntimeServices(
 {
     private readonly Lazy<IDeepSeekTranslationProvider> _provider = new(providerFactory);
     private readonly Lazy<ClipRay.App.Ocr.OcrService> _ocr = new(ocrFactory);
+    private readonly object _gate = new();
+    private bool _closed;
+    private Task? _retirement;
 
-    public IDeepSeekTranslationProvider Provider => _provider.Value;
-    public ClipRay.App.Ocr.OcrService Ocr => _ocr.Value;
+    public IDeepSeekTranslationProvider Provider { get { lock (_gate) { ObjectDisposedException.ThrowIf(_closed, this); return _provider.Value; } } }
+    public ClipRay.App.Ocr.OcrService Ocr { get { lock (_gate) { ObjectDisposedException.ThrowIf(_closed, this); return _ocr.Value; } } }
 
     public void Dispose()
     {
-        if (_ocr.IsValueCreated) _ocr.Value.Dispose();
+        _ = RetireAsync();
+    }
+    public Task RetireAsync()
+    {
+        lock (_gate)
+        {
+            _closed = true;
+            return _retirement ??= _ocr.IsValueCreated ? _ocr.Value.DisposeAsync().AsTask() : Task.CompletedTask;
+        }
     }
 }

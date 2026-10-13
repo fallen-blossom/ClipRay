@@ -266,9 +266,12 @@
                             <Button x:Name="OpenRecordingFolderButton" Grid.Column="2" Margin="8,0,0,0" settings:SettingsText.Chinese="打开" settings:SettingsText.English="Open" Click="OpenRecordingFolder_Click" />
                         </Grid>
                         <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
-                            <CheckBox x:Name="CopyToClipboardBox" settings:SettingsText.Chinese="保存后复制图片和文件到剪贴板" settings:SettingsText.English="Copy image and file to clipboard after saving" Margin="0,0,28,0" />
+                            <CheckBox x:Name="CopyToClipboardBox" settings:SettingsText.Chinese="完成后自动复制到剪贴板" settings:SettingsText.English="Automatically copy to clipboard when finished" Margin="0,0,28,0" />
                             <CheckBox x:Name="BorderFeedbackBox" settings:SettingsText.Chinese="显示屏幕边框反馈" settings:SettingsText.English="Show screen border feedback" />
                         </StackPanel>
+                        <TextBlock Margin="0,8,0,0" Foreground="#AEB8CD" TextWrapping="Wrap"
+                                   settings:SettingsText.Chinese="默认开启：截图和长截图复制图片，录屏复制视频文件。关闭后仍保存文件，可从最近截取手动复制。Win+V 历史只支持不超过 4 MB 的图片等内容，不显示视频文件。"
+                                   settings:SettingsText.English="Enabled by default: screenshots copy images; recordings copy video files. When disabled, files are still saved and can be copied from Recent captures. Win+V history supports images up to 4 MB; video files are not displayed." />
                     </StackPanel>
                 </Border>
 
@@ -299,7 +302,7 @@
                                      LostFocus="CleanupDailyTimeBox_LostFocus" />
                         </StackPanel>
                         <TextBlock Margin="0,11,0,0" Foreground="#8E98AC" TextWrapping="Wrap"
-                                   settings:SettingsText.Chinese="只删除超过保留天数的 ClipRay 成品截图、长截图和录屏；不会清理未完成录屏、长截图恢复数据或其他文件。删除不进入回收站。" settings:SettingsText.English="Permanently deletes completed ClipRay screenshots, scrolling captures and recordings older than the retention period. Incomplete recordings, capture recovery data and other files are excluded. Deleted files do not go to the Recycle Bin." />
+                                   settings:SettingsText.Chinese="将超过保留天数且有保存完成证明的 ClipRay 截图、长截图和录屏移入回收站；旧文件、未完成录屏、恢复数据和其他文件保留。回收失败会记录并保留原文件。" settings:SettingsText.English="Moves expired ClipRay screenshots, scrolling captures and recordings with saved completion records to the Recycle Bin. Historical files without records, incomplete recordings, recovery data and other files are kept. Recycling failures are recorded and keep the original file." />
                         <TextBlock Margin="0,9,0,0" Foreground="#C9D1E2">
                             <Run settings:SettingsText.Chinese="计划状态：" settings:SettingsText.English="Schedule: " /><Run x:Name="CleanupScheduleStateText" Text="未启用" />
                         </TextBlock>
@@ -457,7 +460,7 @@
                 <Border x:Name="CredentialCard" Style="{StaticResource Card}">
                     <StackPanel>
                         <TextBlock Style="{StaticResource SectionTitle}" settings:SettingsText.Chinese="API 凭据" settings:SettingsText.English="API credentials" />
-                        <TextBlock settings:SettingsText.Chinese="仅支持一个固定本机凭据槽；密钥保存在 Windows Credential Manager，此处不保存明文。" settings:SettingsText.English="One fixed credential slot is supported. The key is stored in Windows Credential Manager, not in plain text settings."
+                        <TextBlock x:Name="CredentialDescriptionText" settings:SettingsText.Chinese="使用当前选择的本机凭据，兼容旧凭据名称；新配置使用固定槽。密钥保存在 Windows Credential Manager，设置文件不保存明文。" settings:SettingsText.English="Uses the currently selected local credential, including legacy credential names; new configurations use the fixed slot. The key is stored in Windows Credential Manager, not in plain text settings."
                                    Foreground="#8E98AC" Margin="0,-8,0,12" TextWrapping="Wrap" />
                         <Grid>
                             <Grid.ColumnDefinitions><ColumnDefinition Width="120" /><ColumnDefinition /></Grid.ColumnDefinitions>
@@ -466,7 +469,7 @@
                         <TextBlock x:Name="CredentialSlotStatusText" Foreground="#8E98AC" Margin="128,8,0,0" />
                         <StackPanel Orientation="Horizontal" Margin="128,10,0,0">
                             <Button x:Name="SaveCredentialButton" settings:SettingsText.Chinese="验证并保存/替换固定凭据" settings:SettingsText.English="Verify and save or replace credential" Click="SaveCredential_Click" />
-                            <Button settings:SettingsText.Chinese="删除" settings:SettingsText.English="Delete" Margin="8,0,0,0" Click="DeleteCredential_Click" />
+                            <Button x:Name="DeleteCredentialButton" settings:SettingsText.Chinese="删除" settings:SettingsText.English="Delete" Margin="8,0,0,0" Click="DeleteCredential_Click" />
                         </StackPanel>
                     </StackPanel>
                 </Border>
@@ -477,18 +480,24 @@
         <Border Grid.Row="2" Background="#141821" BorderBrush="#293142" BorderThickness="0,1,0,0" Padding="26,15">
             <Grid>
                 <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                <Border x:Name="StatusPanel" Padding="12,8" Margin="0,0,18,0" CornerRadius="9"
-                        HorizontalAlignment="Left" MaxWidth="640"
-                        Background="#171E2B" BorderBrush="#344158" BorderThickness="1"
-                        Opacity="0" RenderTransformOrigin="0,0.5">
-                    <Border.RenderTransform><ScaleTransform ScaleX="0.96" ScaleY="0.96" /></Border.RenderTransform>
-                    <StackPanel Orientation="Horizontal">
-                        <Path x:Name="StatusIcon" Width="17" Height="17" Margin="0,0,9,0" VerticalAlignment="Center"
-                              Stretch="Uniform" Stroke="#69DDB0" StrokeThickness="2" StrokeStartLineCap="Round"
-                              StrokeEndLineCap="Round" Data="M 2,9 L 7,14 L 16,3" />
-                        <TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="#DCE5F4" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
-                    </StackPanel>
-                </Border>
+                <Grid>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition /></Grid.RowDefinitions>
+                    <TextBlock x:Name="HotkeyRegistrationWarningText" Visibility="Collapsed" Foreground="#FFADB5"
+                               Margin="0,0,18,8" MaxWidth="640" HorizontalAlignment="Left" TextWrapping="Wrap"
+                               AutomationProperties.LiveSetting="Polite" />
+                    <Border x:Name="StatusPanel" Grid.Row="1" Padding="12,8" Margin="0,0,18,0" CornerRadius="9"
+                            HorizontalAlignment="Left" MaxWidth="640"
+                            Background="#171E2B" BorderBrush="#344158" BorderThickness="1"
+                            Opacity="0" RenderTransformOrigin="0,0.5">
+                        <Border.RenderTransform><ScaleTransform ScaleX="0.96" ScaleY="0.96" /></Border.RenderTransform>
+                        <StackPanel Orientation="Horizontal">
+                            <Path x:Name="StatusIcon" Width="17" Height="17" Margin="0,0,9,0" VerticalAlignment="Center"
+                                  Stretch="Uniform" Stroke="#69DDB0" StrokeThickness="2" StrokeStartLineCap="Round"
+                                  StrokeEndLineCap="Round" Data="M 2,9 L 7,14 L 16,3" />
+                            <TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="#DCE5F4" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+                        </StackPanel>
+                    </Border>
+                </Grid>
                 <StackPanel Grid.Column="1" Orientation="Horizontal">
                     <Button x:Name="UninstallButton" Content="卸载 ClipRay" Visibility="Collapsed"
                             MinWidth="104" Margin="0,0,20,0" Padding="14,8"

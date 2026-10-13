@@ -34,6 +34,7 @@ public enum RecordingStartupStage
     GraphicsCapture,
     SystemAudio,
     RecordingUi,
+    Selection,
 }
 
 public sealed class RecordingStartupException : Exception
@@ -55,6 +56,9 @@ public static class RecordingFailureText
         ArgumentNullException.ThrowIfNull(exception);
         string T(string chinese, string english) => AppInterfaceLanguage.Text(interfaceLanguage, chinese, english);
         var failure = FindStartupFailure(exception);
+        if (failure?.Stage == RecordingStartupStage.Selection)
+            return T("录屏选区必须完整位于一个屏幕内；右侧和下侧最多各裁去 1 像素以取得偶数宽高，裁剪后至少为 2x2 像素。请调整选区后重试。",
+                "Keep the entire recording selection within one screen. The right and bottom edges may each lose 1 pixel for even dimensions; the result must be at least 2x2 pixels. Adjust the selection and retry.");
         var stage = failure?.Stage switch
         {
             RecordingStartupStage.AudioDevice => T("系统声音设备", "system audio device"),
@@ -142,156 +146,12 @@ public static class RecordingStartupGuard
 
 public interface IRecordingRuntime : IAsyncDisposable
 {
+    RecordingFaultSignal? Faults => null;
+    RecordingStopReport? Report => null;
+    void RequestStop() { }
     Task StartAsync(CancellationToken cancellationToken);
 
     Task StopAsync();
-}
-
-public sealed class RecordingSession : IAsyncDisposable
-{
-    private readonly object _sync = new();
-    private readonly IRecordingRuntime _runtime;
-    private Task? _stopTask;
-
-    public RecordingSession(IRecordingRuntime runtime)
-    {
-        _runtime = runtime;
-    }
-
-    public RecordingSessionState State { get; private set; } = RecordingSessionState.Created;
-
-    public async Task StartAsync(CancellationToken cancellationToken)
-    {
-        lock (_sync)
-        {
-            if (State != RecordingSessionState.Created)
-            {
-                throw new InvalidOperationException("A recording session can only be started once.");
-            }
-
-            State = RecordingSessionState.Starting;
-        }
-
-        try
-        {
-            await _runtime.StartAsync(cancellationToken).ConfigureAwait(false);
-            lock (_sync)
-            {
-                if (State == RecordingSessionState.Starting)
-                {
-                    State = RecordingSessionState.Recording;
-                }
-            }
-        }
-        catch
-        {
-            lock (_sync) State = RecordingSessionState.Failed;
-            try { await _runtime.DisposeAsync().ConfigureAwait(false); }
-            catch { /* 启动失败是首要诊断；清理失败不能覆盖其阶段和 HRESULT。 */ }
-            throw;
-        }
-    }
-
-    public Task StopAsync()
-    {
-        lock (_sync)
-        {
-            return _stopTask ??= StopCoreAsync();
-        }
-    }
-
-    public async ValueTask DisposeAsync() => await StopAsync().ConfigureAwait(false);
-
-    private async Task StopCoreAsync()
-    {
-        lock (_sync)
-        {
-            if (State is RecordingSessionState.Stopped)
-            {
-                return;
-            }
-
-            State = RecordingSessionState.Stopping;
-        }
-
-        try
-        {
-            await _runtime.StopAsync().ConfigureAwait(false);
-            lock (_sync) State = RecordingSessionState.Stopped;
-        }
-        catch
-        {
-            lock (_sync) State = RecordingSessionState.Failed;
-            throw;
-        }
-        finally
-        {
-            await _runtime.DisposeAsync().ConfigureAwait(false);
-        }
-    }
-}
-
-public sealed class RegionRecordingRuntime : IRecordingRuntime
-{
-    private readonly IGraphicsCaptureSource _video;
-    private readonly ISystemAudioCapture _audio;
-    private readonly IMediaFoundationRecorder _recorder;
-    private int _stopped;
-    private int _disposed;
-
-    public RegionRecordingRuntime(
-        IGraphicsCaptureSource video,
-        ISystemAudioCapture audio,
-        IMediaFoundationRecorder recorder)
-    {
-        _video = video;
-        _audio = audio;
-        _recorder = recorder;
-    }
-
-    public async Task StartAsync(CancellationToken cancellationToken)
-    {
-        await RecordingStartupGuard.ExecuteAsync(
-            RecordingStartupStage.MediaFoundation,
-            () => _recorder.StartAsync(cancellationToken)).ConfigureAwait(false);
-        try
-        {
-            await RecordingStartupGuard.ExecuteAsync(
-                RecordingStartupStage.GraphicsCapture,
-                () => _video.StartAsync(_recorder.WriteVideoAsync, cancellationToken)).ConfigureAwait(false);
-            await RecordingStartupGuard.ExecuteAsync(
-                RecordingStartupStage.SystemAudio,
-                () => _audio.StartAsync(_recorder.WriteAudioAsync, cancellationToken)).ConfigureAwait(false);
-        }
-        catch
-        {
-            try { await StopAsync().ConfigureAwait(false); }
-            catch { /* 保留第一个启动失败，partial 仍由上层提示用户。 */ }
-            throw;
-        }
-    }
-
-    public async Task StopAsync()
-    {
-        if (Interlocked.Exchange(ref _stopped, 1) != 0) return;
-        Exception? failure = null;
-        try { await _audio.StopAsync().ConfigureAwait(false); }
-        catch (Exception exception) { failure = exception; }
-        try { await _video.StopAsync().ConfigureAwait(false); }
-        catch (Exception exception) { failure ??= exception; }
-        try { await _recorder.StopAsync().ConfigureAwait(false); }
-        catch (Exception exception) { failure ??= exception; }
-        if (failure is not null) throw failure;
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        await StopAsync().ConfigureAwait(false);
-        await _audio.DisposeAsync().ConfigureAwait(false);
-        await _video.DisposeAsync().ConfigureAwait(false);
-        await _recorder.DisposeAsync().ConfigureAwait(false);
-    }
 }
 
 public readonly record struct RecordingMonitorMapping(Rectangle MonitorBounds, Rectangle CropInMonitor);
@@ -305,21 +165,23 @@ public static class RecordingGeometry
             throw new ArgumentOutOfRangeException(nameof(selectedRegion));
         }
 
-        var intersection = monitorBounds
-            .Select((monitor, index) => new { Monitor = monitor, Index = index, Intersection = Rectangle.Intersect(monitor, selectedRegion) })
-            .Where(static candidate => candidate.Intersection.Width > 0 && candidate.Intersection.Height > 0)
-            .OrderByDescending(static candidate => (long)candidate.Intersection.Width * candidate.Intersection.Height)
-            .ThenBy(static candidate => candidate.Index)
-            .FirstOrDefault()
-            ?? throw new InvalidOperationException("The selected region does not intersect a physical monitor.");
-
-        var crop = new Rectangle(
-            intersection.Intersection.X - intersection.Monitor.X,
-            intersection.Intersection.Y - intersection.Monitor.Y,
-            intersection.Intersection.Width,
-            intersection.Intersection.Height);
-        return new RecordingMonitorMapping(intersection.Monitor, crop);
+        foreach (var monitor in monitorBounds)
+        {
+            if (selectedRegion.Left >= monitor.Left && selectedRegion.Top >= monitor.Top
+                && (long)selectedRegion.X + selectedRegion.Width <= (long)monitor.X + monitor.Width
+                && (long)selectedRegion.Y + selectedRegion.Height <= (long)monitor.Y + monitor.Height)
+                return new RecordingMonitorMapping(monitor, new Rectangle(
+                    selectedRegion.X - monitor.X, selectedRegion.Y - monitor.Y, selectedRegion.Width, selectedRegion.Height));
+        }
+        throw new InvalidOperationException("The recording region must be fully contained in one physical monitor.");
     }
+
+    public static RecordingMonitorMapping Normalize(RecordingMonitorMapping mapping) =>
+        mapping with { CropInMonitor = NormalizeForEncoder(mapping.CropInMonitor) };
+
+    public static Rectangle EffectiveRegion(RecordingMonitorMapping mapping) => new(
+        checked(mapping.MonitorBounds.X + mapping.CropInMonitor.X), checked(mapping.MonitorBounds.Y + mapping.CropInMonitor.Y),
+        mapping.CropInMonitor.Width, mapping.CropInMonitor.Height);
 
     public static Rectangle NormalizeForEncoder(Rectangle crop)
     {
@@ -390,6 +252,7 @@ public sealed record RecordingOutputPaths(string PartialPath, string FinalPath)
 
 public sealed class RecordingFileMover
 {
+    internal ClipRay.App.Cleanup.CompletedOutputStore CompletedOutputs { get; set; } = new();
     public void Finalize(RecordingOutputPaths paths)
     {
         if (!File.Exists(paths.PartialPath))
@@ -397,7 +260,9 @@ public sealed class RecordingFileMover
             throw new FileNotFoundException("The partial recording does not exist.", paths.PartialPath);
         }
 
+        using var lease = ClipRay.App.Cleanup.CompletedOutputStore.EnterDirectory(Path.GetDirectoryName(paths.FinalPath)!);
         File.Move(paths.PartialPath, paths.FinalPath, overwrite: false);
+        _ = CompletedOutputs.TryRecordSaved(paths.FinalPath, ClipRay.App.Cleanup.CleanupFileKind.CompletedRecording);
     }
 }
 

@@ -162,7 +162,8 @@ if (args.Contains("--rate-probe", StringComparer.OrdinalIgnoreCase))
     Console.WriteLine($"RATE_PROBE writeMeanMs={writeMilliseconds.DefaultIfEmpty(0).Average():F2} writeMaxMs={writeMax:F2} drainMs={drain.TotalMilliseconds:F0} recorderStopMs={recorderStop.TotalMilliseconds:F0} probeMs={probeElapsed.TotalMilliseconds:F0} fileDuration={probedDuration?.TotalSeconds:F2}");
     Console.WriteLine($"STOP_BREAKDOWN videoStopMs={drain.TotalMilliseconds:F0} recorderStopMs={recorderStop.TotalMilliseconds:F0} probeMs={probeElapsed.TotalMilliseconds:F0} totalStopMs={(drain + recorderStop + probeElapsed).TotalMilliseconds:F0}");
     Console.WriteLine($"RATE_PROBE file={probePaths.FinalPath}");
-    var pass = deliveredFps >= 35 && distinctFps >= 30 && writeMax < 200 && drain.TotalMilliseconds < 1500
+    // Daily 30fps candidate: 90% unique-frame delivery; real-device acceptance is still pending.
+    var pass = deliveredFps >= 27 && distinctFps >= 27 && writeMax < 200 && drain.TotalMilliseconds < 1500
         && probedDuration is not null && Math.Abs(probedDuration.Value.TotalSeconds - captureSeconds) < 1.5;
     Console.WriteLine(pass ? "RATE_PROBE result=PASS" : "RATE_PROBE result=FAIL");
     return pass ? 0 : 3;

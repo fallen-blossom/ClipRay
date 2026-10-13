@@ -3,10 +3,12 @@ param(
     [string] $WorkspaceRoot = (Split-Path -Parent $PSScriptRoot),
     [string] $PublishDirectory,
     [string] $DesktopDirectory = [Environment]::GetFolderPath('Desktop'),
+    [ValidateSet('Lite','Full')] [string] $Flavor = 'Full',
     [switch] $SkipPublish
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Release-Identity.ps1')
 $WorkspaceRoot = [IO.Path]::GetFullPath($WorkspaceRoot)
 if ([string]::IsNullOrWhiteSpace($PublishDirectory)) {
     $PublishDirectory = Join-Path $WorkspaceRoot 'artifacts\app'
@@ -40,13 +42,37 @@ function Copy-LocalLmtPayload([string] $DestinationRoot) {
 }
 
 if (-not $SkipPublish) {
+    Assert-ReleaseOrdinaryPath $PublishDirectory
+    if ((Test-Path -LiteralPath $PublishDirectory) -and @(Get-ChildItem -LiteralPath $PublishDirectory -Force).Count -gt 0) {
+        throw 'True publishing requires a fresh empty destination; existing payload identity cannot be replaced.'
+    }
+    $sourceCommit = & git -C $WorkspaceRoot rev-parse --verify HEAD
+    if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'Publishing requires an exact Git commit.' }
+    & git -C $WorkspaceRoot diff --quiet HEAD --
+    if ($LASTEXITCODE -ne 0) { throw 'Commit tracked changes before true publishing.' }
+    $untrackedInputs = @(& git -C $WorkspaceRoot ls-files --others --exclude-standard)
+    if ($LASTEXITCODE -ne 0 -or $untrackedInputs.Count -gt 0) { throw 'Commit or move untracked inputs before true publishing from an exact source revision.' }
+    [xml] $project = Get-Content -LiteralPath (Join-Path $WorkspaceRoot 'src\ClipRay.App\ClipRay.App.csproj') -Raw
+    $appVersion = @($project.Project.PropertyGroup.Version | Where-Object { $_ })[0]
+    $informationalVersion = "$appVersion+$sourceCommit"
     & dotnet publish (Join-Path $WorkspaceRoot 'src\ClipRay.App\ClipRay.App.csproj') `
-        -c Release --self-contained true --no-restore -o $PublishDirectory | Out-Host
+        -c Release -r win-x64 --self-contained true --no-restore "-p:InformationalVersion=$informationalVersion" `
+        -p:IncludeSourceRevisionInInformationalVersion=false -p:ClipRayIncludeCudaRuntime=$($($Flavor -eq 'Full').ToString().ToLowerInvariant()) -o $PublishDirectory | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "ClipRay publish failed with exit code $LASTEXITCODE."
     }
 
-    Copy-LocalLmtPayload $PublishDirectory
+    if ($Flavor -eq 'Full') { Copy-LocalLmtPayload $PublishDirectory }
+    New-Item -ItemType Directory -Path (Join-Path $PublishDirectory 'licenses') -Force | Out-Null
+    foreach($notice in @('LICENSE','TRADEMARKS.md','THIRD_PARTY_NOTICES.md','SOURCE.md')) {
+        Copy-Item -LiteralPath (Join-Path $WorkspaceRoot $notice) -Destination $PublishDirectory
+    }
+    Get-ChildItem -LiteralPath (Join-Path $WorkspaceRoot 'licenses') -Force | Where-Object {
+        $_.Name -ne 'llama.cpp-MIT.txt' -or $Flavor -eq 'Full'
+    } | Copy-Item -Destination (Join-Path $PublishDirectory 'licenses') -Recurse -Force
+    Set-Content -LiteralPath (Join-Path $PublishDirectory 'install-exit-protocol.txt') -Value 'ClipRay.InstallExit.1' -Encoding ascii
+    Write-ReleaseIdentity $PublishDirectory $sourceCommit $informationalVersion $Flavor
+    Assert-ReleaseIdentity $PublishDirectory $sourceCommit $informationalVersion $Flavor
 }
 
 $targetPath = Join-Path $PublishDirectory 'ClipRay.App.exe'

@@ -25,6 +25,15 @@ foreach ($path in $paths) {
     $treeEntry = & git -C $WorkspaceRoot ls-tree $commit -- $path
     if ($LASTEXITCODE -ne 0 -or -not $treeEntry) { throw "Selected source path is absent from commit: $path" }
 }
+$selectedFiles = @(& git -c core.quotepath=false -C $WorkspaceRoot ls-tree -r --name-only $commit -- @paths)
+if ($LASTEXITCODE -ne 0 -or $selectedFiles.Count -eq 0) { throw 'Could not expand the exact public source selection.' }
+foreach($relative in $selectedFiles) {
+    if ($relative -match '(^|/)(\.git|__pycache__|bin|obj)(/|$)' -or
+        $relative -match '^(screenshots|diagnostics)(/|$)' -or $relative -match '^docs/(reviews|testing|superpowers)/' -or
+        $relative -match '(^|/)\.env($|\.)|\.(pyc|log)$' -or $relative -match '^scripts/(.*Diagnostic.*|ClipboardOwnerMonitor|analyze_.*)') {
+        throw "Forbidden file selected for public source archive: $relative"
+    }
+}
 
 [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($OutputPath))
 & git -C $WorkspaceRoot archive --format=zip "--prefix=ClipRay-$Version/" "--output=$OutputPath" $commit -- @paths
@@ -38,7 +47,7 @@ try {
         $relative = $item.FullName.Substring("ClipRay-$Version/".Length)
         if ($relative -match '(^|/)(\.git|__pycache__|bin|obj)(/|$)' -or
             $relative -match '^(screenshots|diagnostics)(/|$)' -or
-            $relative -match '^docs/(testing|superpowers)/' -or
+            $relative -match '^docs/(reviews|testing|superpowers)/' -or
             $relative -match '(^|/)\.env($|\.)|\.(pyc|log)$') {
             throw "Forbidden file in public source archive: $relative"
         }

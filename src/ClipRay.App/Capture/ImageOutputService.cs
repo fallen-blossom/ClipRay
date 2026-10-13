@@ -5,6 +5,7 @@ using System.IO;
 using System.Windows;
 using ClipRay.App.Infrastructure;
 using ClipRay.App.Scrolling;
+using ClipRay.App.Cleanup;
 
 namespace ClipRay.App.Capture;
 
@@ -14,7 +15,8 @@ public enum OutputArtifactKind
     LongCapture,
 }
 
-public sealed record ImageDeliveryOutcome(string Path, bool ClipboardRequested, bool ClipboardCopied);
+public sealed record ImageDeliveryOutcome(string Path, bool ClipboardRequested, bool ClipboardCopied,
+    string? DiagnosticFailure = null, string? ClipboardFailure = null);
 
 public sealed class ImageOutputService
 {
@@ -22,6 +24,10 @@ public sealed class ImageOutputService
     private readonly OutputArtifactKind _kind;
     private readonly bool _copyToClipboard;
     private readonly Action<System.Windows.Media.Imaging.BitmapSource>? _clipboard;
+    internal Action<string, Bitmap, LongCaptureRunDiagnostics>? SavedDiagnosticOverride { get; set; }
+    internal Action<Bitmap>? BeforeSaveOverride { get; set; }
+    internal Func<string, (System.Windows.Media.Imaging.BitmapSource? Source, byte[]? Png)>? ClipboardPreparationOverride { get; set; }
+    internal CompletedOutputStore CompletedOutputs { get; set; } = new();
 
     public ImageOutputService()
         : this(WorkspaceLocator.Find(AppContext.BaseDirectory))
@@ -47,10 +53,18 @@ public sealed class ImageOutputService
         _clipboard = clipboard;
     }
 
-    public string SavePng(Bitmap bitmap, DateTime timestamp)
+    public string SavePng(Bitmap bitmap, DateTime timestamp, LongCaptureRunDiagnostics? diagnostics = null)
+        => SaveCommitted(bitmap, timestamp, diagnostics).Path;
+
+    private SavedImage SaveCommitted(Bitmap bitmap, DateTime timestamp, LongCaptureRunDiagnostics? diagnostics)
     {
+        BeforeSaveOverride?.Invoke(bitmap);
+        string? diagnosticFailure = null;
+        try { diagnostics?.RecordSaveInput(bitmap.Size); }
+        catch { diagnosticFailure = "diagnostic-unavailable"; }
         var folder = Path.Combine(_outputRoot, timestamp.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
         Directory.CreateDirectory(folder);
+        using var outputLease = CompletedOutputStore.EnterDirectory(folder);
 
         var label = _kind == OutputArtifactKind.LongCapture ? "LongCapture" : "Screenshot";
         var fileName = $"ClipRay-{label}_{timestamp:yyyy-MM-dd_HH-mm-ss-fff}";
@@ -75,7 +89,6 @@ public sealed class ImageOutputService
                     bitmap.Save(stream, ImageFormat.Png);
                 }
 
-                return path;
             }
             catch
             {
@@ -90,74 +103,93 @@ public sealed class ImageOutputService
 
                 throw;
             }
+            if (!CompletedOutputs.TryRecordSaved(path, CleanupFileKind.CompletedImage))
+                diagnosticFailure = "completed-output-receipt-unavailable";
+            if (diagnostics is not null)
+            {
+                try
+                {
+                    if (SavedDiagnosticOverride is {} observe) observe(path, bitmap, diagnostics);
+                    else
+                    {
+                        using var saved = new Bitmap(path);
+                        diagnostics.RecordSaved(path, bitmap.Size, saved.Size);
+                    }
+                }
+                catch { diagnosticFailure = "diagnostic-readback-unavailable"; }
+            }
+            return new(path, diagnosticFailure);
         }
     }
 
     public string SaveAndCopy(Bitmap bitmap, LongCaptureRunDiagnostics? diagnostics = null)
     {
         var delivered = SaveWithDelivery(bitmap, diagnostics);
-        if (delivered.ClipboardRequested && !delivered.ClipboardCopied)
-            throw new InvalidOperationException("image-saved-clipboard-unavailable");
         return delivered.Path;
     }
 
     public ImageDeliveryOutcome SaveWithDelivery(Bitmap bitmap, LongCaptureRunDiagnostics? diagnostics = null)
     {
-        diagnostics?.RecordSaveInput(bitmap.Size);
-        var path = SavePng(bitmap, DateTime.Now);
-        if (diagnostics is not null)
+        return Deliver(Prepare(SaveCommitted(bitmap, DateTime.Now, diagnostics)));
+    }
+
+    public async Task<ImageDeliveryOutcome> SaveWithDeliveryAsync(Bitmap bitmap, LongCaptureRunDiagnostics? diagnostics = null, Func<bool>? canPublish = null)
+    {
+        // Encoder and image conversion work belong off the dispatcher. Only the frozen
+        // payload crosses back to the caller's context; clipboard publication stays there.
+        var prepared = await Task.Run(() => Prepare(SaveCommitted(bitmap, DateTime.Now, diagnostics)));
+        return Deliver(prepared,canPublish);
+    }
+
+    private PreparedImage Prepare(SavedImage saved)
+    {
+        if (!_copyToClipboard) return new(saved, null, null, null, null);
+        // Prepare failure must not turn a successfully saved image into a save failure.
+        try
         {
-            using var saved = new Bitmap(path);
-            diagnostics.RecordSaved(path, bitmap.Size, saved.Size);
+            if (ClipboardPreparationOverride is {} prepare)
+            {
+                var result = prepare(saved.Path);
+                return new(saved, result.Source, result.Png, null, result.Source is null ? "clipboard-preparation-unavailable" : null);
+            }
+            SavedMediaFile.TryReadPng(saved.Path, out var source, out var png);
+            var dib = source is null ? null : MediaClipboardDataFactory.EncodeDib(source);
+            return new(saved, source, png, dib, source is null ? "clipboard-preparation-unavailable" : null);
         }
+        catch { return new(saved, null, null, null, "clipboard-preparation-unavailable"); }
+    }
+
+    private ImageDeliveryOutcome Deliver(PreparedImage prepared,Func<bool>? canPublish = null)
+    {
         var copied = false;
-        if (_copyToClipboard)
+        var clipboardFailure = prepared.Failure;
+        if (_copyToClipboard && canPublish is not null)
+        {
+            try { if (!canPublish()) return new(prepared.Saved.Path,true,false,prepared.Saved.DiagnosticFailure,"application-exiting"); }
+            catch { return new(prepared.Saved.Path,true,false,prepared.Saved.DiagnosticFailure,"clipboard-admission-unavailable"); }
+        }
+        if (_copyToClipboard && prepared.Source is { } source)
         {
             try
             {
-                var source = BitmapSourceFactory.Create(bitmap);
                 if (_clipboard is not null) _clipboard(source);
-                else CopyWithRetry(source, path);
+                else MediaClipboardPublisher.Publish(MediaClipboardDataFactory.CreateImage(source, prepared.Saved.Path, prepared.Png, prepared.Dib));
                 copied = true;
             }
-            catch { /* Saving already succeeded; do not misreport it as lost. */ }
+            catch { clipboardFailure = "clipboard-unavailable"; }
         }
-        return new(path, _copyToClipboard, copied);
+        return new(prepared.Saved.Path, _copyToClipboard, copied, prepared.Saved.DiagnosticFailure, clipboardFailure);
     }
 
     public bool TryCopySavedFile(Bitmap bitmap, string path)
     {
-        try
-        {
-            CopyWithRetry(BitmapSourceFactory.Create(bitmap), path);
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
+        // Kept for existing preview callbacks; the persisted file owns the later copy.
+        return TryCopySavedFile(path);
     }
 
-    private static void CopyWithRetry(System.Windows.Media.Imaging.BitmapSource source, string path)
-    {
-        // Publish both representations in one clipboard update: Explorer receives
-        // the saved PNG, while image consumers can still paste the bitmap.
-        var data = new System.Windows.DataObject();
-        data.SetImage(source);
-        data.SetFileDropList(new System.Collections.Specialized.StringCollection { Path.GetFullPath(path) });
-        using var dropEffect = new MemoryStream(BitConverter.GetBytes(1)); // DROPEFFECT_COPY
-        data.SetData("Preferred DropEffect", dropEffect);
-        for (var attempt = 0; attempt < 4; attempt++)
-        {
-            try
-            {
-                System.Windows.Clipboard.SetDataObject(data, copy: true);
-                return;
-            }
-            catch (System.Runtime.InteropServices.COMException) when (attempt < 3)
-            {
-                Thread.Sleep(40 * (attempt + 1));
-            }
-        }
-    }
+    public bool TryCopySavedFile(string path, Action<System.Windows.DataObject>? publish = null) =>
+        SavedMediaClipboard.TryCopyPng(path, publish);
+
+    private sealed record SavedImage(string Path, string? DiagnosticFailure);
+    private sealed record PreparedImage(SavedImage Saved, System.Windows.Media.Imaging.BitmapSource? Source, byte[]? Png, byte[]? Dib, string? Failure);
 }

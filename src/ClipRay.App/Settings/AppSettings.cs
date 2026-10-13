@@ -59,6 +59,10 @@ public sealed record AppSettings
 
     public string RecordingDirectory { get; init; } = string.Empty;
 
+    // Written only when the complete layout is known to be the generated default.
+    // Unmarked legacy folders remain ambiguous, even when their names look familiar.
+    public string? DefaultOutputLayoutRoot { get; init; }
+
     public bool CopyToClipboard { get; init; } = true;
 
     public bool ShowBorderFeedback { get; init; } = true;
@@ -109,6 +113,7 @@ public sealed record AppSettings
             ScreenshotDirectory = directories.Screenshots,
             LongCaptureDirectory = directories.LongCaptures,
             RecordingDirectory = directories.Recordings,
+            DefaultOutputLayoutRoot = Path.GetFullPath(workspaceRoot),
             MachineTranslationFallbackEnabled = true,
             InterfaceLanguage = AppInterfaceLanguage.ForWindowsUiCulture(windowsUiCultureName ?? CultureInfo.CurrentUICulture.Name),
             InterfaceLanguageFollowsWindows = true,
@@ -119,21 +124,24 @@ public sealed record AppSettings
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workspaceRoot);
         var directories = OutputDirectoryLayout.Create(workspaceRoot);
-        var rebaseLegacyLayout = OutputDirectoryLayout.IsCompleteLegacyLayout(this);
+        var rebaseDefaultLayout = OutputDirectoryLayout.HasConfirmedDefaultLayout(this);
+        var allMissing = string.IsNullOrWhiteSpace(ScreenshotDirectory)
+            && string.IsNullOrWhiteSpace(LongCaptureDirectory) && string.IsNullOrWhiteSpace(RecordingDirectory);
         var settings = this with
         {
             InterfaceLanguage = InterfaceLanguageFollowsWindows
                 ? AppInterfaceLanguage.ForWindowsUiCulture(windowsUiCultureName ?? CultureInfo.CurrentUICulture.Name)
                 : AppInterfaceLanguage.Normalize(InterfaceLanguage),
-            ScreenshotDirectory = rebaseLegacyLayout || string.IsNullOrWhiteSpace(ScreenshotDirectory)
+            ScreenshotDirectory = rebaseDefaultLayout || string.IsNullOrWhiteSpace(ScreenshotDirectory)
                 ? directories.Screenshots
                 : ScreenshotDirectory,
-            LongCaptureDirectory = rebaseLegacyLayout || string.IsNullOrWhiteSpace(LongCaptureDirectory)
+            LongCaptureDirectory = rebaseDefaultLayout || string.IsNullOrWhiteSpace(LongCaptureDirectory)
                 ? directories.LongCaptures
                 : LongCaptureDirectory,
-            RecordingDirectory = rebaseLegacyLayout || string.IsNullOrWhiteSpace(RecordingDirectory)
+            RecordingDirectory = rebaseDefaultLayout || string.IsNullOrWhiteSpace(RecordingDirectory)
                 ? directories.Recordings
                 : RecordingDirectory,
+            DefaultOutputLayoutRoot = rebaseDefaultLayout || allMissing ? Path.GetFullPath(workspaceRoot) : null,
             Provider = !HasExplicitProviderChoice
                 && TranslationTargetLanguage == "简体中文"
                 && Provider is "DeepSeek" or "Local LMT"

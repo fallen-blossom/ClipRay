@@ -6,6 +6,7 @@ using ClipRay.Core.Geometry;
 using Windows.Graphics.Imaging;
 using Windows.Media.Ocr;
 using Windows.Storage.Streams;
+using ClipRay.App.Infrastructure;
 
 namespace ClipRay.App.Ocr;
 
@@ -17,7 +18,7 @@ public sealed record OcrWordEvidence(string EngineId, string ModelId, string? Sc
         ArgumentNullException.ThrowIfNull(candidate);
         ArgumentException.ThrowIfNullOrWhiteSpace(modelId);
         return new("rapidocr-common-script", modelId, candidate.Script,
-            double.IsFinite(candidate.Confidence) ? candidate.Confidence : null);
+            candidate.HasRawConfidence && double.IsFinite(candidate.Confidence) ? candidate.Confidence : null);
     }
 }
 
@@ -35,11 +36,22 @@ public interface IOcrRuntime
     Task<IReadOnlyList<OcrWord>> RecognizeAsync(Bitmap bitmap, CancellationToken cancellationToken);
 }
 
-public sealed class OcrService : IDisposable
+public sealed class OcrService : IDisposable, IAsyncDisposable
 {
     private readonly Func<IOcrRuntime> _runtimeFactory;
     private readonly string _successStatus;
     private IOcrRuntime? _runtime;
+    private readonly object _runtimeGate = new();
+    private readonly AsyncResourceLifetime _lifetime = new();
+    private readonly SemaphoreSlim _runtimeUse = new(1,1);
+    private readonly TimeProvider _clock;
+    private readonly TimeSpan _idleTimeout;
+    private readonly ITimer _idleTimer;
+    private DateTimeOffset _lastUse;
+    private Exception? _idleFailure;
+    private IOcrRuntime Runtime { get { lock (_runtimeGate) {
+        if(_idleFailure is not null)throw new InvalidOperationException("The OCR idle owner failed retirement.",_idleFailure);
+        return _runtime ??= _runtimeFactory(); } } }
 
     public OcrService() : this(static () => new FastFirstOcrRuntime(
         new ScriptSupplementalOcrRuntime(
@@ -48,10 +60,15 @@ public sealed class OcrService : IDisposable
             ScriptSupplementalOcr.ContainsHangul),
         new WindowsOcrRuntime())) { }
 
-    public OcrService(Func<IOcrRuntime> runtimeFactory, string? successStatus = null)
+    public OcrService(Func<IOcrRuntime> runtimeFactory, string? successStatus = null, TimeProvider? clock=null, TimeSpan? idleTimeout=null)
     {
         _runtimeFactory = runtimeFactory;
         _successStatus = successStatus ?? "Local OCR completed (multilingual PP-OCRv6 with Korean PP-OCRv5 supplement; Windows OCR fallback).";
+        _clock = clock ?? TimeProvider.System;
+        _idleTimeout = idleTimeout ?? TimeSpan.FromMinutes(15);
+        if (_idleTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(idleTimeout));
+        _lastUse = _clock.GetUtcNow();
+        _idleTimer = _clock.CreateTimer(_ => _ = ReleaseIdleAsync(), null, _idleTimeout, _idleTimeout);
     }
 
     public static OcrService CreateForEnglishMachine(IOcrRuntime? english = null, IOcrRuntime? fallback = null) =>
@@ -76,17 +93,26 @@ public sealed class OcrService : IDisposable
             $"Local Windows OCR completed ({languageTag}).");
     }
 
-    public async Task<OcrRecognitionResult> RecognizeAsync(Bitmap bitmap, CancellationToken cancellationToken)
+    public Task<OcrRecognitionResult> RecognizeAsync(Bitmap bitmap, CancellationToken cancellationToken) => RecognizeAsync(bitmap,cancellationToken,null);
+    public async Task<OcrRecognitionResult> RecognizeAsync(Bitmap bitmap, CancellationToken cancellationToken, Action<OcrRecognitionTrace>? observe)
     {
         ArgumentNullException.ThrowIfNull(bitmap);
+        using var admission = _lifetime.Enter();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        cancellationToken = linked.Token;
         using var owned = new Bitmap(bitmap);
+        await _runtimeUse.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             var plan = OcrPreprocessingPlan.Create(owned.Width, owned.Height);
             using var prepared = plan.CreatePreparedBitmap(owned);
-            var words = await (_runtime ??= _runtimeFactory()).RecognizeAsync(prepared, cancellationToken).ConfigureAwait(false);
+            var words = await Runtime.RecognizeAsync(prepared, cancellationToken).ConfigureAwait(false);
             var restored = words.Select(word => word with { Bounds = plan.Restore(word.Bounds) }).ToArray();
-            return new OcrRecognitionResult(true, OcrBlockGrouping.GroupWords(restored), _successStatus);
+            var blocks = OcrBlockGrouping.GroupWords(restored);
+            try { observe?.Invoke(new(owned.Width,owned.Height,plan.Scale,prepared.Width,prepared.Height,
+                words.Select(w => new OcrLineTrace(w.Bounds,w.IsDetectedLine,w.Evidence?.EngineId,w.Evidence?.ModelId,w.Evidence?.RawScore,w.Text.Length)).ToArray(),blocks.Count,clock.ElapsedMilliseconds)); } catch { }
+            return new OcrRecognitionResult(true, blocks, _successStatus);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -100,20 +126,47 @@ public sealed class OcrService : IDisposable
         {
             return new OcrRecognitionResult(false, [], "Local OCR failed; the image stayed on this device.");
         }
+        finally { _lastUse = _clock.GetUtcNow(); _runtimeUse.Release(); }
     }
 
-    public void Dispose()
+    public void Dispose() => _ = DisposeAsync();
+    public ValueTask DisposeAsync()
     {
-        if (_runtime is IDisposable disposable) disposable.Dispose();
-        _runtime = null;
+        _idleTimer.Dispose();
+        return new(_lifetime.RetireAsync(async () =>
+    {
+        if (_runtime is IAsyncDisposable asyncDisposable) await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+        else if (_runtime is IDisposable disposable) await Task.Run(disposable.Dispose).ConfigureAwait(false);
+        if(_idleFailure is not null) throw new InvalidOperationException("OCR idle retirement failed.",_idleFailure);
+        }));
     }
 
-    public Task WarmupAsync(CancellationToken cancellationToken)
+    internal async Task ReleaseIdleAsync()
     {
-        var runtime = _runtime ??= _runtimeFactory();
-        return runtime is IOcrWarmup warmup
-            ? warmup.WarmupAsync(cancellationToken)
-            : Task.CompletedTask;
+        IDisposable admission;
+        try { admission = _lifetime.Enter(); } catch (ObjectDisposedException) { return; }
+        using (admission)
+        {
+            // Never wait for an active native call just to unload an idle resource.
+            if (!await _runtimeUse.WaitAsync(0).ConfigureAwait(false)) return;
+            try
+            {
+                if (_clock.GetUtcNow()-_lastUse < _idleTimeout || _runtime is null) return;
+                await OcrRuntimeRelease.ReleaseAsync(_runtime).ConfigureAwait(false);
+                _runtime = null;
+            }
+            catch(Exception error) { _idleFailure=error; }
+            finally { _runtimeUse.Release(); }
+        }
+    }
+
+    public async Task WarmupAsync(CancellationToken cancellationToken)
+    {
+        using var admission = _lifetime.Enter();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        await _runtimeUse.WaitAsync(linked.Token).ConfigureAwait(false);
+        try { if (Runtime is IOcrWarmup warmup) await warmup.WarmupAsync(linked.Token).ConfigureAwait(false); }
+        finally { _lastUse = _clock.GetUtcNow(); _runtimeUse.Release(); }
     }
 }
 
@@ -398,3 +451,12 @@ public readonly record struct OcrPreprocessingPlan(double Scale)
 }
 
 internal sealed class OcrUnavailableException(string message) : Exception(message);
+
+internal static class OcrRuntimeRelease
+{
+    internal static async Task ReleaseAsync(object runtime)
+    {
+        if (runtime is IAsyncDisposable asyncDisposable) await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+        else if (runtime is IDisposable disposable) await Task.Run(disposable.Dispose).ConfigureAwait(false);
+    }
+}

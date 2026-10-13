@@ -43,6 +43,7 @@ public partial class SelectionOverlayWindow : Window
     private PixelRect _selectionAtDragStart;
     private PixelRect _snapSelection;
     private EditLayer? _editLayer;
+    private readonly EditPreviewCache _editPreviewCache = new();
     private List<PixelPoint>? _activeEditPoints;
     private EditTool _activeEditTool;
     private IntPtr _windowHandle;
@@ -59,6 +60,18 @@ public partial class SelectionOverlayWindow : Window
     private PixelPoint _lastSnapPoint;
     private SnapDetectionMode _snapDetectionMode = SnapDetectionMode.WindowFirst;
     private TranslationRouteKind _translationRoute;
+    private bool _captureDeliveryPending;
+    private long _captureInputRevision;
+
+    internal Func<ModifierKeys> ReadModifiers { get; set; } = HotkeyCapturePolicy.ReadCurrentModifiers;
+    internal UiQueryScheduler SnapQueryScheduler { get; set; } = UiQueryScheduler.Shared;
+    internal TimeSpan SnapQueryBudget { get; set; } = TimeSpan.FromMilliseconds(180);
+    internal Func<CancellationToken,Task> SnapQueryDelay { get; set; } = token=>Task.Delay(TimeSpan.FromMilliseconds(45),token);
+    internal Func<System.Windows.Input.MouseEventArgs, PixelPoint>? ReadPointerOverride { get; set; }
+    internal Func<System.Windows.Input.MouseEventArgs, MouseButtonState> ReadLeftButton { get; set; } = static e => e.LeftButton;
+
+    private PixelPoint ReadPointer(System.Windows.Input.MouseEventArgs e) =>
+        ReadPointerOverride?.Invoke(e) ?? ToPixel(e.GetPosition(OverlayCanvas));
 
     public SelectionOverlayWindow(
         CapturedFrame frame,
@@ -66,7 +79,9 @@ public partial class SelectionOverlayWindow : Window
         bool showPreviewHint = false,
         IClipboardTextSink? clipboardTextSink = null,
         AppSettings? interactionSettings = null,
-        OverlayLaunchMode launchMode = OverlayLaunchMode.Capture)
+        OverlayLaunchMode launchMode = OverlayLaunchMode.Capture,
+        IWindowCandidateSource? windowCandidateSource = null,
+        IUiElementCandidateSource? uiElementCandidateSource = null)
     {
         _frame = frame;
         _pixelBounds = new PixelRect(0, 0, frame.Bitmap.Width, frame.Bitmap.Height);
@@ -80,12 +95,12 @@ public partial class SelectionOverlayWindow : Window
             frame.ScreenBounds.X,
             frame.ScreenBounds.Y,
             frame.ScreenBounds.Width,
-            frame.ScreenBounds.Height));
+            frame.ScreenBounds.Height), windowCandidateSource, uiElementCandidateSource);
         _escapeHintTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1.5) };
         _escapeHintTimer.Tick += OnEscapeHintTimerTick;
         InitializeComponent();
         CaptureLocalization.ApplyStatic(this, _interactionSettings.InterfaceLanguage);
-        foreach (var entry in new[] { (PenWidthInput, "画笔粗细", "Pen width"), (MosaicBrushInput, "马赛克笔刷大小", "Mosaic brush size"),
+        foreach (var entry in new[] { (PenWidthInput, "画笔粗细", "Pen width"), (TextSizeInput, "文字字号", "Text font size"), (MosaicBrushInput, "马赛克笔刷大小", "Mosaic brush size"),
             (MosaicBlockInput, "马赛克像素大小", "Mosaic pixel size") })
             System.Windows.Automation.AutomationProperties.SetName(entry.Item1, AppInterfaceLanguage.Text(_interactionSettings.InterfaceLanguage, entry.Item2, entry.Item3));
         System.Windows.Automation.AutomationProperties.SetName(SelectionWidthInput, AppInterfaceLanguage.Text(_interactionSettings.InterfaceLanguage, "选区宽度", "Selection width"));
@@ -126,6 +141,8 @@ public partial class SelectionOverlayWindow : Window
         };
         Closed += (_, _) =>
         {
+            if (AnnotationToolButton.ContextMenu is { } annotationMenu) annotationMenu.IsOpen = false;
+            AnnotationToolButton.ContextMenu = null;
             if (TranslateToolButton.ContextMenu is { } routeMenu)
             {
                 routeMenu.IsOpen = false;
@@ -136,6 +153,7 @@ public partial class SelectionOverlayWindow : Window
             _lifetime.Dispose();
             _translationSequencer.Close();
             _escapeHintTimer.Stop();
+            _editPreviewCache.Dispose();
             _frame.Dispose();
         };
         AddHandler(
@@ -145,6 +163,13 @@ public partial class SelectionOverlayWindow : Window
         ToolFeedbackPanel.SizeChanged += (_, _) => PositionToolFeedbackForCurrentToolbar();
         MouseMove += OnMouseMove;
         MouseLeftButtonUp += OnMouseLeftButtonUp;
+        LostMouseCapture += (_, _) =>
+        {
+            if (_mode != InteractionMode.Edit) return;
+            _mode = InteractionMode.None;
+            _activeEditPoints = null;
+            UpdateEditPreview();
+        };
         MouseWheel += OnMouseWheel;
     }
 
@@ -152,6 +177,7 @@ public partial class SelectionOverlayWindow : Window
 
     private string T(string source) => CaptureLocalization.Text(_interactionSettings.InterfaceLanguage, source);
     public Func<Bitmap, bool>? CaptureDelivery { get; set; }
+    public Func<Bitmap, Task<bool>>? CaptureDeliveryAsync { get; set; }
 
     public event EventHandler<RoutedUICommand>? ToolRequested;
 
@@ -180,7 +206,7 @@ public partial class SelectionOverlayWindow : Window
     {
         if (e.ChangedButton != MouseButton.Left) return;
 
-        var point = ToPixel(e.GetPosition(OverlayCanvas));
+        var point = ReadPointer(e);
         var pressedSnapProposal = _isSnapProposal && Contains(_selection, point);
         StopSnapTracking();
 
@@ -188,6 +214,7 @@ public partial class SelectionOverlayWindow : Window
         {
             return;
         }
+        CommitTextEditor();
 
         var isResizeHandle = TryGetHandle(e.OriginalSource as DependencyObject, out var resizeHandle);
         if (_activeEditTool == EditTool.Picker && OverlayPickerInputRouter.TryRoutePicker(
@@ -228,10 +255,12 @@ public partial class SelectionOverlayWindow : Window
                 isResizeHandle,
                 !_selection.IsEmpty && SelectionDrawableBounds.Contains(_selection, point)))
         {
+            InvalidateInputResults();
             _activeEditPoints = [];
             StrokePointCollection.AppendClampedDistinct(_activeEditPoints, point, _selection);
             _mode = InteractionMode.Edit;
             CaptureMouse();
+            UpdateActiveAnnotationPreview();
             e.Handled = true;
             return;
         }
@@ -258,7 +287,7 @@ public partial class SelectionOverlayWindow : Window
         else
         {
             _mode = InteractionMode.Draw;
-            _selection = new PixelRect(point.X, point.Y, 0, 0);
+            SetSelection(new PixelRect(point.X, point.Y, 0, 0));
             _isSnapProposal = false;
         }
 
@@ -268,12 +297,12 @@ public partial class SelectionOverlayWindow : Window
 
     private void OnMouseMove(object sender, System.Windows.Input.MouseEventArgs e)
     {
-        var point = Clamp(ToPixel(e.GetPosition(OverlayCanvas)));
+        var point = Clamp(ReadPointer(e));
         if (_mode == InteractionMode.None)
         {
             UpdateMosaicBrushCursor(point);
             UpdatePickerHud(point);
-            if (e.LeftButton != MouseButtonState.Pressed)
+            if (ReadLeftButton(e) != MouseButtonState.Pressed)
             {
                 if (_moveToolActive)
                 {
@@ -290,17 +319,24 @@ public partial class SelectionOverlayWindow : Window
             return;
         }
 
-        if (e.LeftButton != MouseButtonState.Pressed)
+        if (ReadLeftButton(e) != MouseButtonState.Pressed)
         {
             return;
         }
 
         if (_mode == InteractionMode.Edit)
         {
-            if (SelectionDrawableBounds.Contains(_selection, point))
+            if (SelectionDrawableBounds.Contains(_selection, point)
+                || _activeEditTool is EditTool.Arrow or EditTool.Line or EditTool.Rectangle or EditTool.Ellipse or EditTool.Circle or EditTool.Text)
             {
-                StrokePointCollection.AppendClampedDistinct(_activeEditPoints!, point, _selection);
+                if (_activeEditTool is EditTool.Arrow or EditTool.Line or EditTool.Rectangle or EditTool.Ellipse or EditTool.Circle or EditTool.Text)
+                {
+                    if (_activeEditPoints!.Count > 1) _activeEditPoints.RemoveRange(1, _activeEditPoints.Count - 1);
+                    StrokePointCollection.AppendClampedDistinct(_activeEditPoints, point, _selection);
+                }
+                else StrokePointCollection.AppendClampedDistinct(_activeEditPoints!, point, _selection);
                 if (_activeEditTool == EditTool.Mosaic) UpdateEditPreview();
+                else UpdateActiveAnnotationPreview();
             }
 
             UpdateMosaicBrushCursor(point);
@@ -318,7 +354,7 @@ public partial class SelectionOverlayWindow : Window
             }
 
             _mode = InteractionMode.Draw;
-            _selection = SelectionMath.FromPoints(_dragStart, point);
+            SetSelection(SelectionMath.FromPoints(_dragStart, point));
             _isSnapProposal = false;
         }
 
@@ -336,10 +372,10 @@ public partial class SelectionOverlayWindow : Window
             }
 
             _mode = InteractionMode.Draw;
-            _selection = SelectionMath.FromPoints(_dragStart, point);
+            SetSelection(SelectionMath.FromPoints(_dragStart, point));
         }
 
-        _selection = _mode switch
+        SetSelection(_mode switch
         {
             InteractionMode.Draw => SelectionMath.FromPoints(_dragStart, point),
             InteractionMode.Move => SelectionMath.Move(
@@ -354,7 +390,7 @@ public partial class SelectionOverlayWindow : Window
                 _pixelBounds,
                 MinimumSelectionPixels),
             _ => _selection,
-        };
+        });
 
         UpdateVisuals();
         e.Handled = true;
@@ -371,14 +407,14 @@ public partial class SelectionOverlayWindow : Window
         {
             StrokePointCollection.AppendClampedDistinct(
                 _activeEditPoints!,
-                Clamp(ToPixel(e.GetPosition(OverlayCanvas))),
+                Clamp(ReadPointer(e)),
                 _selection);
             CommitActiveEdit();
         }
 
         if (_mode == InteractionMode.PendingSnapDecision)
         {
-            _selection = _snapSelection;
+            SetSelection(_snapSelection);
         }
 
         _mode = InteractionMode.None;
@@ -392,12 +428,27 @@ public partial class SelectionOverlayWindow : Window
 
     private void OnPreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
+        // IME owns these processed keys, including Escape used to cancel a candidate.
+        if (_pendingTextBounds is not null && e.Key is Key.ImeProcessed or Key.DeadCharProcessed) return;
         var key = HotkeyCapturePolicy.ResolveEventKey(
             e.Key,
             e.SystemKey,
             e.ImeProcessedKey,
             e.DeadCharProcessedKey);
-        var modifiers = HotkeyCapturePolicy.ReadCurrentModifiers();
+        var modifiers = ReadModifiers();
+        if (HandleAnnotationKey(key, modifiers)) { e.Handled = true; return; }
+        var textBox = FindInputTextBox(e.OriginalSource as DependencyObject)
+            ?? FindInputTextBox(Keyboard.FocusedElement as DependencyObject);
+        if (textBox is not null && key != Key.Escape)
+        {
+            if (!textBox.IsReadOnly && key == Key.Enter && modifiers == ModifierKeys.None
+                && (ReferenceEquals(textBox, SelectionWidthInput) || ReferenceEquals(textBox, SelectionHeightInput)))
+            {
+                OnApplySelectionSize(textBox, new RoutedEventArgs());
+                e.Handled = true;
+            }
+            return;
+        }
         UpdateSnapDetectionMode(modifiers);
         if (key is Key.LeftCtrl or Key.RightCtrl)
         {
@@ -472,7 +523,9 @@ public partial class SelectionOverlayWindow : Window
 
     private void UndoLastEdit()
     {
+        CommitTextEditor();
         if (_editLayer?.UndoLast() != true) return;
+        InvalidateInputResults();
         ToolStatusText.Text = T("已撤回上一步");
         ToolStatus.Visibility = Visibility.Visible;
         UpdateEditPreview();
@@ -480,7 +533,9 @@ public partial class SelectionOverlayWindow : Window
 
     private void RedoLastEdit()
     {
+        CommitTextEditor();
         if (_editLayer?.RedoLast() != true) return;
+        InvalidateInputResults();
         ToolStatusText.Text = T("已重做上一步");
         ToolStatus.Visibility = Visibility.Visible;
         UpdateEditPreview();
@@ -674,15 +729,15 @@ public partial class SelectionOverlayWindow : Window
     private void RequestTranslation()
     {
         if (_selection.Width < MinimumSelectionPixels || _selection.Height < MinimumSelectionPixels) return;
-        var request = _translationSequencer.Begin(_selection);
+        CommitTextEditor();
+        InvalidateInputResults();
+        var request = _translationSequencer.Begin(_selection, LifetimeToken);
         var captureBounds = SelectionCapturePolicy.CreateOcrCaptureBounds(request.Selection, _pixelBounds);
-        var bitmap = _frame.Bitmap.Clone(
-            ToCropRectangle(captureBounds, _frame.Bitmap.Width, _frame.Bitmap.Height),
-            System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+        var bitmap = CreateRecognitionCapture(captureBounds);
         TranslationCaptureDispatcher.Dispatch(
             TranslationRequested,
             this,
-            new TranslationCapture(request.Version, bitmap, request.Selection, captureBounds, _translationRoute));
+            new TranslationCapture(request.Version, bitmap, request.Selection, captureBounds, _translationRoute, request.Token));
     }
 
     private void OnTranslateToolRightClick(object sender, MouseButtonEventArgs e)
@@ -711,10 +766,7 @@ public partial class SelectionOverlayWindow : Window
             };
             item.Click += (_, _) =>
             {
-                _translationRoute = (TranslationRouteKind)item.Tag;
-                var routeName = T(TranslationRouteCatalog.Get(_translationRoute).ShortName);
-                TranslateToolButton.ToolTip = AppInterfaceLanguage.Text(_interactionSettings.InterfaceLanguage,
-                    $"翻译：{routeName}（右键切换）", $"Translate: {routeName} (right-click to change)");
+                SelectTranslationRoute((TranslationRouteKind)item.Tag);
             };
             menu.Items.Add(item);
         }
@@ -741,19 +793,29 @@ public partial class SelectionOverlayWindow : Window
             ? TranslationRouteKind.Machine
             : TranslationRouteKind.DeepSeekFlash;
 
+    private void SelectTranslationRoute(TranslationRouteKind route)
+    {
+        if (_translationRoute != route) InvalidateInputResults();
+        _translationRoute = route;
+        var routeName = T(TranslationRouteCatalog.Get(route).ShortName);
+        TranslateToolButton.ToolTip = AppInterfaceLanguage.Text(_interactionSettings.InterfaceLanguage,
+            $"翻译：{routeName}（右键切换）", $"Translate: {routeName} (right-click to change)");
+    }
+
     private void RequestTextExtraction()
     {
+        CommitTextEditor();
         if (TextExtractionPanel.Visibility == Visibility.Visible)
         {
+            _translationSequencer.CancelPending();
             TextExtractionPanel.Visibility = Visibility.Collapsed;
             return;
         }
         if (_selection.Width < MinimumSelectionPixels || _selection.Height < MinimumSelectionPixels) return;
-        var request = _translationSequencer.Begin(_selection);
+        InvalidateInputResults();
+        var request = _translationSequencer.Begin(_selection, LifetimeToken);
         var captureBounds = SelectionCapturePolicy.CreateOcrCaptureBounds(request.Selection, _pixelBounds);
-        var bitmap = _frame.Bitmap.Clone(
-            ToCropRectangle(captureBounds, _frame.Bitmap.Width, _frame.Bitmap.Height),
-            System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+        var bitmap = CreateRecognitionCapture(captureBounds);
         ExtractedTextBox.Text = string.Empty;
         ExtractionStatusText.Text = T("正在运行本地 OCR 快速路径…");
         TextExtractionPanel.Visibility = Visibility.Visible;
@@ -762,7 +824,7 @@ public partial class SelectionOverlayWindow : Window
         TranslationCaptureDispatcher.Dispatch(
             TextExtractionRequested,
             this,
-            new TranslationCapture(request.Version, bitmap, request.Selection, captureBounds));
+            new TranslationCapture(request.Version, bitmap, request.Selection, captureBounds, token: request.Token));
     }
 
     public bool ShowExtractedText(long version, string text, string status)
@@ -820,22 +882,13 @@ public partial class SelectionOverlayWindow : Window
     private void OnCopyExtractedText(object sender, RoutedEventArgs e)
     {
         if (string.IsNullOrWhiteSpace(ExtractedTextBox.Text)) return;
-        var copied = false;
-        for (var attempt = 0; attempt < 3; attempt++)
+        var copied = TextClipboardPublisher.TryCopy(ExtractedTextBox.Text, _clipboardTextSink.SetText);
+        ExtractionStatusText.Text = copied switch
         {
-            try
-            {
-                _clipboardTextSink.SetText(ExtractedTextBox.Text);
-                copied = true;
-                break;
-            }
-            catch (ExternalException)
-            {
-                if (attempt < 2) Thread.Sleep(25);
-            }
-        }
-
-        ExtractionStatusText.Text = copied ? T("已按行复制到剪贴板") : T("剪贴板暂忙，请稍后重试");
+            TextCopyResult.Copied => T("已按行复制到剪贴板"),
+            TextCopyResult.Busy => T("剪贴板暂忙，请稍后重试"),
+            _ => T("剪贴板暂不可用，请重试"),
+        };
     }
 
     private void OnCloseTextExtraction(object sender, RoutedEventArgs e)
@@ -865,8 +918,16 @@ public partial class SelectionOverlayWindow : Window
         Activate();
     }
 
-    private void ConfirmSelection()
+    private async void ConfirmSelection()
     {
+        if (_captureDeliveryPending) return;
+        if (_mode == InteractionMode.Edit)
+        {
+            CommitActiveEdit();
+            _mode = InteractionMode.None;
+            ReleaseMouseCapture();
+        }
+        CommitTextEditor();
         if (_selection.Width < MinimumSelectionPixels || _selection.Height < MinimumSelectionPixels)
         {
             return;
@@ -925,16 +986,24 @@ public partial class SelectionOverlayWindow : Window
                     ToCropRectangle(_selection, _frame.Bitmap.Width, _frame.Bitmap.Height),
                     System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
         }
-        if (CaptureDelivery is not null)
+        if (CaptureDeliveryAsync is not null || CaptureDelivery is not null)
         {
+            var revision = _captureInputRevision;
+            var lifetime = _lifetime.Token;
+            _captureDeliveryPending = true;
             using (bitmap)
             {
-                try { if (!CaptureDelivery(bitmap)) return; }
+                try
+                {
+                    var saved = CaptureDeliveryAsync is {} asynchronous ? await asynchronous(bitmap) : CaptureDelivery!(bitmap);
+                    if (!saved || lifetime.IsCancellationRequested || revision != _captureInputRevision) return;
+                }
                 catch
                 {
-                    ShowTranslationStatus("保存失败，编辑内容已保留；请重试保存或调整输出目录。");
+                    if (!lifetime.IsCancellationRequested) ShowTranslationStatus("保存失败，编辑内容已保留；请重试保存或调整输出目录。");
                     return;
                 }
+                finally { _captureDeliveryPending = false; }
             }
         }
         else CaptureConfirmed?.Invoke(this, bitmap);
@@ -948,6 +1017,7 @@ public partial class SelectionOverlayWindow : Window
             return;
         }
 
+        CommitTextEditor();
         _moveToolActive = false;
         MoveToolButton.Background = System.Windows.Media.Brushes.Transparent;
         var layer = EnsureEditLayer();
@@ -968,7 +1038,9 @@ public partial class SelectionOverlayWindow : Window
 
         layer.SwitchTool(tool);
         _activeEditTool = tool;
-        PenProperties.Visibility = tool is EditTool.Pen or EditTool.Picker ? Visibility.Visible : Visibility.Collapsed;
+        PenProperties.Visibility = tool != EditTool.Mosaic ? Visibility.Visible : Visibility.Collapsed;
+        PenWidthLabel.Visibility = PenWidthInput.Visibility = tool == EditTool.Text ? Visibility.Collapsed : Visibility.Visible;
+        TextSizeLabel.Visibility = TextSizeInput.Visibility = tool == EditTool.Text ? Visibility.Visible : Visibility.Collapsed;
         MosaicProperties.Visibility = tool == EditTool.Mosaic ? Visibility.Visible : Visibility.Collapsed;
         SizeProperties.Visibility = Visibility.Collapsed;
         ToolProperties.Visibility = tool == EditTool.Picker ? Visibility.Collapsed : Visibility.Visible;
@@ -979,6 +1051,12 @@ public partial class SelectionOverlayWindow : Window
         {
             EditTool.Pen => T("画笔：在选区内拖动绘制"),
             EditTool.Mosaic => T("马赛克：在选区内拖动涂抹"),
+            EditTool.Arrow => T("箭头：拖动绘制由细到粗的箭头"),
+            EditTool.Line => T("直线：拖动绘制"),
+            EditTool.Rectangle => T("矩形：拖动绘制，Shift 绘制正方形"),
+            EditTool.Ellipse => T("椭圆：拖动绘制，Shift 绘制圆形"),
+            EditTool.Circle => T("圆形：拖动绘制"),
+            EditTool.Text => T("文字框：点击或拖动输入，Ctrl+Enter 完成"),
             _ => T("取色：点击冻结截图中的像素"),
         };
         ToolStatus.Visibility = Visibility.Visible;
@@ -988,6 +1066,7 @@ public partial class SelectionOverlayWindow : Window
     private void SelectMoveTool()
     {
         if (_selection.Width < MinimumSelectionPixels || _selection.Height < MinimumSelectionPixels) return;
+        CommitTextEditor();
         _moveToolActive = !_moveToolActive;
         _activeEditTool = EditTool.None;
         _editLayer?.SwitchTool(EditTool.None);
@@ -1036,8 +1115,19 @@ public partial class SelectionOverlayWindow : Window
         {
             layer.AddMosaicStroke(new MosaicStroke(points, layer.MosaicBrushSize, layer.MosaicBlockSize));
         }
+        else if (_activeEditTool == EditTool.Text)
+        {
+            StartTextEditor(points[0], points[^1]);
+        }
+        else if (ActiveShapeAnnotation() is { } annotation
+            && (annotation.Kind is AnnotationKind.Arrow or AnnotationKind.Line ? annotation.Bounds.Width + annotation.Bounds.Height >= 2
+                : annotation.Bounds.Width > 0 && annotation.Bounds.Height > 0))
+        {
+            layer.AddAnnotation(annotation);
+        }
 
         _activeEditPoints = null;
+        InvalidateInputResults();
         UpdateEditPreview();
     }
 
@@ -1045,6 +1135,7 @@ public partial class SelectionOverlayWindow : Window
     {
         PenColorInput.Text = result.Text;
         UpdateSelectedPenColor(EnsureEditLayer().PenColor);
+        UpdateAnnotationTextColor();
         ToolStatusText.Text = result.Copied
             ? AppInterfaceLanguage.Text(_interactionSettings.InterfaceLanguage, $"已复制 {result.Text}", $"Copied {result.Text}")
             : AppInterfaceLanguage.Text(_interactionSettings.InterfaceLanguage, $"已取色 {result.Text}，剪贴板暂不可用", $"Picked {result.Text}; clipboard unavailable");
@@ -1062,6 +1153,7 @@ public partial class SelectionOverlayWindow : Window
         {
             _editLayer.SetPenColor(System.Drawing.ColorTranslator.FromHtml(PenColorInput.Text));
             UpdateSelectedPenColor(_editLayer.PenColor);
+            UpdateAnnotationTextColor();
         }
         catch (ArgumentException)
         {
@@ -1070,7 +1162,9 @@ public partial class SelectionOverlayWindow : Window
 
     private void OnPreviewKeyUp(object sender, System.Windows.Input.KeyEventArgs e)
     {
-        UpdateSnapDetectionMode(HotkeyCapturePolicy.ReadCurrentModifiers());
+        if (FindInputTextBox(e.OriginalSource as DependencyObject) is not null
+            || FindInputTextBox(Keyboard.FocusedElement as DependencyObject) is not null) return;
+        UpdateSnapDetectionMode(ReadModifiers());
         var key = HotkeyCapturePolicy.ResolveEventKey(
             e.Key,
             e.SystemKey,
@@ -1139,6 +1233,7 @@ public partial class SelectionOverlayWindow : Window
 
     private void OnToggleSizeEditor(object sender, RoutedEventArgs e)
     {
+        CommitTextEditor();
         PenProperties.Visibility = Visibility.Collapsed;
         MosaicProperties.Visibility = Visibility.Collapsed;
         LongCaptureProperties.Visibility = Visibility.Collapsed;
@@ -1160,7 +1255,7 @@ public partial class SelectionOverlayWindow : Window
             return;
         }
 
-        _selection = SelectionSizePolicy.ResizeAroundCenter(_selection, width, height, _pixelBounds);
+        SetSelection(SelectionSizePolicy.ResizeAroundCenter(_selection, width, height, _pixelBounds));
         _isSnapProposal = false;
         UpdateVisuals();
     }
@@ -1234,23 +1329,26 @@ public partial class SelectionOverlayWindow : Window
         CancellationToken cancellationToken)
     {
         IReadOnlyList<PixelRect> candidates;
+        var scheduler=SnapQueryScheduler;
         try
         {
-            await Task.Delay(TimeSpan.FromMilliseconds(45), cancellationToken);
-            candidates = await Task.Run(
-                () => _windowSnapService.GetCandidates(screenPoint, _windowHandle, _snapDetectionMode),
-                cancellationToken);
+            await SnapQueryDelay(cancellationToken);
+            var mode=_snapDetectionMode;
+            var handle=_windowHandle;
+            candidates = await _windowSnapService.GetCandidatesAsync(screenPoint,handle,mode,scheduler,SnapQueryBudget,cancellationToken);
         }
         catch (OperationCanceledException)
         {
             return;
         }
 
-        if (_lifetime.IsCancellationRequested || !_snapInteraction.CanAcceptRefinement(requestVersion))
+        if (scheduler.IsRetired || _lifetime.IsCancellationRequested || !_snapInteraction.CanAcceptRefinement(requestVersion))
         {
             return;
         }
 
+        // Deadline/retired clients keep the already available window proposal.
+        if(candidates.Count==0) return;
         _snapCandidates = candidates;
         _snapCandidateIndex = 0;
         ApplySnapCandidate();
@@ -1258,22 +1356,22 @@ public partial class SelectionOverlayWindow : Window
 
     private void ApplySnapCandidate()
     {
-        if (!_snapInteraction.IsTracking) return;
+        if (!_snapInteraction.IsTracking || SnapQueryScheduler.IsRetired) return;
 
         if (_snapCandidates.Count > 0)
         {
             var bounds = _snapCandidates[_snapCandidateIndex];
-            _selection = new PixelRect(
+            SetSelection(new PixelRect(
                 bounds.X - _frame.ScreenBounds.X,
                 bounds.Y - _frame.ScreenBounds.Y,
                 bounds.Width,
-                bounds.Height);
+                bounds.Height));
             _isSnapProposal = true;
             UpdateVisuals();
         }
         else if (_isSnapProposal)
         {
-            _selection = default;
+            SetSelection(default);
             _isSnapProposal = false;
             UpdateVisuals();
         }
@@ -1365,7 +1463,7 @@ public partial class SelectionOverlayWindow : Window
 
         if (_selection.Width >= MinimumSelectionPixels && _selection.Height >= MinimumSelectionPixels)
         {
-            SizeLabel.Text = $"{Math.Round(_selection.Width)} × {Math.Round(_selection.Height)}";
+            SizeLabel.Text = $"{Math.Round(_selection.Width)} × {Math.Round(_selection.Height)} px";
             Toolbar.Visibility = Visibility.Visible;
             Toolbar.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
             var toolbarSize = Toolbar.DesiredSize;
@@ -1572,18 +1670,17 @@ public partial class SelectionOverlayWindow : Window
 
     private void UpdateEditPreview()
     {
+        UpdateActiveAnnotationPreview();
         var activeMosaic = _activeEditTool == EditTool.Mosaic && _activeEditPoints is { Count: > 0 }
             ? new MosaicStroke(_activeEditPoints, EnsureEditLayer().MosaicBrushSize, EnsureEditLayer().MosaicBlockSize)
             : null;
-        if (_editLayer is null || (_editLayer.PenStrokes.Count == 0 && _editLayer.MosaicStrokes.Count == 0 && activeMosaic is null))
+        if (_editLayer is null || (!_editLayer.HasEdits && activeMosaic is null))
         {
             EditPreview.Visibility = Visibility.Collapsed;
             return;
         }
 
-        using var composited = activeMosaic is null
-            ? EditRenderer.Composite(_frame.Bitmap, _editLayer)
-            : EditRenderer.CompositePreview(_frame.Bitmap, _editLayer, activeMosaic);
+        var composited = _editPreviewCache.GetOverlay(_frame.Bitmap, _editLayer, activeMosaic);
         EditPreview.Source = BitmapSourceFactory.Create(composited);
         EditPreview.Visibility = Visibility.Visible;
     }
@@ -1629,6 +1726,43 @@ public partial class SelectionOverlayWindow : Window
     private PixelPoint ToPixel(System.Windows.Point point) => new(
         Math.Clamp(point.X * PixelScaleX, 0, _frame.Bitmap.Width),
         Math.Clamp(point.Y * PixelScaleY, 0, _frame.Bitmap.Height));
+
+    private void SetSelection(PixelRect selection)
+    {
+        if (_selection == selection) return;
+        InvalidateInputResults();
+        _selection = selection;
+    }
+
+    private void InvalidateInputResults()
+    {
+        _captureInputRevision++;
+        _translationSequencer.CancelPending();
+        _translationDisplayState = null;
+        TranslationLayer.Children.Clear();
+        TranslationLayer.Visibility = Visibility.Collapsed;
+        TranslationToggle.Visibility = Visibility.Collapsed;
+        TextExtractionPanel.Visibility = Visibility.Collapsed;
+        ExtractedTextBox.Clear();
+        HideTranslationStatus();
+    }
+
+    private Bitmap CreateRecognitionCapture(PixelRect captureBounds) => _editLayer is { } layer
+        ? EditRenderer.CompositeCapture(_frame.Bitmap, layer, captureBounds)
+        : _frame.Bitmap.Clone(ToCropRectangle(captureBounds, _frame.Bitmap.Width, _frame.Bitmap.Height),
+            System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+
+    private static System.Windows.Controls.TextBox? FindInputTextBox(DependencyObject? source)
+    {
+        for (var current = source; current is not null;)
+        {
+            if (current is System.Windows.Controls.TextBox textBox) return textBox;
+            current = current is Visual or System.Windows.Media.Media3D.Visual3D
+                ? VisualTreeHelper.GetParent(current)
+                : LogicalTreeHelper.GetParent(current);
+        }
+        return null;
+    }
 
     private Rect ToDip(PixelRect rect) => new(
         rect.X / PixelScaleX,
@@ -1684,6 +1818,7 @@ public partial class SelectionOverlayWindow : Window
             {
                 return true;
             }
+            if (ReferenceEquals(current, AnnotationTextEditor)) return true;
         }
 
         return false;
@@ -1742,30 +1877,28 @@ public partial class SelectionOverlayWindow : Window
     }
 }
 
-public sealed record OverlayTranslationRequest(long Version, PixelRect Selection);
+public sealed record OverlayTranslationRequest(long Version, PixelRect Selection, CancellationToken Token = default);
 
 public sealed class OverlayTranslationSequencer
 {
-    private long _version;
-    private bool _closed;
+    private readonly UiOperationOwner _operations = new();
 
-    public OverlayTranslationRequest Begin(PixelRect selection)
+    public OverlayTranslationRequest Begin(PixelRect selection, CancellationToken cancellationToken = default)
     {
-        if (_closed) throw new ObjectDisposedException(nameof(OverlayTranslationSequencer));
-        return new OverlayTranslationRequest(++_version, selection);
+        var operation = _operations.Begin(cancellationToken);
+        return new OverlayTranslationRequest(operation.Version, selection, operation.Token);
     }
 
-    public bool IsLatest(long version) => !_closed && version == _version;
+    public bool IsLatest(long version) => _operations.IsCurrent(version);
 
     public void CancelPending()
     {
-        if (!_closed) _version++;
+        _operations.CancelPending();
     }
 
     public void Close()
     {
-        _closed = true;
-        _version++;
+        _operations.Close();
     }
 
     public static PixelRect MapToScreen(PixelRect selection, PixelRect relative) =>
@@ -1779,13 +1912,15 @@ public sealed class TranslationCapture : EventArgs, IDisposable
         Bitmap bitmap,
         PixelRect selection,
         PixelRect? captureBounds = null,
-        TranslationRouteKind route = TranslationRouteKind.LocalLmt)
+        TranslationRouteKind route = TranslationRouteKind.LocalLmt,
+        CancellationToken token = default)
     {
         Version = version;
         Bitmap = bitmap;
         Selection = selection;
         CaptureBounds = captureBounds ?? selection;
         Route = route;
+        Token = token;
     }
 
     public long Version { get; }
@@ -1793,6 +1928,7 @@ public sealed class TranslationCapture : EventArgs, IDisposable
     public PixelRect Selection { get; }
     public PixelRect CaptureBounds { get; }
     public TranslationRouteKind Route { get; }
+    public CancellationToken Token { get; }
     public void Dispose() => Bitmap.Dispose();
 }
 

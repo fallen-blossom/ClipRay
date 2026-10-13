@@ -43,8 +43,9 @@ public static class ScrollCaptureTempStore
                     continue;
                 }
 
-                Directory.Delete(fullPath, recursive: true);
-                deleted++;
+                // Absence of a final marker is not evidence of disposable data.
+                // Crash fragments, legacy sessions and unknown materials stay local.
+                skipped++;
             }
             catch
             {

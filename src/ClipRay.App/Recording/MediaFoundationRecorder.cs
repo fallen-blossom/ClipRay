@@ -6,6 +6,7 @@ namespace ClipRay.App.Recording;
 
 public interface IMediaFoundationRecorder : IAsyncDisposable
 {
+    RecordingStopReport? Report => null;
     Task StartAsync(CancellationToken cancellationToken);
 
     ValueTask WriteVideoAsync(VideoRecordingSample sample);
@@ -15,26 +16,25 @@ public interface IMediaFoundationRecorder : IAsyncDisposable
     Task StopAsync();
 }
 
-public sealed class MediaFoundationRecorder : IMediaFoundationRecorder
+internal sealed class NativeRecordingEncoderBackend : IRecordingEncoderBackend
 {
     private static readonly Guid H264Format = new("34363248-0000-0010-8000-00AA00389B71");
-    private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly RecordingOutputPaths _paths;
     private readonly int _width;
     private readonly int _height;
-    private readonly AudioCaptureFormat _audioFormat;
+    private readonly AudioCaptureFormat? _audioFormat;
     private IMFSinkWriter? _writer;
     private int _videoStream;
     private int _audioStream;
     private int _started;
-    private int _stopped;
+    public bool BeganWriting { get; private set; }
     private bool _mediaFoundationStarted;
 
-    public MediaFoundationRecorder(
+    public NativeRecordingEncoderBackend(
         RecordingOutputPaths paths,
         int width,
         int height,
-        AudioCaptureFormat audioFormat)
+        AudioCaptureFormat? audioFormat)
     {
         if (width < 2 || (width & 1) != 0) throw new ArgumentOutOfRangeException(nameof(width));
         if (height < 2 || (height & 1) != 0) throw new ArgumentOutOfRangeException(nameof(height));
@@ -44,113 +44,47 @@ public sealed class MediaFoundationRecorder : IMediaFoundationRecorder
         _audioFormat = audioFormat;
     }
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    public void Start(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (Interlocked.Exchange(ref _started, 1) != 0) throw new InvalidOperationException("Media Foundation recorder already started.");
         Directory.CreateDirectory(Path.GetDirectoryName(_paths.PartialPath)!);
         using (new FileStream(_paths.PartialPath, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
-        try
-        {
-            RecordingStartupGuard.Execute(RecordingStartupStage.MediaFoundation, () => MediaFactory.MFStartup());
-            _mediaFoundationStarted = true;
-            using var attributes = CreateSinkWriterAttributes();
-            _writer = RecordingStartupGuard.Execute(
-                RecordingStartupStage.Mp4SinkWriter,
-                () => MediaFactory.MFCreateSinkWriterFromURL(_paths.PartialPath, null, attributes));
-            RecordingStartupGuard.Execute(RecordingStartupStage.VideoEncoder, () => ConfigureVideo(_writer));
-            RecordingStartupGuard.Execute(RecordingStartupStage.AudioEncoder, () => ConfigureAudio(_writer));
-            RecordingStartupGuard.Execute(RecordingStartupStage.SinkWriterStart, _writer.BeginWriting);
-            return Task.CompletedTask;
-        }
-        catch
-        {
-            try { _writer?.Dispose(); }
-            catch { /* 清理失败不能覆盖初始化阶段的 HRESULT。 */ }
-            _writer = null;
-            try { ShutdownMediaFoundation(); }
-            catch { /* 同上。 */ }
-            throw;
-        }
+        RecordingStartupGuard.Execute(RecordingStartupStage.MediaFoundation, () => MediaFactory.MFStartup());
+        _mediaFoundationStarted = true;
+        using var attributes = CreateSinkWriterAttributes();
+        _writer = RecordingStartupGuard.Execute(RecordingStartupStage.Mp4SinkWriter,
+            () => MediaFactory.MFCreateSinkWriterFromURL(_paths.PartialPath, null, attributes));
+        RecordingStartupGuard.Execute(RecordingStartupStage.VideoEncoder, () => ConfigureVideo(_writer));
+        if (_audioFormat is not null) RecordingStartupGuard.Execute(RecordingStartupStage.AudioEncoder, () => ConfigureAudio(_writer));
+        RecordingStartupGuard.Execute(RecordingStartupStage.SinkWriterStart, _writer.BeginWriting);
+        BeganWriting = true;
     }
-
-    public ValueTask WriteVideoAsync(VideoRecordingSample sample) => WriteAsync(sample, true);
-
-    public ValueTask WriteAudioAsync(AudioRecordingSample sample) => WriteAsync(sample, false);
-
-    public async Task StopAsync()
+    public void FinalizeEncoding() => _writer!.Finalize();
+    public void ReleaseWriter() { _writer?.Dispose(); _writer = null; }
+    public void Shutdown()
     {
-        if (Interlocked.Exchange(ref _stopped, 1) != 0) return;
-        await _gate.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            if (_writer is null) return;
-            _writer.Finalize();
-            _writer.Dispose();
-            _writer = null;
-            ShutdownMediaFoundation();
-            new RecordingFileMover().Finalize(_paths);
-        }
-        finally
-        {
-            _gate.Release();
-        }
+        if (_writer is not null) throw new InvalidOperationException("Writer still owns Media Foundation.");
+        ShutdownMediaFoundation();
     }
-
-    public async ValueTask DisposeAsync()
+    public void WriteVideo(VideoRecordingSample sample)
     {
-        try
-        {
-            await StopAsync().ConfigureAwait(false);
-        }
-        finally
-        {
-            _writer?.Dispose();
-            _writer = null;
-            ShutdownMediaFoundation();
-            _gate.Dispose();
-        }
+        if (sample.Width != _width || sample.Height != _height || sample.BgraPixels.Length != checked(_width * _height * 4))
+            throw new InvalidOperationException("Video sample dimensions do not match the encoder.");
+        Write(sample.BgraPixels,sample.Timestamp100Nanoseconds,sample.Duration100Nanoseconds,_videoStream);
     }
-
-    private async ValueTask WriteAsync(object recordingSample, bool video)
+    public void WriteAudio(AudioRecordingSample sample)
     {
-        await _gate.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            var writer = _writer ?? throw new InvalidOperationException("Recorder is not running.");
-            byte[] bytes;
-            long timestamp;
-            long duration;
-            if (video)
-            {
-                var sample = (VideoRecordingSample)recordingSample;
-                if (sample.Width != _width || sample.Height != _height || sample.BgraPixels.Length != _width * _height * 4)
-                {
-                    throw new InvalidOperationException("Video sample dimensions do not match the encoder.");
-                }
-                bytes = sample.BgraPixels;
-                timestamp = sample.Timestamp100Nanoseconds;
-                duration = sample.Duration100Nanoseconds;
-            }
-            else
-            {
-                var sample = (AudioRecordingSample)recordingSample;
-                if (sample.SampleRate != _audioFormat.SampleRate || sample.Channels != _audioFormat.Channels || sample.BitsPerSample != _audioFormat.BitsPerSample)
-                {
-                    throw new InvalidOperationException("Audio sample format changed during recording.");
-                }
-                bytes = sample.PcmBytes;
-                timestamp = sample.Timestamp100Nanoseconds;
-                duration = sample.Duration100Nanoseconds;
-            }
-
-            using var mediaSample = CreateSample(bytes, timestamp, duration);
-            writer.WriteSample(video ? _videoStream : _audioStream, mediaSample);
-        }
-        finally
-        {
-            _gate.Release();
-        }
+        if (_audioFormat is null || sample.SampleRate != _audioFormat.SampleRate || sample.Channels != _audioFormat.Channels
+            || sample.BitsPerSample != _audioFormat.BitsPerSample || sample.PcmBytes.Length % _audioFormat.BlockAlign != 0)
+            throw new InvalidOperationException("Audio sample format does not match the encoder.");
+        Write(sample.PcmBytes,sample.Timestamp100Nanoseconds,sample.Duration100Nanoseconds,_audioStream);
+    }
+    private void Write(byte[] bytes,long timestamp,long duration,int stream)
+    {
+        var writer = _writer ?? throw new InvalidOperationException("Recorder is not running.");
+        using var sample = CreateSample(bytes,timestamp,duration);
+        writer.WriteSample(stream,sample);
     }
 
     /// <summary>
@@ -159,20 +93,12 @@ public sealed class MediaFoundationRecorder : IMediaFoundationRecorder
     /// </summary>
     private static readonly Guid EnableHardwareTransforms = new("a634a91c-822b-41b9-a494-4de4643612b0");
 
-    /// <summary>
-    /// 关掉 Sink Writer 节流。默认节流会在写入约 135 帧后把每次 WriteSample 拖成约 1 秒，
-    /// 捕获被饿死、成片退化成十几 fps 的重复帧，停止排空也要等好几秒。
-    /// 采集侧最多按 60fps 实时投喂，编码吸收一帧只要个位数毫秒，因此不需要它的背压。
-    /// </summary>
-    private static readonly Guid DisableThrottling = new("08b845d8-2b74-4afe-9d53-be16d2d5ae4f");
-
-    /// <summary>Creates the sink writer attributes used by every recording.</summary>
+    /// <summary>Keep native backpressure; application queues and held samples are bounded separately.</summary>
     public static IMFAttributes CreateSinkWriterAttributes()
     {
-        var attributes = MediaFactory.MFCreateAttributes(2);
-        attributes.Set(EnableHardwareTransforms, 1u);
-        attributes.Set(DisableThrottling, 1u);
-        return attributes;
+        var attributes = MediaFactory.MFCreateAttributes(1);
+        try { attributes.Set(EnableHardwareTransforms, 1u); return attributes; }
+        catch { attributes.Dispose(); throw; }
     }
 
     private void ConfigureVideo(IMFSinkWriter writer)
@@ -200,6 +126,7 @@ public sealed class MediaFoundationRecorder : IMediaFoundationRecorder
 
     private void ConfigureAudio(IMFSinkWriter writer)
     {
+        if (_audioFormat is null) throw new InvalidOperationException("Audio stream not requested.");
         using var output = MediaFactory.MFCreateMediaType();
         output.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Audio);
         output.Set(MediaTypeAttributeKeys.Subtype, AudioFormatGuids.Aac);
@@ -227,21 +154,16 @@ public sealed class MediaFoundationRecorder : IMediaFoundationRecorder
     private static IMFSample CreateSample(byte[] bytes, long timestamp, long duration)
     {
         var sample = MediaFactory.MFCreateSample();
-        using var buffer = MediaFactory.MFCreateMemoryBuffer(bytes.Length);
-        buffer.Lock(out var pointer, out _, out _);
         try
         {
-            Marshal.Copy(bytes, 0, pointer, bytes.Length);
-            buffer.CurrentLength = bytes.Length;
+            using var buffer = MediaFactory.MFCreateMemoryBuffer(bytes.Length);
+            buffer.Lock(out var pointer, out _, out _);
+            try { Marshal.Copy(bytes,0,pointer,bytes.Length); buffer.CurrentLength = bytes.Length; }
+            finally { buffer.Unlock(); }
+            sample.AddBuffer(buffer); sample.SampleTime = timestamp; sample.SampleDuration = duration;
+            return sample;
         }
-        finally
-        {
-            buffer.Unlock();
-        }
-        sample.AddBuffer(buffer);
-        sample.SampleTime = timestamp;
-        sample.SampleDuration = duration;
-        return sample;
+        catch { sample.Dispose(); throw; }
     }
 
     private static ulong PackRatio(uint numerator, uint denominator) => ((ulong)numerator << 32) | denominator;

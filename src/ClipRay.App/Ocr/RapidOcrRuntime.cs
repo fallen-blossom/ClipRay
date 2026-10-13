@@ -94,7 +94,7 @@ public static class RapidOcrThreadPolicy
     }
 }
 
-internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool useLatinModel = false, int? threadCountOverride = null, bool disableSpinning = false, Action<OcrResult>? observeResult = null) : IOcrRuntime, IOcrWarmup, IDisposable
+internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool useLatinModel = false, int? threadCountOverride = null, bool disableSpinning = true, Action<OcrResult>? observeResult = null) : IOcrRuntime, IOcrWarmup, IDisposable, IAsyncDisposable
 {
     private const string ClassifierName = "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx";
     private const string V5DetectorName = "ch_PP-OCRv5_mobile_det.onnx";
@@ -103,10 +103,14 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
     private string _recognizerModelId = string.Empty;
     private string? _recognizerModelSha256;
     private bool _disposed;
+    private readonly AsyncResourceLifetime _lifetime = new();
 
     public async Task<IReadOnlyList<OcrWord>> RecognizeAsync(Bitmap bitmap, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(bitmap);
+        using var admission = _lifetime.Enter();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        cancellationToken = linked.Token;
         ObjectDisposedException.ThrowIf(_disposed, this);
         cancellationToken.ThrowIfCancellationRequested();
         using var prepared = OcrPolarityPlan.CreatePreparedBitmap(bitmap);
@@ -125,7 +129,13 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
                     (useKoreanSupplement || useLatinModel ? RapidOcrOptions.Default : RapidOcrOptions.PPOCRv6) with { DoAngle = false }),
                 cancellationToken).ConfigureAwait(false);
             observeResult?.Invoke(result);
-            return result.TextBlocks
+            return ConvertResult(result, _recognizerModelId,
+                useLatinModel ? "latin" : useKoreanSupplement ? "korean" : "multilingual", _recognizerModelSha256);
+        }
+        finally { _gate.Release(); }
+    }
+
+    internal static IReadOnlyList<OcrWord> ConvertResult(OcrResult result, string modelId, string script, string? modelHash=null) => result.TextBlocks
                 .Where(static block => !string.IsNullOrWhiteSpace(block.Text))
                 .Select(block =>
                 {
@@ -134,21 +144,16 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
                     var right = block.BoxPoints.Max(static point => point.X);
                     var bottom = block.BoxPoints.Max(static point => point.Y);
                     return new OcrWord(block.Text, new PixelRect(left, top, right - left, bottom - top),
-                        new OcrWordEvidence("rapidocr", _recognizerModelId,
-                            useLatinModel ? "latin" : useKoreanSupplement ? "korean" : "multilingual", null,
-                            _recognizerModelSha256));
+                        new OcrWordEvidence("rapidocr", modelId, script,
+                            OcrQualityPolicy.RawConfidence(block.CharScores), modelHash)) { IsDetectedLine = true };
                 })
                 .ToArray();
-        }
-        finally
-        {
-            _gate.Release();
-        }
-    }
 
     public async Task WarmupAsync(CancellationToken cancellationToken)
     {
-        if (_disposed) return;
+        using var admission = _lifetime.Enter();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        cancellationToken = linked.Token;
         try
         {
             await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -179,8 +184,7 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
         try
         {
             using var sessionOptions = RapidOcr.GetDefaultSessionOptions(
-                threadCountOverride ?? (useLatinModel ? Math.Min(4, RapidOcrThreadPolicy.Select(Environment.ProcessorCount))
-                    : RapidOcrThreadPolicy.Select(Environment.ProcessorCount)));
+                threadCountOverride is { } threads ? Math.Clamp(threads,1,4) : OcrExecutionPolicy.SelectThreads(Environment.ProcessorCount));
             if (disableSpinning)
             {
                 sessionOptions.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
@@ -251,18 +255,8 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _gate.Wait();
-        try
-        {
-            _ocr?.Dispose();
-            _ocr = null;
-        }
-        finally
-        {
-            _gate.Release();
-            _gate.Dispose();
-        }
+        _ = DisposeAsync();
     }
+    public ValueTask DisposeAsync() => new(_lifetime.RetireAsync(() => Task.Run(() =>
+    { _disposed = true; _ocr?.Dispose(); _ocr = null; })));
 }

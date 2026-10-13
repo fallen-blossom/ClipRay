@@ -130,7 +130,8 @@ public static class RecordingBorderProbeStore
         Directory.CreateDirectory(dataRoot);
         var path = Path.Combine(dataRoot, "recording-border-probe.json");
         var json = JsonSerializer.Serialize(diagnostics, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(path, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        if (!new ClipRay.App.Diagnostics.LocalDiagnosticSession(dataRoot).Json(path,diagnostics,append:false))
+            throw new IOException("Diagnostic budget.");
         return path;
     }
 }

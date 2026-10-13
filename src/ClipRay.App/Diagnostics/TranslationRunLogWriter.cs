@@ -13,11 +13,13 @@ public sealed class JsonlTranslationRunLogWriter : ITranslationRunLogWriter
 {
     private readonly object _lock = new();
     private readonly string _diagnosticsRoot;
+    private readonly LocalDiagnosticSession _session;
 
     public JsonlTranslationRunLogWriter(string diagnosticsRoot)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(diagnosticsRoot);
         _diagnosticsRoot = diagnosticsRoot;
+        _session = new(diagnosticsRoot);
     }
 
     public void Write(TranslationRunLog entry)
@@ -31,11 +33,10 @@ public sealed class JsonlTranslationRunLogWriter : ITranslationRunLogWriter
         {
             var fileName = $"translation-{entry.StartedUtc:yyyy-MM-dd}.jsonl";
             var path = Path.Combine(_diagnosticsRoot, fileName);
-            var json = JsonSerializer.Serialize(entry, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            var json = JsonSerializer.SerializeToElement(entry, new JsonSerializerOptions(JsonSerializerDefaults.Web));
             lock (_lock)
             {
-                Directory.CreateDirectory(_diagnosticsRoot);
-                File.AppendAllText(path, json + Environment.NewLine, Encoding.UTF8);
+                _session.Json(path,json);
             }
         }
         catch (IOException)

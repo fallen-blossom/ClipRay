@@ -164,6 +164,8 @@ internal static class LiveRegionValidationTests
         }, TranslationRouteKind.Machine, validateLayoutRegions: true,
             staleWorkerCancelTimeout: TimeSpan.FromMilliseconds(120));
         var running = session.StartAsync(default);
+        try
+        {
         entered.Task.WaitAsync(TimeSpan.FromSeconds(1)).GetAwaiter().GetResult();
         running.WaitAsync(TimeSpan.FromSeconds(1)).GetAwaiter().GetResult();
         using var blocked = Create(_ => Picture(0, 1), (_, _) =>
@@ -175,12 +177,17 @@ internal static class LiveRegionValidationTests
         }
         catch (LiveTranslationPipelineException exception)
             when (exception.Category == "stale-worker-still-running") { }
-        release.TrySetResult();
-        if (!SpinWait.SpinUntil(() => !LiveTranslationWorkerRegistry.HasUnresolvedWorker, 1000))
-            throw new Exception("A completed stale worker remained registered.");
         if (session.State != LiveTranslationSessionState.StoppedAfterConsecutiveFailures
             || session.LastErrorCategory != "stale-worker-cancel-timeout")
             throw new Exception("An uncooperative stale worker blocked the session or allowed overlapping work.");
+        }
+        finally
+        {
+            session.Stop(); release.TrySetResult();
+            running.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+            if (!SpinWait.SpinUntil(() => !LiveTranslationWorkerRegistry.HasUnresolvedWorker, 1000))
+                throw new Exception("A completed stale worker remained registered.");
+        }
     }
 
     public static void ChangedGeometryDoesNotReuseStaleTranslation()
@@ -258,12 +265,21 @@ internal static class LiveRegionValidationTests
         });
         session.FrameReady += (_, _) => published++;
         var running = session.StartAsync(default);
+        var prematurelyEnded = false;
+        try
+        {
         entered.Task.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
         session.Stop();
         Thread.Sleep(180);
-        var prematurelyEnded = running.IsCompleted;
-        finish.SetResult();
-        running.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+        prematurelyEnded = running.IsCompleted;
+        }
+        finally
+        {
+            session.Stop(); finish.TrySetResult();
+            running.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+            if (!SpinWait.SpinUntil(() => !LiveTranslationWorkerRegistry.HasUnresolvedWorker, 1000))
+                throw new Exception("A completed stopped worker remained registered.");
+        }
         if (prematurelyEnded || published != 0) throw new Exception("Stop abandoned a live source or published a late result.");
     }
 

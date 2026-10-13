@@ -41,7 +41,8 @@ internal sealed class LiveTranslationSemanticEvidence
         return true;
     }
 
-    public bool SameSourceStableGeometry(IReadOnlyList<VisualTextRegion> expected)
+    public bool SameSourceStableGeometry(IReadOnlyList<VisualTextRegion> expected,
+        LiveTranslationPixelSnapshot? source = null, LiveTranslationPixelSnapshot? current = null)
     {
         if (expected.Count != _regions.Length) return false;
         var used = new bool[_regions.Length];
@@ -49,7 +50,8 @@ internal sealed class LiveTranslationSemanticEvidence
         {
             var index = -1;
             for (var candidate = 0; candidate < _regions.Length; candidate++)
-                if (!used[candidate] && EquivalentStable(region, _regions[candidate]))
+                if (!used[candidate] && (EquivalentStable(region, _regions[candidate])
+                    || HasUnchangedRegionPixels(region, _regions[candidate], source, current)))
                 {
                     index = candidate;
                     break;
@@ -60,6 +62,10 @@ internal sealed class LiveTranslationSemanticEvidence
         return true;
     }
 
+    public bool SameSourceStableGeometry(LiveTranslationSemanticEvidence expected,
+        LiveTranslationPixelSnapshot? source = null, LiveTranslationPixelSnapshot? current = null) =>
+        SameSourceStableGeometry(expected._regions, source, current);
+
     public bool Matches(InPlaceLayoutItem item)
     {
         var source = item.SourceRegion;
@@ -68,10 +74,12 @@ internal sealed class LiveTranslationSemanticEvidence
             && SamePlace(item.SourceBlock.Bounds, candidate.Bounds));
     }
 
-    public bool MatchesStableGeometry(InPlaceLayoutItem item)
+    public bool MatchesStableGeometry(InPlaceLayoutItem item,
+        LiveTranslationPixelSnapshot? sourcePixels = null, LiveTranslationPixelSnapshot? currentPixels = null)
     {
         var source = item.SourceRegion;
-        if (source is not null) return _regions.Any(candidate => EquivalentStable(source, candidate));
+        if (source is not null) return _regions.Any(candidate => EquivalentStable(source, candidate)
+            || HasUnchangedRegionPixels(source, candidate, sourcePixels, currentPixels));
         return _regions.Any(candidate => TextEquals(item.SourceBlock.Text, candidate.SourceText)
             && StableBounds(item.SourceBlock.Bounds, candidate.Bounds));
     }
@@ -83,6 +91,23 @@ internal sealed class LiveTranslationSemanticEvidence
         && expected.Lines.Zip(current.Lines).All(pair =>
             TextEquals(pair.First.Text, pair.Second.Text)
             && StableBounds(pair.First.Bounds, pair.Second.Bounds));
+
+    private static bool HasUnchangedRegionPixels(VisualTextRegion expected, VisualTextRegion observed,
+        LiveTranslationPixelSnapshot? source, LiveTranslationPixelSnapshot? current)
+    {
+        if (source is null || current is null || source.Width != current.Width
+            || source.Height != current.Height || !Equivalent(expected, observed)) return false;
+        var bounds = Rectangle.FromLTRB(
+            (int)Math.Floor(Math.Min(expected.Bounds.Left, observed.Bounds.Left)),
+            (int)Math.Floor(Math.Min(expected.Bounds.Top, observed.Bounds.Top)),
+            (int)Math.Ceiling(Math.Max(expected.Bounds.Right, observed.Bounds.Right)),
+            (int)Math.Ceiling(Math.Max(expected.Bounds.Bottom, observed.Bounds.Bottom)));
+        // Detector boxes may jitter when video changes elsewhere in the image.
+        // A larger geometry tolerance is safe only when the full union is exact.
+        return bounds.Width > 0 && bounds.Height > 0 && bounds.Left >= 0 && bounds.Top >= 0
+            && bounds.Right <= source.Width && bounds.Bottom <= source.Height
+            && source.CountChangedPixels(current, bounds) == 0;
+    }
 
     private static bool StableBounds(PixelRect expected, PixelRect current) =>
         Math.Abs(expected.Left - current.Left) <= 1

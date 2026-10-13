@@ -12,6 +12,54 @@ using ClipRay.Core.Geometry;
 
 internal static class ScreenshotEvidenceTests
 {
+    public static void RuntimeDataEvidenceRecordsInputsLayoutAndFingerprints()
+    {
+        var root = NewRoot();
+        var previousRoot = Environment.GetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_ROOT");
+        var previousMode = Environment.GetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_MODE");
+        try
+        {
+            Environment.SetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_ROOT", null);
+            Environment.SetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_MODE", null);
+            string directory;
+            using (var trace = ScreenshotTranslationEvidence.StartForRuntime(root,
+                Guid.NewGuid().ToString("N"), DateTimeOffset.UtcNow)!)
+            {
+                directory = trace.DirectoryPath;
+                if (Path.GetDirectoryName(directory) != Path.Combine(root, "screenshot"))
+                    throw new Exception("Normal runtime does not write to its local screenshot diagnostic root.");
+                trace.RecordContext(new { route = "Machine", selection = new { width = 2, height = 2 } });
+                using var source = new Bitmap(2, 2);
+                trace.SaveSource(source);
+                trace.RecordTranslationInputs(TranslationRouteKind.Machine,
+                    [new TranslationRequest("auto", "简体中文", "hello")]);
+                trace.RecordTranslationOutputs(new TranslationBatchOutcome(
+                    [new TranslationResult(true, "你好", "completed")],
+                    new TranslationExecutionTrace(TranslationRouteKind.Machine, 0, 0, 0)));
+                trace.RecordOutcome(new ApplicationTranslationOutcome(true, TranslationPipelineStage.None,
+                    "test", [], [], [], []));
+                trace.RecordOverlayDecision(true, "test-only", 1);
+                trace.SaveRenderedLayer(() => BitmapSource.Create(2, 2, 96, 96,
+                    PixelFormats.Bgra32, null, new byte[16], 8));
+            }
+            using var manifest = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "manifest.json")));
+            if (!manifest.RootElement.GetProperty("complete").GetBoolean()
+                || manifest.RootElement.GetProperty("schema_version").GetString() != ScreenshotTranslationEvidence.DataSchemaVersion
+                || Directory.EnumerateFiles(directory, "*.png").Any())
+                throw new Exception("Normal screenshot data evidence persists images or loses a required stage.");
+            var events = File.ReadAllLines(Path.Combine(directory, "events.jsonl"));
+            if (!events.Any(e => e.Contains("source_frame_fingerprint"))
+                || !events.Any(e => e.Contains("rendered_layer_fingerprint"))
+                || !events.Any(e => e.Contains("translation_inputs")) || !events.Any(e => e.Contains("pipeline_outcome")))
+                throw new Exception("Normal data evidence lost source, translation or layout projection.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_ROOT", previousRoot);
+            Environment.SetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_MODE", previousMode);
+        }
+    }
+
     public static void ScreenshotSwitchIsIndependentOfLiveTrace()
     {
         var oldScreenshot = Environment.GetEnvironmentVariable("CLIPRAY_SCREENSHOT_EVIDENCE_ROOT");

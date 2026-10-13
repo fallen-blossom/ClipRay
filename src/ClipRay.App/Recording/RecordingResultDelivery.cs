@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using ClipRay.App.Capture;
 using ClipRay.App.Settings;
 using MediaBrushes = System.Windows.Media.Brushes;
 using MediaColor = System.Windows.Media.Color;
@@ -20,19 +21,8 @@ public sealed class WindowsRecordingFileClipboard : IRecordingFileClipboard
 {
     public void SetFile(string path)
     {
-        var files = new StringCollection { Path.GetFullPath(path) };
-        for (var attempt = 0; ; attempt++)
-        {
-            try
-            {
-                System.Windows.Forms.Clipboard.SetFileDropList(files);
-                return;
-            }
-            catch (ExternalException) when (attempt < 4)
-            {
-                Thread.Sleep(25 * (attempt + 1));
-            }
-        }
+        if (!SavedMediaFile.IsRegularLocalFile(path)) throw new FileNotFoundException("Recording file is unavailable.", path);
+        MediaClipboardPublisher.Publish(MediaClipboardDataFactory.CreateFile(path));
     }
 }
 
@@ -54,11 +44,37 @@ public static class RecordingResultDelivery
     }
 }
 
+internal interface IRecordingPreviewPlayback
+{
+    TimeSpan Position { get; set; }
+    TimeSpan NaturalDuration { get; }
+    void Play();
+    void Pause();
+    void Close();
+}
+
+internal sealed class MediaElementRecordingPlayback(MediaElement media) : IRecordingPreviewPlayback
+{
+    public TimeSpan Position { get => media.Position; set => media.Position = value; }
+    public TimeSpan NaturalDuration => media.NaturalDuration.HasTimeSpan ? media.NaturalDuration.TimeSpan : TimeSpan.Zero;
+    public void Play() => media.Play();
+    public void Pause() => media.Pause();
+    public void Close() => media.Close();
+}
+
 public sealed class RecordingPreviewWindow : Window
 {
+    private string? _retiringMessage;
+    internal bool ClosedForDelivery => _closed;
+    internal void MarkRetiring(string message)
+    {
+        if (_closed || !_pending) return;
+        _retiringMessage = message; _status.Text = message;
+    }
     private readonly string _interfaceLanguage;
     private readonly string _path;
     private readonly MediaElement _media;
+    private readonly IRecordingPreviewPlayback _playback;
     private readonly Slider _seek;
     private readonly TextBlock _time;
     private readonly TextBlock _status;
@@ -71,6 +87,7 @@ public sealed class RecordingPreviewWindow : Window
     private bool _playing;
     private bool _copied;
     private bool _scrubbing;
+    private bool _syncingSeek;
     private bool _resumeAfterScrub;
 
     public bool LoadCompleted { get; private set; }
@@ -81,7 +98,7 @@ public sealed class RecordingPreviewWindow : Window
     public bool SeekEnabled => _seek.IsEnabled;
     public bool IsPending => _pending;
 
-    /// <summary>最近一次拖动换算出的成片位置；null 表示还没有拖动过。</summary>
+    /// <summary>最近一次用户进度操作换算出的成片位置；null 表示还没有跳转过。</summary>
     public TimeSpan? LastScrubTarget { get; private set; }
 
     public RecordingPreviewWindow(
@@ -90,6 +107,17 @@ public sealed class RecordingPreviewWindow : Window
         bool initiallyCopied = false,
         bool pending = false,
         string interfaceLanguage = "zh-CN")
+        : this(path, clipboard, initiallyCopied, pending, interfaceLanguage, null)
+    {
+    }
+
+    internal RecordingPreviewWindow(
+        string path,
+        IRecordingFileClipboard? clipboard,
+        bool initiallyCopied,
+        bool pending,
+        string interfaceLanguage,
+        IRecordingPreviewPlayback? playback)
     {
         _interfaceLanguage = AppInterfaceLanguage.Normalize(interfaceLanguage);
         _copied = initiallyCopied;
@@ -119,6 +147,7 @@ public sealed class RecordingPreviewWindow : Window
             Stretch = Stretch.Uniform,
             ScrubbingEnabled = true,
         };
+        _playback = playback ?? new MediaElementRecordingPlayback(_media);
         _seek = new Slider
         {
             Minimum = 0,
@@ -136,7 +165,9 @@ public sealed class RecordingPreviewWindow : Window
             new System.Windows.Controls.Primitives.DragCompletedEventHandler(OnScrubCompleted));
         _seek.ValueChanged += (_, _) =>
         {
+            if (_syncingSeek) return;
             if (_scrubbing) UpdateTimeText();
+            else SeekToSliderPosition();
         };
         _time = new TextBlock
         {
@@ -159,7 +190,7 @@ public sealed class RecordingPreviewWindow : Window
             if (_pending)
             {
                 var seconds = (DateTime.UtcNow - _pendingSince).TotalSeconds;
-                _status.Text = T($"正在保存录屏…已用 {seconds:F1} 秒", $"Saving recording… {seconds:F1} s elapsed");
+                _status.Text = _retiringMessage ?? T($"正在保存录屏…已用 {seconds:F1} 秒", $"Saving recording… {seconds:F1} s elapsed");
                 return;
             }
             SyncTransport();
@@ -169,12 +200,12 @@ public sealed class RecordingPreviewWindow : Window
         {
             if (_playing)
             {
-                _media.Pause();
+                _playback.Pause();
                 toggle.Content = T("播放", "Play");
             }
             else
             {
-                _media.Play();
+                _playback.Play();
                 toggle.Content = T("暂停", "Pause");
             }
             _playing = !_playing;
@@ -234,7 +265,7 @@ public sealed class RecordingPreviewWindow : Window
         {
             if (_media.Source is not null)
             {
-                _media.Play();
+                _playback.Play();
                 _playing = true;
             }
             _progress.Start();
@@ -243,9 +274,9 @@ public sealed class RecordingPreviewWindow : Window
         {
             LoadCompleted = true;
             MediaOpenedSuccessfully = true;
-            _media.Play();
+            _playback.Play();
             _playing = true;
-            _seek.IsEnabled = true;
+            _seek.IsEnabled = MediaDuration > TimeSpan.Zero;
             SyncTransport();
             _progress.Start();
             _status.Text = _copied
@@ -254,8 +285,8 @@ public sealed class RecordingPreviewWindow : Window
         };
         _media.MediaEnded += (_, _) =>
         {
-            _media.Position = TimeSpan.Zero;
-            _media.Play();
+            _playback.Position = TimeSpan.Zero;
+            _playback.Play();
             SyncTransport();
         };
         _media.MediaFailed += (_, _) =>
@@ -271,7 +302,7 @@ public sealed class RecordingPreviewWindow : Window
         {
             _closed = true;
             _progress.Stop();
-            _media.Close();
+            _playback.Close();
         };
     }
 
@@ -282,12 +313,14 @@ public sealed class RecordingPreviewWindow : Window
         _pending = false;
         _copied |= copied;
         _duration = RecordingMediaProbe.TryReadDuration(_path) ?? TimeSpan.Zero;
-        _seek.Maximum = _duration.TotalSeconds;
+        _syncingSeek = true;
+        try { _seek.Maximum = _duration.TotalSeconds; }
+        finally { _syncingSeek = false; }
         _transportActions.IsEnabled = true;
         _transportActions.Visibility = Visibility.Visible;
         _status.Text = T("正在载入录屏…", "Loading recording…");
         _media.Source = new Uri(_path);
-        _media.Play();
+        _playback.Play();
         _playing = true;
         _progress.Start();
     }
@@ -307,13 +340,13 @@ public sealed class RecordingPreviewWindow : Window
     private TimeSpan MediaDuration =>
         _duration > TimeSpan.Zero
             ? _duration
-            : _media.NaturalDuration.HasTimeSpan ? _media.NaturalDuration.TimeSpan : TimeSpan.Zero;
+            : _playback.NaturalDuration;
 
     private void OnScrubStarted(object sender, System.Windows.Controls.Primitives.DragStartedEventArgs args)
     {
         _scrubbing = true;
         _resumeAfterScrub = _playing;
-        _media.Pause();
+        _playback.Pause();
         _playing = false;
         _progress.Stop();
     }
@@ -321,31 +354,40 @@ public sealed class RecordingPreviewWindow : Window
     private void OnScrubCompleted(object sender, System.Windows.Controls.Primitives.DragCompletedEventArgs args)
     {
         _scrubbing = false;
-        var duration = MediaDuration;
-        var fraction = _seek.Maximum > 0 ? _seek.Value / _seek.Maximum : 0d;
-        var target = RecordingPreviewTransport.PositionFromFraction(fraction, duration);
-        LastScrubTarget = target;
-        if (duration > TimeSpan.Zero) _media.Position = target;
-        UpdateTimeText(target);
+        SeekToSliderPosition();
         if (_resumeAfterScrub)
         {
-            _media.Play();
+            _playback.Play();
             _playing = true;
             _progress.Start();
         }
         _resumeAfterScrub = false;
     }
 
+    private void SeekToSliderPosition()
+    {
+        var duration = MediaDuration;
+        if (duration <= TimeSpan.Zero) return;
+        var fraction = _seek.Maximum > 0 ? _seek.Value / _seek.Maximum : 0d;
+        var target = RecordingPreviewTransport.PositionFromFraction(fraction, duration);
+        LastScrubTarget = target;
+        _playback.Position = target;
+        UpdateTimeText(target);
+    }
+
     private void SyncTransport()
     {
         var duration = MediaDuration;
         if (duration <= TimeSpan.Zero) return;
-        if (Math.Abs(_seek.Maximum - duration.TotalSeconds) > 0.001) _seek.Maximum = duration.TotalSeconds;
-        if (!_scrubbing)
+        _syncingSeek = true;
+        try
         {
-            _seek.Value = RecordingPreviewTransport.FractionFromPosition(_media.Position, duration) * _seek.Maximum;
+            if (Math.Abs(_seek.Maximum - duration.TotalSeconds) > 0.001) _seek.Maximum = duration.TotalSeconds;
+            if (!_scrubbing)
+                _seek.Value = RecordingPreviewTransport.FractionFromPosition(_playback.Position, duration) * _seek.Maximum;
         }
-        UpdateTimeText(_media.Position);
+        finally { _syncingSeek = false; }
+        UpdateTimeText(_playback.Position);
     }
 
     private void UpdateTimeText() => UpdateTimeText(RecordingPreviewTransport.PositionFromFraction(

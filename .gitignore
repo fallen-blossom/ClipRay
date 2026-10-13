@@ -33,6 +33,8 @@
 **/*.suo
 **/*.log
 **/*.tmp
+**/__pycache__/
+**/*.pyc
 **/.env
 **/.env.*
 

@@ -7,7 +7,8 @@ namespace ClipRay.App.Overlay;
 public static class OverlayInputPolicy
 {
     public static bool ShouldBeginEdit(EditTool tool, bool isResizeHandle, bool isInsideSelection) =>
-        tool is EditTool.Pen or EditTool.Mosaic or EditTool.Picker
+        tool is EditTool.Pen or EditTool.Mosaic or EditTool.Picker or EditTool.Arrow or EditTool.Line
+            or EditTool.Rectangle or EditTool.Ellipse or EditTool.Circle or EditTool.Text
         && !isResizeHandle
         && isInsideSelection;
 }

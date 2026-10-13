@@ -76,8 +76,18 @@ public sealed class RecordingControlWindow : Window
         var size = new System.Drawing.Size((int)Math.Ceiling(ActualWidth * scale.M11), (int)Math.Ceiling(ActualHeight * scale.M22));
         var placement = ScrollCapturePlacementPolicy.Place(region, size, Forms.Screen.AllScreens.Select(static screen => screen.WorkingArea).ToArray());
         if (placement is null) return false;
-        return SetWindowPos(new WindowInteropHelper(this).Handle, IntPtr.Zero, placement.Value.Bounds.X, placement.Value.Bounds.Y, 0, 0, 0x0001);
+        var handle = new WindowInteropHelper(this).Handle;
+        if (!SetWindowPos(handle, IntPtr.Zero, placement.Value.Bounds.X, placement.Value.Bounds.Y, 0, 0, 0x0001)
+            || !GetWindowRect(handle,out var actual)) return false;
+        return actual.Right > actual.Left && actual.Bottom > actual.Top
+            && !region.IntersectsWith(System.Drawing.Rectangle.FromLTRB(actual.Left,actual.Top,actual.Right,actual.Bottom));
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowRectangle { public int Left,Top,Right,Bottom; }
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(IntPtr window,out WindowRectangle rectangle);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

@@ -31,9 +31,11 @@
 ```powershell
 dotnet restore ClipRay.sln --configfile NuGet.Config --source https://api.nuget.org/v3/index.json --locked-mode
 dotnet build ClipRay.sln -c Release --no-restore
-dotnet run --project tests/ClipRay.Core.Tests -c Release --no-build --no-restore
-dotnet run --project tests/ClipRay.App.Tests -c Release --no-build --no-restore
+./tests/Run-BackgroundTests.ps1 -SkipBuild
+./tests/Run-BackgroundTests.ps1 -SkipBuild -CollectOnly
 ```
+
+后台检查逐组运行九个阶段、Stage7 返修组和 Core.Tests，使用注入依赖、离屏窗口和独立临时文件；集合输出不执行测试。App.Tests 无参数、未知参数或未知用例返回 2；完整历史用例只能显式选择 `--legacy-all-tests`，其中包含实际系统入口，不能当作后台检查。故意失败用例只由 `-FailureSentinel` 选择，并将失败退出码传给调用方。
 
 开始录屏快捷键为 `Ctrl+Win+Z`。自动测试不代表前台录屏或翻译质量已经验收；前台检查应另外记录实际版本、动作和结果。
 
@@ -44,7 +46,11 @@ dotnet run --project tests/ClipRay.App.Tests -c Release --no-build --no-restore
 ./scripts/Build-Installer.ps1 -Flavor Full -IsccPath '<你的 ISCC.exe 路径>' -KeepStaging
 ```
 
-安装器应从没有 tracked 改动的确定提交构建。公开源码由 `Export-PublicSource.ps1` 从同一个提交导出，文件选择见 `scripts/public-source-paths.txt`；不复制本机未跟踪文件、缓存或私人开发记录。`SOURCE-REVISION.txt` 记录对应提交。
+安装器应从没有 tracked 改动和 untracked 输入的确定提交构建。公开源码由 `Export-PublicSource.ps1` 从同一个提交导出，文件选择见 `scripts/public-source-paths.txt`；不复制本机未跟踪文件、缓存或私人开发记录。`SOURCE-REVISION.txt` 记录对应提交。
+
+安装器默认 `Lite`，`-Flavor Full` 显式保留完整载荷。真正发布必须使用新空目录，版本标识为 `1.0.6+<完整 commit>`。`release-identity.json` 记录 schema、commit、AppInformationalVersion、flavor、win-x64、自包含状态及完整文件的相对路径、大小和 SHA256；复用 `-PreparedStaging` 时先校验这些原记录，缺失、额外或变更文件一律拒绝，不重写旧 manifest 使其通过。`release-manifest.json` 保留原来的扁平数组；这两个根 metadata 文件不参与 payload 的自引用 hash，identity 另记录 flat manifest 的 hash。安装映射为 `licenses/*` → `{app}/licenses/*`，其他 payload → `{app}/app/*`。
+
+`Publish-Local.ps1 -SkipPublish` 只处理快捷方式，不证明真正发布的身份。旧 DLL-only 录屏诊断补丁已停用，旧 `DisplayVersion=1.0.2` 不能证明兼容，需完整升级。卸载仅请求准确安装路径的实例正常收尾；旧协议、取消、超时或无法核实退出时停止并提示手动退出，不按名称强杀同名程序。自动清理默认关闭，只回收有保存完成证明且超过保留期的成品；历史、未完成和恢复材料保留，逐项结果可在设置的最近清理提示中查看。
 
 升级 SDK 或依赖后，先对试构建的发布目录运行 `scripts/Collect-PackageNotices.ps1 -PackageCacheRoot '<NuGet 缓存目录>' -PublishedPayloadRoot '<发布目录>'`，收集实际版本的原始许可，再提交这些文件。安装器会检查实际随包运行时的许可记录，避免只更新 DLL、遗漏新版通知。
 

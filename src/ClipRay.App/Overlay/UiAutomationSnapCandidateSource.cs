@@ -13,17 +13,9 @@ public sealed class UiAutomationSnapCandidateSource : IUiElementCandidateSource
         try
         {
             var current = AutomationElement.FromHandle(rootWindow);
-            var hierarchy = new List<PixelRect>();
-            if (TryGetVisibleBounds(current, out var rootBounds)) hierarchy.Add(rootBounds);
-
-            while (FindContainingChild(current, point) is { } child)
-            {
-                current = child;
-                if (TryGetVisibleBounds(current, out var bounds)) hierarchy.Add(bounds);
-            }
-
-            hierarchy.Reverse();
-            return hierarchy;
+            var walker=TreeWalker.ControlViewWalker;
+            return CollectHierarchy(current,point,walker.GetFirstChild,walker.GetNextSibling,
+                element=>TryGetVisibleBounds(element,out var bounds)?bounds:null);
         }
         catch (Exception exception) when (exception is ElementNotAvailableException
             or InvalidOperationException
@@ -33,20 +25,23 @@ public sealed class UiAutomationSnapCandidateSource : IUiElementCandidateSource
         }
     }
 
-    private static AutomationElement? FindContainingChild(AutomationElement parent, Point point)
+    internal static IReadOnlyList<PixelRect> CollectHierarchy<T>(T root,Point point,Func<T,T?> firstChild,Func<T,T?> nextSibling,
+        Func<T,PixelRect?> visibleBounds,int nodeBudget=128,int depthBudget=32) where T:class
     {
-        var walker = TreeWalker.ControlViewWalker;
-        for (var child = walker.GetFirstChild(parent); child is not null; child = walker.GetNextSibling(child))
+        var hierarchy=new List<PixelRect>();var current=root;var remaining=nodeBudget;
+        if(visibleBounds(root) is { } rootBounds)hierarchy.Add(rootBounds);
+        for(var depth=0;depth<depthBudget&&remaining>0;depth++)
         {
-            if (TryGetVisibleBounds(child, out var bounds)
-                && point.X >= bounds.Left && point.X <= bounds.Right
-                && point.Y >= bounds.Top && point.Y <= bounds.Bottom)
+            T? containing=null;
+            for(var child=firstChild(current);child is not null&&remaining-->0;child=remaining>0?nextSibling(child):null)
             {
-                return child;
+                if(visibleBounds(child) is { } bounds&&point.X>=bounds.Left&&point.X<=bounds.Right&&point.Y>=bounds.Top&&point.Y<=bounds.Bottom)
+                {containing=child;hierarchy.Add(bounds);break;}
             }
+            if(containing is null)break;
+            current=containing;
         }
-
-        return null;
+        hierarchy.Reverse();return hierarchy;
     }
 
     private static bool TryGetVisibleBounds(AutomationElement element, out PixelRect bounds)

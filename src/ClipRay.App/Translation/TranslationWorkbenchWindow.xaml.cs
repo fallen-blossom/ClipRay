@@ -5,6 +5,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Media;
 using System.Windows.Input;
 using ClipRay.App.Overlay;
+using ClipRay.App.Capture;
 using Button = System.Windows.Controls.Button;
 using Brushes = System.Windows.Media.Brushes;
 
@@ -446,8 +447,8 @@ public partial class TranslationWorkbenchWindow : Window
     private void Copy(string text, string? status = null)
     {
         if (string.IsNullOrEmpty(text)) return;
-        try { _copy(text); StatusText.Text = status ?? T("译文已复制。"); }
-        catch { StatusText.Text = T("剪贴板暂不可用，请重试。"); }
+        StatusText.Text = TextClipboardPublisher.TryCopy(text, _copy) == TextCopyResult.Copied
+            ? status ?? T("译文已复制。") : T("剪贴板暂不可用，请重试。");
     }
 
     private void ExportClick(object sender, RoutedEventArgs e)

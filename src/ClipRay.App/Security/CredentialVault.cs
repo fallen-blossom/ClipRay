@@ -135,23 +135,17 @@ public sealed class CredentialVault : ICredentialVault
         var existingFixed = GetForUse(FixedDeepSeekSlot);
         if (!string.IsNullOrWhiteSpace(existingFixed))
         {
-            Delete(selectedName);
-            return true;
+            // A different (or equal) existing slot is not proof that this selection
+            // was migrated. Keep both identities and the caller's current selection.
+            return false;
         }
         var selected = GetForUse(selectedName);
         if (string.IsNullOrWhiteSpace(selected)) return false;
 
         Save(FixedDeepSeekSlot, "DeepSeek", selected);
-        try
-        {
-            Delete(selectedName);
-            return true;
-        }
-        catch
-        {
-            Delete(FixedDeepSeekSlot);
-            throw;
-        }
+        // Keep the old slot until selection persistence is known to have succeeded.
+        // A failed settings write can safely reopen the original selected identity.
+        return true;
     }
 
     public IReadOnlyList<string> DeleteAllClipRayCredentials()

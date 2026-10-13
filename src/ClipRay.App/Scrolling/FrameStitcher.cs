@@ -47,10 +47,11 @@ public sealed class FrameStitcher
         {
             return new FrameStitchResult(FrameStitchDisposition.Repeated, next.Height, 1);
         }
-        if (IsNearRepeated(earlierPixels, nextPixels, cancellationToken))
+        if (IsNearRepeated(earlierPixels, nextPixels, cancellationToken, out var changedNearFrame))
         {
             return new FrameStitchResult(FrameStitchDisposition.Repeated, next.Height, 0.99);
         }
+        if (changedNearFrame) return FrameStitchResult.LowConfidence;
 
         var maximum = Math.Min(_maximumOverlapRows, Math.Min(earlier.Height, next.Height));
         var candidates = new List<int>();
@@ -124,24 +125,34 @@ public sealed class FrameStitcher
         return true;
     }
 
-    private static bool IsNearRepeated(Pixels earlier, Pixels next, CancellationToken cancellationToken)
+    private static bool IsNearRepeated(Pixels earlier, Pixels next, CancellationToken cancellationToken, out bool changedNearFrame)
     {
+        changedNearFrame=false;
         if (earlier.Width != next.Width || earlier.Height != next.Height) return false;
-        var margin = Math.Min(earlier.Width / 3, Math.Max(24, earlier.Width / 10));
-        var yStep = Math.Max(1, earlier.Height / 120);
-        var xStep = Math.Max(1, Math.Max(1, earlier.Width - margin * 2) / 64);
+        // A blank center cannot witness unchanged edge text. Confirm the whole
+        // frame and local columns; slight dispersed noise remains tolerated.
+        var bandWidth = Math.Max(8, earlier.Width / 32);
+        var bandDifferences = new long[(earlier.Width + bandWidth - 1) / bandWidth];
+        var bandSamples = new long[bandDifferences.Length];
         long difference = 0;
         long samples = 0;
-        for (var y = 0; y < earlier.Height; y += yStep)
+        var distinctPixel=false;
+        for (var y = 0; y < earlier.Height; y++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            for (var x = margin; x < earlier.Width - margin; x += xStep)
+            for (var x = 0; x < earlier.Width; x++)
             {
-                difference += earlier.DifferenceAt(next, x, y, y);
+                var delta = earlier.DifferenceAt(next, x, y, y);
+                if (delta > 12 || (earlier.BytesPerPixel == 4 && earlier.Bytes[y*earlier.Stride+x*4+3] != next.Bytes[y*next.Stride+x*4+3])) distinctPixel=true;
+                difference += delta;
                 samples += 3;
+                bandDifferences[x/bandWidth] += delta;
+                bandSamples[x/bandWidth] += 3;
             }
         }
-        return difference / (double)Math.Max(1, samples) < 0.25;
+        var near = difference / (double)Math.Max(1, samples) < 0.25;
+        changedNearFrame = near && (distinctPixel || bandDifferences.Select((value,index) => value / (double)Math.Max(1,bandSamples[index])).Any(mean => mean >= 1));
+        return near && !changedNearFrame;
     }
 
     private FrameStitchResult AnalyzeRowRuns(Pixels earlier, Pixels next, CancellationToken cancellationToken)
@@ -288,7 +299,7 @@ public sealed class FrameStitcher
         }
     }
 
-    private static void CopyRows(Bitmap source, int sourceY, Bitmap destination, int destinationY, int rows)
+    internal static void CopyRows(Bitmap source, int sourceY, Bitmap destination, int destinationY, int rows)
     {
         if (rows == 0) return;
         var sourceData = source.LockBits(new Rectangle(0, sourceY, source.Width, rows), ImageLockMode.ReadOnly, source.PixelFormat);

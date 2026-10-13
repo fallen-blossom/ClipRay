@@ -14,7 +14,8 @@ public interface ISettingsStore
     void Save(AppSettings settings);
 }
 
-public sealed record SettingsLoadResult(AppSettings Settings, string? Warning, bool RequiresSave = false);
+public sealed record SettingsLoadResult(AppSettings Settings, string? Warning, bool RequiresSave = false,
+    bool PreserveOriginalFile = false);
 
 public static class ExternalSettingsReconciler
 {
@@ -67,16 +68,21 @@ public sealed class SettingsStore : ISettingsStore
         {
             return new SettingsLoadResult(
                 AppSettings.CreateDefault(_workspaceRoot, _windowsUiCultureName()),
-                "设置文件无效，已使用默认设置。");
+                "设置文件无效，已使用默认设置。原文件已保留，修正后可在设置中保存。", PreserveOriginalFile: true);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return new SettingsLoadResult(AppSettings.CreateDefault(_workspaceRoot, _windowsUiCultureName()),
+                $"无法读取设置文件（错误 0x{unchecked((uint)exception.HResult):X8}）；已使用默认设置，原文件未更改。", PreserveOriginalFile: true);
         }
     }
 
     private SettingsLoadResult LoadResult()
     {
-        if (!File.Exists(_path))
-            return new SettingsLoadResult(AppSettings.CreateDefault(_workspaceRoot, _windowsUiCultureName()), null);
-
-        var json = File.ReadAllText(_path);
+        string json;
+        try { json = File.ReadAllText(_path); }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        { return new SettingsLoadResult(AppSettings.CreateDefault(_workspaceRoot, _windowsUiCultureName()), null); }
         using var document = JsonDocument.Parse(json);
         var hasMachineFallbackChoice = document.RootElement.TryGetProperty(
             nameof(AppSettings.MachineTranslationFallbackEnabled),
@@ -153,6 +159,7 @@ public sealed class SettingsStore : ISettingsStore
         InvalidDataException or
         InvalidOperationException or
         FormatException or
+        ArgumentException or
         NotSupportedException;
 }
 
