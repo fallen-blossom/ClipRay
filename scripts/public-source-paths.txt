@@ -28,3 +28,4 @@ docs/CLI.zh-CN.md
 docs/prototypes/translation-workbench.html
 docs/release/RELEASE-NOTES.zh-CN.md
 docs/release/1.0.6-preview.3.zh-CN.md
+docs/release/1.0.6-preview.4.zh-CN.md

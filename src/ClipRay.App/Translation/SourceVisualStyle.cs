@@ -109,15 +109,41 @@ public static class SourceVisualStyleEstimator
         Bitmap source,
         OcrTextBlock block,
         IReadOnlyList<OcrTextBlock> siblingBlocks,
+        Color backing) => EstimateCore(source, block, siblingBlocks, backing, out _, out _);
+
+    internal static SourceVisualStyle EstimateWordStyle(
+        Bitmap source,
+        OcrTextBlock block,
+        IReadOnlyList<OcrTextBlock> siblingBlocks,
         Color backing)
+    {
+        var style = EstimateCore(source, block, siblingBlocks, backing, out var candidates, out var localBacking);
+        var isItalic = CanCheckWordItalic(block, style, backing)
+            && HasConsistentWordItalic(localBacking.ToArgb() == backing.ToArgb()
+                ? candidates : ReadCandidates(source, block.Bounds, backing), block, style, backing);
+        return style with { IsItalic = isItalic, RotationDegrees = 0 };
+    }
+
+    private static SourceVisualStyle EstimateCore(
+        Bitmap source,
+        OcrTextBlock block,
+        IReadOnlyList<OcrTextBlock> siblingBlocks,
+        Color backing,
+        out List<InkPixel> candidates,
+        out Color sampledBacking)
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(block);
         ArgumentNullException.ThrowIfNull(siblingBlocks);
 
         var matureColors = MortSourceColorAdapter.Analyze(source, block);
-        var localBacking = matureColors.Success ? matureColors.Background : backing;
-        var candidates = ReadCandidates(source, block.Bounds, localBacking);
+        // Tight OCR boxes can put a dense stem on every sampled inner edge.
+        // Do not let that reverse foreground/background against the independently
+        // sampled backing outside the text rectangle.
+        var localBacking = matureColors.Success && ColorDistance(matureColors.Background,backing)<=24
+            ? matureColors.Background : backing;
+        sampledBacking = localBacking;
+        candidates = ReadCandidates(source, block.Bounds, localBacking);
         var alignment = EstimateAlignment(block, siblingBlocks);
         var fontCategory = EstimateFontCategory(block);
         if (candidates.Count == 0)
@@ -141,15 +167,13 @@ public static class SourceVisualStyleEstimator
             .OrderByDescending(static group => group.Count())
             .ThenByDescending(static group => group.Average(static pixel => pixel.Distance))
             .First().First().Color;
-        // Use the retained upstream clustering result only when it observed real
-        // supported source ink. A black/white readability fallback is not a color
-        // sample and must not overwrite a low-contrast or multicolor source.
-        if (matureColors.Success && !matureColors.UsedFontFallback
-            && matureColors.ForegroundWordSupport > 0 && !ambiguousForeground)
-            foreground = matureColors.Font;
-        var stable = candidates
-            .Where(pixel => ColorDistance(pixel.Color, foreground) <= 56)
-            .ToArray();
+        // Upstream's population/word-support winner can be an antialiased
+        // edge shade present in every word, rather than the source paint color.
+        // Keep its useful background estimate, but derive ink from supported
+        // local cores. Geometry includes their same-hue coverage ramp: measuring
+        // only pixels close to an edge shade drops dark stems and fine endpoints.
+        var stable = candidates.Where(pixel => !IsMateriallyDifferentHue(
+            foreground,pixel.Color,localBacking)).ToArray();
         if (stable.Length < 4) stable = foregroundSeed;
 
         var minX = stable.Min(static pixel => pixel.X);
@@ -161,12 +185,24 @@ public static class SourceVisualStyleEstimator
         var glyphHeight = EstimateTypicalGlyphHeight(
             stable, block.Bounds.Height, geometryHeight, block.Words.Count > 0);
         var blockArea = Math.Max(1, block.Bounds.Width * block.Bounds.Height);
-        var inkCoverage = stable.Length / blockArea;
-        var weight = inkCoverage >= 0.32
-            ? SourceFontWeight.Bold
-            : inkCoverage >= 0.18
-                ? SourceFontWeight.SemiBold
-                : SourceFontWeight.Normal;
+        var foregroundDistance=Math.Max(1,ColorDistance(foreground,localBacking));
+        var inkCoverage = stable.Sum(pixel=>Math.Min(1,pixel.Distance/foregroundDistance)) / blockArea;
+        var sourceSize=glyphHeight / TranslationTextLayoutPolicy.MeasureSourceInkRatio(block.Text, fontCategory);
+        var weight = inkCoverage >= 0.32 ? SourceFontWeight.Bold
+            : inkCoverage >= 0.18 ? SourceFontWeight.SemiBold : SourceFontWeight.Normal;
+        if(block.Words.Count>0 && block.Text.Any(char.IsLetterOrDigit))
+        {
+            // Area / OCR-box area confuses dense glyphs (a, an, I) with bold.
+            // Compare coverage with the SAME normal glyphs at the measured scale
+            // instead. Antialiased coverage counts fractionally, not as solid ink.
+            var expectedArea=NormalGlyphArea(block.Text,fontCategory,sourceSize);
+            if(expectedArea>0)
+            {
+                var density=inkCoverage*blockArea/expectedArea;
+                weight=density>=1.45 ? SourceFontWeight.Bold
+                    : density>=1.18 ? SourceFontWeight.SemiBold : SourceFontWeight.Normal;
+            }
+        }
         var spread = foregroundSeed.Average(pixel => ColorDistance(pixel.Color, foreground));
         var confidence = ambiguousForeground || spread > 48
             ? VisualStyleConfidence.Low
@@ -186,7 +222,75 @@ public static class SourceVisualStyleEstimator
             alignment,
             rotation,
             confidence,
-            glyphHeight / TranslationTextLayoutPolicy.MeasureSourceInkRatio(block.Text, fontCategory));
+            sourceSize);
+    }
+
+    internal static bool HasConsistentWordItalic(Bitmap source,OcrTextBlock block,
+        SourceVisualStyle style,Color backing)
+    {
+        if (!CanCheckWordItalic(block, style, backing)) return false;
+        return HasConsistentWordItalic(ReadCandidates(source, block.Bounds, backing), block, style, backing);
+    }
+
+    private static bool CanCheckWordItalic(OcrTextBlock block, SourceVisualStyle style, Color backing) =>
+        style.Confidence == VisualStyleConfidence.High && block.Text.Any(char.IsLetter)
+        && style.GlyphHeightPixels >= 6 && ColorDistance(style.ForegroundColor, backing) >= MinimumInkDistance;
+
+    private static bool HasConsistentWordItalic(IReadOnlyList<InkPixel> candidates, OcrTextBlock block,
+        SourceVisualStyle style, Color backing)
+    {
+        var contrast=ColorDistance(style.ForegroundColor,backing);
+        var ink=candidates
+            .Where(pixel=>pixel.Distance>=contrast*.55
+                && !IsMateriallyDifferentHue(style.ForegroundColor,pixel.Color,backing))
+            .Select(pixel=>(pixel.X,pixel.Y)).ToHashSet();
+        var components=new List<(double Shear,int Bottom)>();
+        while(ink.Count>0)
+        {
+            var first=ink.First();
+            var pending=new Queue<(int X,int Y)>();
+            var glyph=new List<(int X,int Y)>();
+            pending.Enqueue(first);ink.Remove(first);
+            while(pending.TryDequeue(out var pixel))
+            {
+                glyph.Add(pixel);
+                for(var dy=-1;dy<=1;dy++) for(var dx=-1;dx<=1;dx++)
+                {
+                    var neighbor=(pixel.X+dx,pixel.Y+dy);
+                    if(ink.Remove(neighbor)) pending.Enqueue(neighbor);
+                }
+            }
+            var height=glyph.Max(pixel=>pixel.Y)-glyph.Min(pixel=>pixel.Y)+1;
+            var width=glyph.Max(pixel=>pixel.X)-glyph.Min(pixel=>pixel.X)+1;
+            // Dots and punctuation are not independent full glyph evidence.
+            if(height<style.GlyphHeightPixels*.4 || height<6 || width<2) continue;
+            var rows=glyph.GroupBy(pixel=>pixel.Y).OrderBy(row=>row.Key)
+                .Select(row=>(Left:row.Min(pixel=>pixel.X),Right:row.Max(pixel=>pixel.X))).ToArray();
+            var band=Math.Max(2,rows.Length/3);
+            var left=rows.Take(band).Average(row=>row.Left)-rows.TakeLast(band).Average(row=>row.Left);
+            var right=rows.Take(band).Average(row=>row.Right)-rows.TakeLast(band).Average(row=>row.Right);
+            // A/P/a silhouettes change one edge. Italic stems shift BOTH edges
+            // consistently, beyond a pixel of rasterization uncertainty.
+            var shear=left>1 && right>1 ? (left+right)/(2*height) : 0;
+            components.Add((shear,glyph.Max(pixel=>pixel.Y)));
+        }
+        if(components.Count<3 || components.Max(item=>item.Bottom)-components.Min(item=>item.Bottom)>1)
+            return false;
+        var votes=components.Where(item=>item.Shear is >=.10 and <=.45).ToArray();
+        return votes.Length>=3 && votes.Length>=components.Count*.75
+            && votes.Max(item=>item.Shear)-votes.Min(item=>item.Shear)<=.12;
+    }
+
+    private static double NormalGlyphArea(string text,SourceFontCategory category,double size)
+    {
+        var family=category switch {
+            SourceFontCategory.Monospace=>"Cascadia Mono, Consolas, Microsoft YaHei UI",
+            SourceFontCategory.Serif=>"Georgia, Times New Roman, Microsoft YaHei UI",
+            _=>"Segoe UI, Microsoft YaHei UI"};
+        var layout=new TranslationTextLayout(true,size,size*1.5,SourceFontWeight.Normal,
+            category,false,SourceTextAlignment.Left,0,family);
+        return TranslationTextLayoutPolicy.Format(text,100_000,layout,System.Windows.Media.Brushes.Black)
+            .BuildGeometry(new System.Windows.Point()).GetArea();
     }
 
     private static List<InkPixel> ReadCandidates(Bitmap source, ClipRay.Core.Geometry.PixelRect bounds, Color backing)
@@ -246,7 +350,27 @@ public static class SourceVisualStyleEstimator
                 strongestColor,
                 Average(cluster.Pixels.Select(static pixel => pixel.Color)),
                 backing));
-        return strongest.Pixels;
+        // Each antialiased pixel lies on a coverage ramp from backing to ink.
+        // Population is useful for selecting the ink hue, but not opacity: a
+        // thin font can contain more gray edge pixels than solid interiors.
+        // Require both population and two-dimensional support so an isolated
+        // dark point cannot become the source color. True pale gray remains
+        // pale: there is no darker supported cluster to substitute for it.
+        // Neighboring buckets can split the same coverage core at a quantizer
+        // boundary. Measure support in a continuous color neighborhood instead
+        // of rejecting two dark pixels supported by adjacent near-dark pixels.
+        var core=clusters.Select(cluster=>new {
+                Seed=Average(cluster.Pixels.Select(pixel=>pixel.Color)),CorePixels=cluster.Pixels})
+            .Select(cluster=>new {cluster.Seed,cluster.CorePixels,
+                Pixels=eligible.Where(pixel=>ColorDistance(pixel.Color,cluster.Seed)<=36).ToArray()})
+            .Where(cluster=>cluster.Pixels.Length>=Math.Max(4,eligible.Length*.02)
+                && cluster.Pixels.Select(pixel=>pixel.X).Distinct().Take(2).Count()==2
+                && cluster.Pixels.Select(pixel=>pixel.Y).Distinct().Take(2).Count()==2
+                && !IsMateriallyDifferentHue(strongestColor,cluster.Seed,backing))
+            .OrderByDescending(cluster=>ColorDistance(cluster.Seed,backing)).FirstOrDefault();
+        // Neighbor shades certify support only; letting their population choose
+        // the final paint color would again turn the core into an edge shade.
+        return core?.CorePixels ?? strongest.Pixels;
     }
 
     private static bool IsMateriallyDifferentHue(Color first, Color second, Color backing)

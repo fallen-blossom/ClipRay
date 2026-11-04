@@ -19,7 +19,7 @@ internal static class ReadableParagraphLayout
         // their erasure bounds can be represented independently of the text box.
         if (region.Role is not (VisualTextRole.Body or VisualTextRole.Heading)
             || Math.Abs(style.RotationDegrees) > .001
-            || repair.Mode != InPlaceBackgroundMode.FlatSampled || repair.PatchPng is null
+            || repair.Confidence != VisualSafetyConfidence.High || repair.PatchPng is null
             || original.IsEmpty || !Integral(original.Left) || !Integral(original.Top)
             || !Integral(original.Width) || !Integral(original.Height)) return null;
 
@@ -64,7 +64,7 @@ internal static class ReadableParagraphLayout
 
         var strip = new Rectangle((int)original.Left, (int)original.Bottom,
             (int)original.Width, height - (int)original.Height);
-        if (!Uniform(source, strip, backing.Value)) return null;
+        if (!IsSmoothBlankArea(source, strip)) return null;
 
         using var padded = new Bitmap(patch.Width, height, PixelFormat.Format32bppArgb);
         using (var graphics = Graphics.FromImage(padded))
@@ -77,22 +77,40 @@ internal static class ReadableParagraphLayout
         return (new(original.X, original.Y, original.Width, height), output.ToArray());
     }
 
-    private static bool Uniform(Bitmap source, Rectangle strip, Color backing)
+    private static bool IsSmoothBlankArea(Bitmap source, Rectangle strip)
     {
-        // Scan every pixel, including unknown icons/lines; subsampling could
-        // miss exactly the neighbor that makes expansion unsafe.
-        using var pixels = source.Clone(strip, PixelFormat.Format32bppArgb);
+        // Include rows below the strip so a faint divider at its bottom edge
+        // cannot be mistaken for a smooth gradient. Rows inside the OCR box
+        // may contain descenders and are intentionally not sampled here.
+        var top = strip.Top;
+        var bottom = Math.Min(source.Height, strip.Bottom + 2);
+        var area = Rectangle.FromLTRB(strip.Left, top, strip.Right, bottom);
+        using var pixels = source.Clone(area, PixelFormat.Format32bppArgb);
         var data = pixels.LockBits(new(0, 0, pixels.Width, pixels.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
         try
         {
-            var row = new byte[checked(pixels.Width * 4)];
+            var rows = new byte[pixels.Height][];
             for (var y = 0; y < pixels.Height; y++)
             {
-                Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), row, 0, row.Length);
-                for (var x = 0; x < row.Length; x += 4)
-                    if (row[x + 3] != 255 || row[x] != backing.B
-                        || row[x + 1] != backing.G || row[x + 2] != backing.R)
+                rows[y] = new byte[checked(pixels.Width * 4)];
+                Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), rows[y], 0, rows[y].Length);
+            }
+            var lastX = (pixels.Width - 1) * 4;
+            var lastY = pixels.Height - 1;
+            for (var y = 0; y < pixels.Height; y++)
+            for (var x = 0; x < pixels.Width; x++)
+            {
+                var index = x * 4;
+                if (rows[y][index + 3] != 255) return false;
+                var fx = pixels.Width == 1 ? 0 : x / (double)(pixels.Width - 1);
+                var fy = lastY == 0 ? 0 : y / (double)lastY;
+                for (var channel = 0; channel < 3; channel++)
+                {
+                    var upper = rows[0][channel] * (1 - fx) + rows[0][lastX + channel] * fx;
+                    var lower = rows[lastY][channel] * (1 - fx) + rows[lastY][lastX + channel] * fx;
+                    if (Math.Abs(rows[y][index + channel] - (upper * (1 - fy) + lower * fy)) > 1.25)
                         return false;
+                }
             }
             return true;
         }

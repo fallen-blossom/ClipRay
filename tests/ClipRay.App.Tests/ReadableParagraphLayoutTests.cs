@@ -15,11 +15,43 @@ internal static class ReadableParagraphLayoutTests
     public static void Run(string? output = null)
     {
         BlankSpaceKeepsReadableSourceSize(output);
+        SmoothGradientKeepsReadableSourceSize();
         GraphicAndSelectionBoundariesRemainProtected();
         ControlsKeepTheirOriginalContainer();
+        ConstrainedTranslationDoesNotBecomeUnreadablySmall();
         LargerStyleRunsHaveUnclippedLineHeight();
         LiveRefreshRebuildsGeometryAndPixelWitness();
         Console.WriteLine("READABLE_PARAGRAPH_LAYOUT_PASSED");
+    }
+
+    private static void SmoothGradientKeepsReadableSourceSize()
+    {
+        using var source = Create(out var region, gradient: true);
+        var plan = InPlaceLayoutService.BuildRegionPlan(source, [region], [new(true, Translated, "controlled")]);
+        Check(plan.Items.Count == 1, "A smooth gradient prevented readable translation.");
+        var item = plan.Items[0];
+        Check(item.Bounds.Height > region.Bounds.Height,
+            "A smooth background did not provide space for translated text.");
+        Check(item.TextLayout!.FontSizePixels >= item.SourceStyle!.EstimatedFontSizePixels!.Value * .9,
+            "Translation was shrunk despite a smooth blank area.");
+        using var patchStream = new System.IO.MemoryStream(item.MaskedPatchPng!);
+        using var patch = new Bitmap(patchStream);
+        for (var y = (int)region.Bounds.Height; y < patch.Height; y++)
+        for (var x = 0; x < patch.Width; x++)
+            Check(patch.GetPixel(x, y).A == 0, "Expanded gradient area lost its original background.");
+    }
+
+    private static void ConstrainedTranslationDoesNotBecomeUnreadablySmall()
+    {
+        using var source = Create(out var region);
+        region = region with { Role = VisualTextRole.Control };
+        var result = new TranslationResult(true, Translated, "controlled");
+        var plan = InPlaceLayoutService.BuildRegionPlan(source, [region], [result]);
+        Check(plan.Items.Count == 0 && plan.Rejections.Any(item => item.Reason == "text-does-not-fit"),
+            "An overlong control label was squeezed into unreadable text.");
+        var shorter = InPlaceLayoutService.BuildRegionPlan(source, [region], [new(true, "保存更改", "controlled")]);
+        Check(shorter.Items.Count == 1 && shorter.Items[0].TextLayout!.FontSizePixels >= 9,
+            "A normal label stopped rendering at a readable size.");
     }
 
     private static void BlankSpaceKeepsReadableSourceSize(string? output)
@@ -118,7 +150,10 @@ internal static class ReadableParagraphLayoutTests
     private static void LiveRefreshRebuildsGeometryAndPixelWitness()
     {
         using var source = Create(out var region);
-        var initial = InPlaceLayoutService.BuildRegionPlan(source, [region], [new(true, Translated, "controlled")]).Items.Single();
+        // This shorter translation fits the original box after a modest
+        // reduction, while still needing expansion at the full source size.
+        const string translated = "请确认保存当前项目全部更改。";
+        var initial = InPlaceLayoutService.BuildRegionPlan(source, [region], [new(true, translated, "controlled")]).Items.Single();
         Check(initial.Bounds.Height > region.Bounds.Height, "Live refresh fixture did not begin expanded.");
         using var current = new Bitmap(source);
         var icon = new Rectangle((int)region.Bounds.Left + 8, (int)region.Bounds.Bottom + 3, 12, 8);
@@ -136,7 +171,7 @@ internal static class ReadableParagraphLayoutTests
         Check(retained.RetainUnchanged(snapshot).Count == 1, "Refreshed geometry did not retain its matching pixel witness.");
     }
 
-    private static Bitmap Create(out VisualTextRegion region)
+    private static Bitmap Create(out VisualTextRegion region, bool gradient = false)
     {
         var source = new Bitmap(420, 200, PixelFormat.Format32bppArgb);
         var bounds = new PixelRect(20, 20, 270, 28);
@@ -144,6 +179,15 @@ internal static class ReadableParagraphLayoutTests
         using (var font = new Font("Segoe UI", 20, FontStyle.Regular, GraphicsUnit.Pixel))
         {
             graphics.Clear(Color.White);
+            if (gradient)
+            {
+                for (var y = 0; y < source.Height; y++)
+                {
+                    var value = 220 + y / 10;
+                    using var brush = new SolidBrush(Color.FromArgb(value, value, value));
+                    graphics.FillRectangle(brush, 0, y, source.Width, 1);
+                }
+            }
             graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             graphics.DrawString(Original, font, Brushes.Black, 20, 20, StringFormat.GenericTypographic);
         }

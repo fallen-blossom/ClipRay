@@ -23,6 +23,8 @@ public sealed record LiveTranslationFrame(
     string ErrorCategory = "none")
 {
     public IReadOnlyList<VisualTextRegion> SourceRegions { get; init; } = [];
+    public IReadOnlyList<LiveTranslationReadingItem> ReadingItems { get; init; } = [];
+    internal IReadOnlyList<LiveTranslationReadingItem> ReadingCandidates { get; init; } = [];
     public IReadOnlyList<VisualTextRegion>? ExpectedLayoutRegions { get; init; }
     public LiveTranslationViewportResultState ResultState { get; init; } = LiveTranslationViewportResultState.Ready;
     public int ExpectedLayoutCount { get; init; }
@@ -35,11 +37,16 @@ public sealed record LiveTranslationFrame(
 
     public static LiveTranslationFrame FromOutcome(TranslationRouteKind route, ApplicationTranslationOutcome outcome)
     {
+        var readingCandidates = LiveTranslationReadingWitness.Candidates(outcome);
+        var readingItems = readingCandidates.Where(reading=>!outcome.LayoutItems.Any(layout=>
+            LiveTranslationReadingWitness.Displays(layout,reading))).ToArray();
         var expected = TranslationAcceptancePolicy.ExpectedLayoutCount(outcome);
         var error = TranslationAcceptancePolicy.ErrorCategory(outcome);
         return new(route.ToString(), outcome.Status, outcome.LayoutItems, error)
         {
             SourceRegions = outcome.Regions,
+            ReadingCandidates = readingCandidates,
+            ReadingItems = readingItems,
             ExpectedLayoutRegions = outcome.Regions.Zip(outcome.Results)
                 .Where(static pair => !pair.Second.IsSuccess
                     || pair.Second.Status != "machine-preserved"
@@ -54,7 +61,8 @@ public sealed record LiveTranslationFrame(
                 ? outcome.IsSuccess && outcome.LayoutItems.Count >= expected
                     ? LiveTranslationViewportResultState.Ready
                     : LiveTranslationViewportResultState.AcceptablePartial
-                : LiveTranslationViewportResultState.Failed,
+                : readingItems.Length>0 ? LiveTranslationViewportResultState.AcceptablePartial
+                    : LiveTranslationViewportResultState.Failed,
         };
     }
 }
@@ -101,6 +109,7 @@ public sealed record LiveTranslationCaptureDecision(
 public sealed class LiveTranslationSession : IDisposable
 {
     private readonly Rectangle _region;
+    private int _hasReadingItems;
     private readonly Func<Rectangle, Bitmap> _capture;
     private readonly Func<Bitmap, CancellationToken, Task<LiveTranslationFrame>> _translate;
     private readonly Func<Bitmap, CancellationToken, Task<OcrRecognitionResult>>? _verifySource;
@@ -222,6 +231,7 @@ public sealed class LiveTranslationSession : IDisposable
             _lastDisplayAttemptAt = _timeProvider.GetTimestamp();
             _displayRetryRequested = false;
         }
+        Volatile.Write(ref _hasReadingItems,frame.Frame.ReadingItems.Count>0 ? 1 : 0);
         NotifyDisplayCandidate(frame);
     }
 
@@ -446,6 +456,7 @@ public sealed class LiveTranslationSession : IDisposable
         // These are current valid translated candidates, including when Apply or
         // render failed. Only the UI ACK APIs advance actual display state.
         var displayed = LiveTranslationRegionWitness.Empty;
+        var displayedReading = LiveTranslationReadingWitness.Empty;
         LiveTranslationFrame? displayedFrame = null;
         var retryPartialViewport = false;
         var retryChangedText = false;
@@ -468,7 +479,7 @@ public sealed class LiveTranslationSession : IDisposable
         {
             lock (displayGate)
             {
-                if (token.IsCancellationRequested || displayed.Count == 0) return;
+                if (token.IsCancellationRequested || displayed.Count == 0 && displayedReading.Count == 0) return;
                 if (current is null) InvalidateViewport();
                 else InvalidateChanged(current);
             }
@@ -478,6 +489,18 @@ public sealed class LiveTranslationSession : IDisposable
             var captured = _capture(_region);
             snapshot = new LiveTranslationPixelSnapshot(captured);
             watchdog.Captured(snapshot);
+            // Reading text has no overlay patch to trigger display invalidation.
+            // Check it on EVERY capture, including semantic-cache hits and while
+            // another region's OCR is still pending.
+            lock(displayGate)
+            {
+                var retained=displayedReading.RetainUnchanged(snapshot);
+                if(!ReferenceEquals(retained,displayedReading))
+                {
+                    displayedReading=retained;
+                    PublishDisplayed(snapshot);
+                }
+            }
             return captured;
         }
         SetState(LiveTranslationSessionState.Running);
@@ -496,7 +519,8 @@ public sealed class LiveTranslationSession : IDisposable
                     {
                         lock (displayGate)
                         {
-                            if (ReferenceEquals(displayed.RetainUnchanged(source), displayed))
+                            if (ReferenceEquals(displayed.RetainUnchanged(source), displayed)
+                                && ReferenceEquals(displayedReading.RetainUnchanged(source),displayedReading))
                                 RetryDisplayIfDue();
                         }
                     }
@@ -1013,9 +1037,10 @@ public sealed class LiveTranslationSession : IDisposable
                 // not relabel an old translation with this crop's source version.
                 if (regional && displayedFrame is not null)
                     completed = LiveTranslationRegionScheduler.Merge(completed, displayedFrame,
-                        displayed.RetainUnchanged(source).Items, selectedWindow);
+                        displayed.RetainUnchanged(source).Items, selectedWindow,
+                        displayedReading.RetainUnchanged(source).Items);
                 var candidateCache = layoutCache.Fork();
-                completed = candidateCache.Update(completed, windows) with
+                completed = candidateCache.Update(completed, windows, displayed.ExactUnchangedItems(source)) with
                 { WorkIdentity = identity, RegionWork = regionWork };
                 using var currentBitmap = Capture(out var current);
                 if (completed.SourceRegions.Count == 0 && completed.LayoutItems.Count == 0
@@ -1035,7 +1060,7 @@ public sealed class LiveTranslationSession : IDisposable
                             LiveTranslationViewportResultState.Stale));
                         return;
                     }
-                    if (displayed.Count > 0) InvalidateViewport();
+                    if (displayed.Count > 0 || displayedReading.Count > 0) InvalidateViewport();
                     displayedFrame = null;
                     processedRegions.Clear();
                     processedSource = current;
@@ -1104,10 +1129,12 @@ public sealed class LiveTranslationSession : IDisposable
                     if (identity.ViewportGeneration != ViewportGeneration) return;
                     layoutCache = candidateCache;
                     displayed = commit.Witness;
+                    displayedReading = commit.ReadingWitness;
                     pendingSemanticBackingRefresh = false;
                     displayedFrame = completed with
                     {
                         LayoutItems = displayed.Items,
+                        ReadingItems = displayedReading.Items,
                         RejectedLayoutCount = commit.Metrics.RejectedLayouts,
                         ErrorCategory = resultError,
                         ResultState = viewportResultState,
@@ -1182,13 +1209,15 @@ public sealed class LiveTranslationSession : IDisposable
             lock (displayGate)
             {
                 Interlocked.Increment(ref _viewportGeneration);
-                if (current is not null && displayed.Count > 0)
+                if (current is not null && (displayed.Count > 0 || displayedReading.Count > 0))
                 {
                     displayed = displayed.RetainUnchanged(current);
+                    displayedReading = displayedReading.RetainUnchanged(current);
                     PublishDisplayed(current);
                     return;
                 }
                 displayed = LiveTranslationRegionWitness.Empty;
+                displayedReading = LiveTranslationReadingWitness.Empty;
                 displayedFrame = null;
                 DiscardDisplayCandidate();
                 Interlocked.Increment(ref _displayRevision);
@@ -1208,7 +1237,10 @@ public sealed class LiveTranslationSession : IDisposable
                     : allowIncidentalOutsideText
                     ? displayed.AdvanceIncidentalChange(current)
                     : displayed.RetainUnchanged(current);
-                if (ReferenceEquals(retained, displayed)) return;
+                var retainedReading=displayedReading.RetainUnchanged(current);
+                var readingChanged=!ReferenceEquals(retainedReading,displayedReading);
+                displayedReading=retainedReading;
+                if (ReferenceEquals(retained, displayed) && !readingChanged) return;
                 var onlyAdvancedOutsideText = allowIncidentalOutsideText
                     && retained.Count == displayed.Count;
                 var samePresentation = retained.Count == displayed.Count
@@ -1217,8 +1249,8 @@ public sealed class LiveTranslationSession : IDisposable
                 var sameTextBackingOnly = sameSourceText is not null
                     && retained.Count == displayed.Count;
                 displayed = retained;
-                if (onlyAdvancedOutsideText || samePresentation) return;
-                if (sameTextBackingOnly)
+                if (!readingChanged && (onlyAdvancedOutsideText || samePresentation)) return;
+                if (sameTextBackingOnly && !readingChanged)
                 {
                     if (ElapsedMilliseconds() - lastSemanticBackingPublishedAt
                         < semanticBackingPublishIntervalMilliseconds)
@@ -1255,7 +1287,7 @@ public sealed class LiveTranslationSession : IDisposable
                 var generation = Interlocked.Increment(ref _generation);
                 if (displayedFrame is null)
                 {
-                    if (displayed.Count == 0)
+                    if (displayed.Count == 0 && displayedReading.Count == 0)
                     {
                         DiscardDisplayCandidate();
                         FrameInvalidated?.Invoke(this, EventArgs.Empty);
@@ -1264,12 +1296,13 @@ public sealed class LiveTranslationSession : IDisposable
                 }
                 var metrics = LiveTranslationViewportCommitPolicy.Measure(
                     current, displayedFrame, displayedFrame.LayoutItems.Count, displayed.Items);
-                var state = LiveTranslationViewportResultPolicy.Classify(displayedFrame, metrics);
+                var state = LiveTranslationViewportResultPolicy.Classify(displayedFrame, metrics,displayedReading.Count);
                 Diagnostic?.Invoke(this, new("viewport_invalidated", displayedFrame.WorkIdentity!,
                     state, metrics, displayedFrame.ErrorCategory));
                 if (!LiveTranslationViewportResultPolicy.CanPresent(state))
                 {
                     displayed = LiveTranslationRegionWitness.Empty;
+                    displayedReading = LiveTranslationReadingWitness.Empty;
                     displayedFrame = null;
                     DiscardDisplayCandidate();
                     FrameInvalidated?.Invoke(this, EventArgs.Empty);
@@ -1277,7 +1310,8 @@ public sealed class LiveTranslationSession : IDisposable
                 }
                 if (!token.IsCancellationRequested)
                 {
-                    displayedFrame = displayedFrame with { LayoutItems = displayed.Items, ResultState = state };
+                    displayedFrame = displayedFrame with { LayoutItems = displayed.Items,
+                        ReadingItems=displayedReading.Items, ResultState = state };
                     PublishDisplayCandidate(new(displayedFrame, generation, ViewportGeneration, revision));
                 }
             }
@@ -1287,7 +1321,12 @@ public sealed class LiveTranslationSession : IDisposable
     {
         Interlocked.Increment(ref _generation);
         DiscardDisplayCandidate();
-        if (!_stopSource.IsCancellationRequested) _stopSource.Cancel();
+        if (!_stopSource.IsCancellationRequested)
+        {
+            _stopSource.Cancel();
+            if(Interlocked.Exchange(ref _hasReadingItems,0)!=0)
+                FrameInvalidated?.Invoke(this,EventArgs.Empty);
+        }
     }
 
     public void Dispose()

@@ -990,6 +990,23 @@ internal static partial class Program
                     StringComparison.Ordinal, null, null, "")) }, Repeated: null),
             invocation => { ReadableParagraphLayoutTests.Run(invocation.CanonicalArgs.Length > 1
                 ? invocation.CanonicalArgs[1] : null); return 0; }, "readable-paragraph-layout-20261025"));
+        commands.Add(new CommandDescriptor("--translation-stability-regression-tests", StringComparison.Ordinal,
+            ArgumentGrammar.NoArguments(), _ => {
+                LiveLayoutIdentityTests.Run();
+                LiveReadingLifecycleTests.Run();
+                OcrPixelAndCacheTests.Run();
+                TranslationReadingFallbackTests.OnlyMissingSuccessfulTranslationsAreReadable();
+                return 0;
+            }, "translation-stability-regression-20261104"));
+        commands.Add(new CommandDescriptor("--live-window-readability-acceptance", StringComparison.Ordinal,
+            new ArgumentGrammar(GrammarKind.Positional, new Cardinality(2, 2, new[] { 2 }), new[] {
+                new PositionRule(1, new ValueRule("output-directory", ValueKind.NonEmptyString, null, StringComparison.Ordinal, null, null, "")),
+                new PositionRule(2, new ValueRule("install-root", ValueKind.NonEmptyString, null, StringComparison.Ordinal, null, null, "")) }, Repeated: null),
+            invocation => LiveWindowReadabilityAcceptance.Run(invocation.CanonicalArgs), "live-window-readability-20261104"));
+        commands.Add(new CommandDescriptor("--source-ink-style-stability-tests", StringComparison.Ordinal,
+            new ArgumentGrammar(GrammarKind.Positional, new Cardinality(1, 1, new[] { 1 }), new[] {
+                new PositionRule(1, new ValueRule("output-directory", ValueKind.NonEmptyString, null, StringComparison.Ordinal, null, null, "")) }, Repeated: null),
+            invocation => { SourceInkStyleStabilityTests.Run(invocation.CanonicalArgs[1]); return 0; }, "source-ink-style-stability-20261104"));
         commands.Add(new CommandDescriptor("--live-recognition-cache-tests", StringComparison.Ordinal,
             ArgumentGrammar.NoArguments(), _ => {
                 LiveTranslationRecognitionCacheTests.SemanticAndPipelineShareCompletedRecognition();

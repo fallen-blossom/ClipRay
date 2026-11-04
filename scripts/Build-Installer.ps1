@@ -222,7 +222,8 @@ try {
 
     $allowedDistributionNames = @(
         'machine-translation/runtime/Lib/site-packages/numpy/_pytesttester.py',
-        'docs/release/1.0.6-preview.3.zh-CN.md'
+        'docs/release/1.0.6-preview.3.zh-CN.md',
+        'docs/release/1.0.6-preview.4.zh-CN.md'
     )
     $forbidden = Get-ChildItem -LiteralPath $staging -Recurse -File | Where-Object {
         $relativePath = $_.FullName.Substring($staging.TrimEnd([IO.Path]::DirectorySeparatorChar).Length + 1).Replace('\', '/')

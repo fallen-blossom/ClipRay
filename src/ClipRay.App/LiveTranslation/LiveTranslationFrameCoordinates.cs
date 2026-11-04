@@ -28,6 +28,8 @@ public static class LiveTranslationFrameCoordinates
             LayoutItems=frame.LayoutItems.Select(item=>item with { Bounds=Bounds(item.Bounds),
                 SourceBlock=Block(item.SourceBlock),SourceRegion=item.SourceRegion is null?null:Region(item.SourceRegion) }).ToArray(),
             SourceRegions=frame.SourceRegions.Select(Region).ToArray(),
+            ReadingItems=frame.ReadingItems.Select(item=>item with {Region=Region(item.Region)}).ToArray(),
+            ReadingCandidates=frame.ReadingCandidates.Select(item=>item with {Region=Region(item.Region)}).ToArray(),
             ExpectedLayoutRegions=frame.ExpectedLayoutRegions?.Select(Region).ToArray()
         };
     }

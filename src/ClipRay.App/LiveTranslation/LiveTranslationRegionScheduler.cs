@@ -41,7 +41,8 @@ internal sealed class LiveTranslationRegionScheduler
     }
 
     internal static LiveTranslationFrame Merge(LiveTranslationFrame crop, LiveTranslationFrame previous,
-        IReadOnlyList<InPlaceLayoutItem> retained, Rectangle window)
+        IReadOnlyList<InPlaceLayoutItem> retained, Rectangle window,
+        IReadOnlyList<LiveTranslationReadingItem>? retainedReading=null)
     {
         var failedRecognition = crop.SourceRegions.Count == 0 && crop.LayoutItems.Count == 0
             && crop.ErrorCategory != "none" && crop.ErrorCategory != "Scope:partial-or-failed";
@@ -51,6 +52,11 @@ internal sealed class LiveTranslationRegionScheduler
         var outsideItems = retained.Where(item => !Intersects(window,
             item.SourceRegion?.Bounds ?? item.SourceBlock.Bounds)).ToArray();
         var items = outsideItems.Concat(crop.LayoutItems).ToArray();
+        // Previous reading text is retained only with a current pixel witness,
+        // and never from the crop being replaced (including failed crops).
+        var oldReading=(retainedReading ?? []).Where(item=>Outside(item.Region));
+        var readingCandidates=oldReading.Concat(crop.ReadingCandidates.Count>0
+            ? crop.ReadingCandidates : crop.ReadingItems).ToArray();
         // Production frames carry exact expected-region identities, including
         // failures. The fallback supports older callers without inventing success.
         var previousExpected = previous.ExpectedLayoutRegions
@@ -67,6 +73,9 @@ internal sealed class LiveTranslationRegionScheduler
         {
             SourceRegions = sourceRegions,
             LayoutItems = items,
+            ReadingCandidates = readingCandidates,
+            ReadingItems = readingCandidates.Where(reading=>!items.Any(layout=>
+                LiveTranslationReadingWitness.Displays(layout,reading))).ToArray(),
             ExpectedLayoutRegions = expectedRegions,
             ExpectedLayoutCount = Math.Max(expectedCount, items.Length),
             ExpectedPrimaryLayoutCount = expectedPrimary.Length,

@@ -52,6 +52,9 @@ public partial class App : System.Windows.Application
     private LiveTranslationEscapeListener? _liveTranslationEscape;
     private LiveTranslationOverlayWindow? _liveTranslationOverlay;
     private LiveTranslationStopControlWindow? _liveTranslationStopControl;
+    private Forms.ToolStripMenuItem? _liveReadingMenuItem;
+    private string? _liveReadingText;
+    private TranslationReadingWindow? _liveReadingWindow;
     private readonly LiveTranslationStartupCoordinator _liveStartup = new();
     internal Func<LiveTranslationOperation, Task<ClipRay.Core.Geometry.PixelRect?>>? LiveSelectionFactory { get; set; }
     internal Func<LiveTranslationOperation, Task>? LiveWarmupFactory { get; set; }
@@ -1096,6 +1099,18 @@ public partial class App : System.Windows.Application
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add("翻译", null, (_, _) => OpenTranslationWindow());
         menu.Items.Add("实时区域翻译", null, (_, _) => StartLiveTranslationSelection());
+        var liveReading = new Forms.ToolStripMenuItem(AppUi("阅读实时译文", "Read live translations"))
+        {
+            Visible = _liveTranslationStopControl is null && !string.IsNullOrWhiteSpace(_liveReadingText),
+        };
+        _liveReadingMenuItem = liveReading;
+        liveReading.Click += (_, _) => Dispatcher.BeginInvoke(OpenLiveReadingWindow);
+        menu.Items.Add(liveReading);
+        menu.Opening += (_, _) =>
+        {
+            liveReading.Text = AppUi("阅读实时译文", "Read live translations");
+            liveReading.Visible = _liveTranslationStopControl is null && !string.IsNullOrWhiteSpace(_liveReadingText);
+        };
         var settingsIcon = TrayMenuTheme.CreateSettingsIcon();
         menu.Items.Add("设置", settingsIcon, (_, _) => OpenSettings());
         menu.Disposed += (_, _) => settingsIcon.Dispose();
@@ -1847,6 +1862,7 @@ public partial class App : System.Windows.Application
                 {
                     var applied = overlay.ShowTranslation(capture.Version, capture.CaptureBounds,
                         outcome.LayoutItems);
+                    if (applied) overlay.ShowTranslationFallback(capture.Version, outcome);
                     var overlayDecision = !applied ? "overlay-refused"
                         : outcome.LayoutItems.Count == 0 ? "accepted-empty-overlay"
                         : "accepted-by-overlay";
@@ -2732,7 +2748,12 @@ public partial class App : System.Windows.Application
             });
         operation.CheckCurrent();
         session.FrameReady += (_, args) => QueueLiveFrame(operation, session, args,
-            () => overlay.Apply(args.Frame, args.Generation), () => _ = PresentAsync(args),
+            () => overlay.Apply(args.Frame, args.Generation), () =>
+            {
+                SetLiveReadingText(string.Join(Environment.NewLine + Environment.NewLine,
+                    args.Frame.ReadingItems.Select(static item => item.Text)), stopControl);
+                _ = PresentAsync(args);
+            },
             error => acceptanceTrace.Record("apply_failed", args.Generation, args.WorkIdentity,
                 new { Category = error.GetType().Name }));
 
@@ -2789,6 +2810,7 @@ public partial class App : System.Windows.Application
             QueueLiveInvalidation(operation, session, () =>
             {
                 overlay.Clear();
+                ClearLiveReadingText();
                 acceptanceTrace.Record("cleared", invalidatedGeneration);
             });
         };
@@ -2850,6 +2872,7 @@ public partial class App : System.Windows.Application
                     acceptanceTrace.Record("ended", session.Generation, data: new { session.State });
                     if (ReferenceEquals(_liveTranslationSession, session))
                     {
+                        ClearLiveReadingText();
                         _liveTranslationSession = null;
                         session.Dispose();
                         if (session.State == LiveTranslationSessionState.StoppedAfterConsecutiveFailures)
@@ -2988,12 +3011,48 @@ public partial class App : System.Windows.Application
 
     private void CloseLiveTranslationUi()
     {
+        ClearLiveReadingText();
         _liveTranslationEscape?.Dispose();
         _liveTranslationEscape = null;
         _liveTranslationOverlay?.Close();
         _liveTranslationOverlay = null;
         _liveTranslationStopControl?.Close();
         _liveTranslationStopControl = null;
+    }
+
+    private void SetLiveReadingText(string text, LiveTranslationStopControlWindow? control)
+    {
+        if (string.IsNullOrWhiteSpace(text)) { ClearLiveReadingText(); return; }
+        _liveReadingText = text;
+        control?.SetReadingFallback(text);
+        if (_liveReadingMenuItem is { } item) item.Visible = control is null;
+        _liveReadingWindow?.UpdateText(text);
+    }
+
+    private void ClearLiveReadingText()
+    {
+        _liveReadingText = null;
+        _liveTranslationStopControl?.ClearReadingFallback();
+        if (_liveReadingMenuItem is { } item) item.Visible = false;
+        _liveReadingWindow?.Close();
+        _liveReadingWindow = null;
+    }
+
+    private void OpenLiveReadingWindow()
+    {
+        if (_liveTranslationSession is null || string.IsNullOrWhiteSpace(_liveReadingText)) return;
+        if (_liveReadingWindow is { } existing) { existing.Activate(); return; }
+        var reader = new TranslationReadingWindow(_liveReadingText, _settings?.InterfaceLanguage == "en");
+        if (!reader.ExcludeFromCapture())
+        {
+            reader.Close();
+            SetTrayTooltip(AppUi("ClipRay | 阅读窗口无法排除截图，请重试",
+                "ClipRay | Reader could not be excluded from capture. Try again."));
+            return;
+        }
+        _liveReadingWindow = reader;
+        reader.Closed += (_, _) => { if (ReferenceEquals(_liveReadingWindow, reader)) _liveReadingWindow = null; };
+        reader.Show();
     }
 
     private IDeepSeekTranslationProvider GetTranslationProvider() => _translationServices.Provider;

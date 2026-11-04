@@ -11,6 +11,10 @@ internal static class CaptureLocalization
 {
     private static readonly IReadOnlyDictionary<string, string> English = new Dictionary<string, string>
     {
+        ["未原位显示的译文"] = "Translations kept off the image",
+        ["阅读未原位显示的译文"] = "Read hidden translations",
+        ["仅显示已成功翻译的内容"] = "Only successfully translated text is shown",
+        ["为保留原画面，这些译文未覆盖到截图"] = "These translations were kept off the image to preserve its appearance",
         ["自定义选区尺寸"] = "Set selection size", ["移动（锁定尺寸）"] = "Move (keep size)",
         ["画笔"] = "Pen", ["马赛克"] = "Mosaic", ["取色"] = "Pick color", ["长截图"] = "Scrolling capture",
         ["标注工具"] = "Annotations", ["箭头"] = "Arrow", ["矩形"] = "Rectangle", ["圆形"] = "Circle",

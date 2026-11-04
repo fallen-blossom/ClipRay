@@ -14,7 +14,10 @@ internal sealed record LiveTranslationViewportCommit(
     LiveTranslationRegionWitness Witness,
     LiveTranslationViewportResultState ResultState,
     LiveTranslationViewportMetrics Metrics,
-    IReadOnlyList<LiveTranslationLayoutQuarantine> Quarantined);
+    IReadOnlyList<LiveTranslationLayoutQuarantine> Quarantined)
+{
+    internal LiveTranslationReadingWitness ReadingWitness { get; init; }=LiveTranslationReadingWitness.Empty;
+}
 
 public sealed record LiveTranslationLayoutQuarantine(
     string? RegionId, string Reason, double X, double Y,
@@ -40,7 +43,9 @@ internal static class LiveTranslationViewportCommitPolicy
         // region witnesses before treating it as a whole-viewport replacement.
         // These entries certify their own source/render pixels independently.
         var witness = candidate.RetainForViewportCommit(current, sameSourceText, sourceRegions);
-        if (changes.IsViewportReplacement && !sourceGeometryVerified && witness.Count == 0)
+        var readingWitness=LiveTranslationReadingWitness.Create(source,
+            frame.ReadingCandidates.Count>0 ? frame.ReadingCandidates : frame.ReadingItems).RetainUnchanged(current);
+        if (changes.IsViewportReplacement && !sourceGeometryVerified && witness.Count == 0 && readingWitness.Count == 0)
             return new(LiveTranslationViewportCommitState.Stale, LiveTranslationRegionWitness.Empty,
                 LiveTranslationViewportResultState.Stale,
                 new(expected, candidate.Count, 0, frame.RejectedLayoutCount), []);
@@ -72,9 +77,10 @@ internal static class LiveTranslationViewportCommitPolicy
         witness = witness.RetainItems(item => !rejected.ContainsKey(item));
         var measuredFrame = frame with { RejectedLayoutCount = frame.RejectedLayoutCount + quarantined.Length };
         var metrics = Measure(source, measuredFrame, candidate.Count, witness.Items);
-        var resultState = LiveTranslationViewportResultPolicy.Classify(frame, metrics);
+        readingWitness=readingWitness.WithoutDisplayed(witness.Items);
+        var resultState = LiveTranslationViewportResultPolicy.Classify(frame, metrics,readingWitness.Count);
         return new(LiveTranslationViewportCommitState.Ready, witness, resultState,
-            metrics, quarantined);
+            metrics, quarantined) {ReadingWitness=readingWitness};
     }
 
     internal static LiveTranslationViewportMetrics Measure(

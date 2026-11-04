@@ -49,6 +49,7 @@
     <Content Include="..\..\docs\testing\recording-silence-2026-10-30.md" Link="docs\testing\recording-silence-2026-10-30.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\..\docs\testing\recording-silence-2026-10-30.md') and '$(ClipRayIncludeInternalDocs)' != 'false'" />
     <Content Include="..\..\docs\testing\scroll-cadence-2026-11-04.md" Link="docs\testing\scroll-cadence-2026-11-04.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Condition="Exists('..\..\docs\testing\scroll-cadence-2026-11-04.md') and '$(ClipRayIncludeInternalDocs)' != 'false'" />
     <Content Include="..\..\docs\release\1.0.6-preview.3.zh-CN.md" Link="docs\release\1.0.6-preview.3.zh-CN.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\docs\release\1.0.6-preview.4.zh-CN.md" Link="docs\release\1.0.6-preview.4.zh-CN.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Resource Include="Assets\ClipRay-icon-transparent.png" />
     <Content Include="Ocr\ppocr_sidecar.py" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Translation\machine_translation_worker.py" Link="machine-translation\machine_translation_worker.py" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />

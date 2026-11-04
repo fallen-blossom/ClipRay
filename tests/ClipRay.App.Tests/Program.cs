@@ -10558,8 +10558,8 @@ internal static partial class Program
     {
         var style = new SourceVisualStyle(
             Color.White,
-            6,
-            10,
+            14,
+            24,
             SourceFontWeight.Normal,
             SourceFontCategory.SansSerif,
             false,
@@ -10567,11 +10567,13 @@ internal static partial class Program
             0,
             VisualStyleConfidence.High);
 
-        var layout = TranslationTextLayoutPolicy.Fit("译", new PixelRect(0, 0, 40, 10), style);
+        var layout = TranslationTextLayoutPolicy.Fit("译", new PixelRect(0, 0, 80, 24), style);
 
         Equal(true, layout.ShouldRender);
         Equal(true, layout.FontSizePixels > 0);
-        Equal(true, layout.FontSizePixels <= 6 / TranslationTextLayoutPolicy.VisibleGlyphRatio + 0.01);
+        Equal(true, layout.FontSizePixels <= 14 / TranslationTextLayoutPolicy.VisibleGlyphRatio + 0.01);
+        var tiny = style with { GlyphHeightPixels = 6, LineHeightPixels = 10 };
+        Equal(false, TranslationTextLayoutPolicy.Fit("译", new PixelRect(0, 0, 40, 10), tiny).ShouldRender);
     }
 
     private static void UsesCjkVisibleGlyphRatio()
@@ -10594,12 +10596,13 @@ internal static partial class Program
         var initial = style.GlyphHeightPixels / TranslationTextLayoutPolicy.VisibleGlyphRatio;
 
         var layout = TranslationTextLayoutPolicy.Fit(
-            "a translated sentence that must wrap",
+            "a translated sentence",
             new PixelRect(0, 0, 120, 36),
             style);
 
         Equal(true, layout.ShouldRender);
         Equal(true, layout.FontSizePixels < initial);
+        Equal(true, layout.FontSizePixels >= initial * .8);
         Equal(SourceTextAlignment.Center, layout.Alignment);
         Equal(SourceFontWeight.SemiBold, layout.FontWeight);
     }
@@ -10609,14 +10612,15 @@ internal static partial class Program
         var style = new SourceVisualStyle(
             Color.White, 18, 22, SourceFontWeight.Normal, SourceFontCategory.SansSerif,
             false, SourceTextAlignment.Left, 0, VisualStyleConfidence.High);
-        var bounds = new PixelRect(0, 0, 50, 18);
+        var bounds = new PixelRect(0, 0, 86, 18);
 
         var ordinary = TranslationTextLayoutPolicy.Fit("大约六小时前", bounds, style);
         var compact = TranslationTextLayoutPolicy.FitCompact("大约六小时前", bounds, style);
 
         Equal(false, ordinary.ShouldRender);
         Equal(true, compact.ShouldRender);
-        Equal(true, compact.FontSizePixels < 18 / 0.9 * 0.55);
+        Equal(true, compact.FontSizePixels >= 18 / 0.9 * 0.7);
+        Equal(false, TranslationTextLayoutPolicy.FitCompact("大约六小时前", new PixelRect(0, 0, 50, 18), style).ShouldRender);
     }
 
     private static void KeepsOriginalWhenTranslationCannotFit()

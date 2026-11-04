@@ -117,10 +117,8 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
         cancellationToken.ThrowIfCancellationRequested();
         var phase = Stopwatch.StartNew();
         using var prepared = OcrPolarityPlan.CreatePreparedBitmap(bitmap);
-        var png = await OcrBitmapEncoder.EncodePngAsync(prepared, null, cancellationToken).ConfigureAwait(false);
-        using var skBitmap = SKBitmap.Decode(png)
-            ?? throw new OcrUnavailableException("The local OCR image could not be decoded.");
-        observeStage?.Invoke(new("polarity-encode-decode", phase.Elapsed.TotalMilliseconds));
+        using var skBitmap = OcrBitmapPixels.Copy(prepared, cancellationToken);
+        observeStage?.Invoke(new("polarity-pixel-copy", phase.Elapsed.TotalMilliseconds));
         phase.Restart();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try

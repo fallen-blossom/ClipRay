@@ -160,7 +160,11 @@ public static class VisualTextRegionBuilder
                 if (start < 0) continue;
                 cursor = start + text.Length;
                 var wordBlock = new OcrTextBlock(text, word.Bounds, [word]);
-                var style = SourceVisualStyleEstimator.Estimate(source, wordBlock, siblings, SampleBacking(source, word.Bounds));
+                var backing=SampleBacking(source,word.Bounds);
+                var style=SourceVisualStyleEstimator.EstimateWordStyle(source,wordBlock,siblings,backing);
+                // Preserve local italics only with independent, consistent
+                // multi-glyph stem evidence. A single asymmetric word silhouette
+                // or whole-box PCA cannot certify italic or rotated text.
                 if (words.Count == 1 && (OcrStyleGeometryRefiner.HasMaterialInkColors(source, word.Bounds)
                     || OcrStyleGeometryRefiner.HasEnoughLatinText(text)
                         && OcrStyleGeometryRefiner.HasMaterialInkHeightVariation(source, word.Bounds)))

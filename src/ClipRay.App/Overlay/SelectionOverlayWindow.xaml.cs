@@ -53,6 +53,8 @@ public partial class SelectionOverlayWindow : Window
     private readonly CancellationTokenSource _lifetime = new();
     private readonly OverlayTranslationSequencer _translationSequencer = new();
     private TranslationDisplayState? _translationDisplayState;
+    private TranslationReadingFallback? _translationReadingFallback;
+    private bool _readingTranslation;
     private bool _longCaptureActive;
     private bool _moveToolActive;
     private IReadOnlyList<PixelRect> _snapCandidates = [];
@@ -436,6 +438,12 @@ public partial class SelectionOverlayWindow : Window
             e.ImeProcessedKey,
             e.DeadCharProcessedKey);
         var modifiers = ReadModifiers();
+        if (key == Key.Escape && _readingTranslation && TextExtractionPanel.Visibility == Visibility.Visible)
+        {
+            CloseReadingPanel();
+            e.Handled = true;
+            return;
+        }
         if (HandleAnnotationKey(key, modifiers)) { e.Handled = true; return; }
         var textBox = FindInputTextBox(e.OriginalSource as DependencyObject)
             ?? FindInputTextBox(Keyboard.FocusedElement as DependencyObject);
@@ -817,6 +825,7 @@ public partial class SelectionOverlayWindow : Window
         var captureBounds = SelectionCapturePolicy.CreateOcrCaptureBounds(request.Selection, _pixelBounds);
         var bitmap = CreateRecognitionCapture(captureBounds);
         ExtractedTextBox.Text = string.Empty;
+        ConfigureReadingPanel(false);
         ExtractionStatusText.Text = T("正在运行本地 OCR 快速路径…");
         TextExtractionPanel.Visibility = Visibility.Visible;
         PositionTextExtractionPanel();
@@ -830,12 +839,59 @@ public partial class SelectionOverlayWindow : Window
     public bool ShowExtractedText(long version, string text, string status)
     {
         if (!IsLoaded || !_translationSequencer.IsLatest(version)) return false;
+        ConfigureReadingPanel(false);
         ExtractedTextBox.Text = text;
         ExtractionStatusText.Text = status;
         TextExtractionPanel.Visibility = Visibility.Visible;
         PositionTextExtractionPanel();
         UpdateVisuals();
         return true;
+    }
+
+    public bool ShowTranslationFallback(long version, ApplicationTranslationOutcome outcome)
+    {
+        if (!IsLoaded || !_translationSequencer.IsLatest(version)) return false;
+        _translationReadingFallback = TranslationReadingFallback.Create(outcome);
+        TranslationReadingButton.Visibility = _translationReadingFallback.Count > 0
+            ? Visibility.Visible : Visibility.Collapsed;
+        TranslationReadingButton.Content = _interactionSettings.InterfaceLanguage == "en"
+            ? $"Read text ({_translationReadingFallback.Count})"
+            : $"阅读译文（{_translationReadingFallback.Count}）";
+        TranslationReadingButton.ToolTip = T("未原位显示的译文");
+        UpdateVisuals();
+        return true;
+    }
+
+    private void ConfigureReadingPanel(bool translation)
+    {
+        _readingTranslation = translation;
+        ExtractionTitle.Text = translation ? T("未原位显示的译文") : T("文字提取");
+        ExtractionHint.Text = translation ? T("仅显示已成功翻译的内容") : T("按视觉行保留换行");
+        System.Windows.Automation.AutomationProperties.SetName(ExtractedTextBox, ExtractionTitle.Text);
+    }
+
+    private void OnReadTranslation(object sender, RoutedEventArgs e)
+    {
+        if (_translationReadingFallback is not { Count: > 0 } fallback) return;
+        if (_readingTranslation && TextExtractionPanel.Visibility == Visibility.Visible)
+        {
+            CloseReadingPanel();
+            return;
+        }
+        ConfigureReadingPanel(true);
+        ExtractedTextBox.Text = fallback.Text;
+        ExtractionStatusText.Text = T("为保留原画面，这些译文未覆盖到截图");
+        TextExtractionPanel.Visibility = Visibility.Visible;
+        PositionTextExtractionPanel();
+        UpdateVisuals();
+        ExtractedTextBox.Focus();
+    }
+
+    private void CloseReadingPanel()
+    {
+        TextExtractionPanel.Visibility = Visibility.Collapsed;
+        TranslationReadingButton.Focus();
+        UpdateVisuals();
     }
 
     public void ShowModernVisualPreview()
@@ -893,6 +949,7 @@ public partial class SelectionOverlayWindow : Window
 
     private void OnCloseTextExtraction(object sender, RoutedEventArgs e)
     {
+        if (_readingTranslation) { CloseReadingPanel(); return; }
         _translationSequencer.CancelPending();
         TextExtractionPanel.Visibility = Visibility.Collapsed;
     }
@@ -1442,6 +1499,10 @@ public partial class SelectionOverlayWindow : Window
 
     private void PositionToolFeedback(System.Windows.Point toolbarPoint, System.Windows.Size toolbarSize)
     {
+        TranslationToggle.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
+        TranslationReadingButton.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
+        ToolStatusText.MaxWidth = Math.Max(40, Math.Min(520, ActualWidth - 48
+            - TranslationToggle.DesiredSize.Width - TranslationReadingButton.DesiredSize.Width));
         ToolFeedbackPanel.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
         if (ToolFeedbackPanel.DesiredSize.Width <= 0 || ToolFeedbackPanel.DesiredSize.Height <= 0) return;
         var anchor = CreateToolFeedbackAnchor(toolbarPoint, toolbarSize);
@@ -1652,6 +1713,9 @@ public partial class SelectionOverlayWindow : Window
         TranslationLayer.Children.Clear();
         TranslationLayer.Visibility = Visibility.Collapsed;
         TranslationToggle.Visibility = Visibility.Collapsed;
+        TranslationReadingButton.Visibility = Visibility.Collapsed;
+        _translationReadingFallback = null;
+        _readingTranslation = false;
         TextExtractionPanel.Visibility = Visibility.Collapsed;
         ExtractedTextBox.Clear();
         HideTranslationStatus();
@@ -1724,7 +1788,8 @@ public partial class SelectionOverlayWindow : Window
             if (ReferenceEquals(current, Toolbar)
                 || ReferenceEquals(current, ToolProperties)
                 || ReferenceEquals(current, TextExtractionPanel)
-                || ReferenceEquals(current, TranslationToggle))
+                || ReferenceEquals(current, TranslationToggle)
+                || ReferenceEquals(current, TranslationReadingButton))
             {
                 return true;
             }

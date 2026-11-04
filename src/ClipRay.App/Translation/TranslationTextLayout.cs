@@ -31,9 +31,9 @@ public static class TranslationTextLayoutPolicy
         return Math.Clamp(geometry.Bounds.Height / 100, .45, 1.35);
     }
     public const double VisibleGlyphRatio = 0.72;
-    public const double MinimumReadableFontSizePixels = 4;
-    private const double MinimumRelativeScale = 0.55;
-    private const double CompactMinimumRelativeScale = 0.4;
+    public const double MinimumReadableFontSizePixels = 9;
+    private const double MinimumRelativeScale = 0.8;
+    private const double CompactMinimumRelativeScale = 0.7;
     private const double FontStepPixels = 0.5;
 
     public static TranslationTextLayout Fit(string text, PixelRect bounds, SourceVisualStyle style) =>
@@ -101,7 +101,7 @@ public static class TranslationTextLayoutPolicy
             return Create(false, startingFontSize, style, fontFamily);
         }
 
-        var minimum = Math.Min(startingFontSize, Math.Max(4, initialFontSize * minimumRelativeScale));
+        var minimum = Math.Max(MinimumReadableFontSizePixels, initialFontSize * minimumRelativeScale);
         for (var size = startingFontSize; size + 0.001 >= minimum; size -= FontStepPixels)
         {
             var lineHeight = CalculateLineHeight(size, initialFontSize, style.LineHeightPixels);
@@ -186,6 +186,7 @@ public static class TranslationTextLayoutPolicy
             var color = run.Style.ForegroundColor;
             formatted.SetForegroundBrush(new SolidColorBrush(System.Windows.Media.Color.FromArgb(color.A,color.R,color.G,color.B)), run.Start,run.Length);
             formatted.SetFontWeight(ToWpfWeight(run.Style.FontWeight),run.Start,run.Length);
+            formatted.SetFontStyle(run.Style.IsItalic ? FontStyles.Italic : FontStyles.Normal,run.Start,run.Length);
             if (layout.SourceFontSizePixels > 0 && run.Style.EstimatedFontSizePixels is > 0)
                 formatted.SetFontSize(Math.Max(MinimumReadableFontSizePixels,
                     run.Style.EstimatedFontSizePixels.Value * layout.FontSizePixels / layout.SourceFontSizePixels),run.Start,run.Length);

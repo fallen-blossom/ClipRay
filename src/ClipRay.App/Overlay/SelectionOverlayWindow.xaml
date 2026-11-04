@@ -316,6 +316,8 @@
                 </Border>
                 <Button x:Name="TranslationToggle" Style="{StaticResource MiniButton}" Margin="6,0,0,0"
                         Padding="12,5" Content="显示原文" Visibility="Collapsed" Click="OnTranslationToggle" />
+                <Button x:Name="TranslationReadingButton" Style="{StaticResource MiniButton}" Margin="6,0,0,0"
+                        Padding="12,5" Content="阅读未原位显示的译文" Visibility="Collapsed" Click="OnReadTranslation" />
             </StackPanel>
         </Canvas>
 
@@ -328,7 +330,7 @@
                 <Grid Margin="18,16,14,12">
                     <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
                     <StackPanel>
-                        <TextBlock Text="文字提取" FontSize="17" FontWeight="SemiBold" Foreground="#F5F7FB" />
+                        <TextBlock x:Name="ExtractionTitle" Text="文字提取" FontSize="17" FontWeight="SemiBold" Foreground="#F5F7FB" />
                         <TextBlock x:Name="ExtractionStatusText" Text="PP-OCR 主路径 · Windows OCR 回退" Margin="0,3,0,0" Foreground="#8F99AD" FontSize="12" />
                     </StackPanel>
                     <Button Grid.Column="1" Style="{StaticResource ToolButton}" Width="36" Height="36" ToolTip="收起" Click="OnCloseTextExtraction">
@@ -341,7 +343,7 @@
                          BorderBrush="#30394A" BorderThickness="1" Padding="12" FontSize="16" />
                 <Grid Grid.Row="2" Margin="18,0,18,16">
                     <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                    <TextBlock Text="按视觉行保留换行" Foreground="#7F899D" VerticalAlignment="Center" />
+                    <TextBlock x:Name="ExtractionHint" Text="按视觉行保留换行" Foreground="#7F899D" VerticalAlignment="Center" />
                     <Button Grid.Column="1" Style="{StaticResource MiniButton}" Content="一键复制" Click="OnCopyExtractedText" />
                 </Grid>
             </Grid>

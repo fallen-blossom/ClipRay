@@ -19,6 +19,7 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
 
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly AsyncResourceLifetime _lifetime = new();
+    private readonly OcrLineRecognitionCache _lineCache = new();
     private RapidOcr? _detector;
     private readonly List<(string Script, string ModelId, TextRecognizer Recognizer)> _recognizers = [];
 
@@ -75,9 +76,8 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
         cancellationToken = linked.Token;
         var phase = Stopwatch.StartNew();
         using var prepared = OcrPolarityPlan.CreatePreparedBitmap(bitmap);
-        using var image = SKBitmap.Decode(await OcrBitmapEncoder.EncodePngAsync(prepared, null, cancellationToken).ConfigureAwait(false));
-        if (image is null) throw new OcrUnavailableException("The local OCR image could not be decoded.");
-        observeStage?.Invoke(new("polarity-encode-decode", phase.Elapsed.TotalMilliseconds));
+        using var image = OcrBitmapPixels.Copy(prepared, cancellationToken);
+        observeStage?.Invoke(new("polarity-pixel-copy", phase.Elapsed.TotalMilliseconds));
         phase.Restart();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -125,10 +125,22 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
             if (crops.Count == 0) return [];
             var candidates = Enumerable.Range(0, crops.Count).Select(_ => new List<ScriptOcrCandidate>()).ToArray();
             var recognitionLines = Enumerable.Range(0, crops.Count).Select(_ => new Dictionary<string, TextLine>()).ToArray();
+            phase.Restart();
+            var pixels = crops.Select(crop => OcrLineRecognitionCache.Snapshot(crop, token)).ToArray();
+            var reused = new bool[crops.Count];
+            for (var i = 0; i < crops.Count; i++)
+            {
+                var cached = _lineCache.Find(pixels[i]);
+                if (cached is null) continue;
+                reused[i] = true;
+                candidates[i].AddRange(cached.Candidates);
+                foreach (var line in cached.Lines) recognitionLines[i].Add(line.Key, line.Value);
+            }
+            observeStage?.Invoke(new("recognition-cache", phase.Elapsed.TotalMilliseconds, reused.Count(hit => hit)));
             foreach (var entry in _recognizers)
             {
                 token.ThrowIfCancellationRequested();
-                var indices = Enumerable.Range(0,crops.Count).Where(i => !candidates[i].Any(candidate =>
+                var indices = Enumerable.Range(0,crops.Count).Where(i => !reused[i] && !candidates[i].Any(candidate =>
                     candidate.Script == "latin" && candidate.Confidence >= .99
                     && candidate.Text.Count(char.IsLetter) >= 4
                     && candidate.Text.All(c => c < '\u0250'))).ToArray();
@@ -143,6 +155,9 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
                         lines[i].CharScores, entry.Script));
                 }
             }
+            token.ThrowIfCancellationRequested();
+            for (var i = 0; i < crops.Count; i++)
+                if (!reused[i]) _lineCache.Store(pixels[i], new(candidates[i].ToArray(), recognitionLines[i]));
             if (observeCandidates is not null)
                 for (var i = 0; i < candidates.Length; i++) observeCandidates(bounds[i], candidates[i].ToArray());
             return candidates.Select((choices, i) => (Selection: ScriptOcrSelection.SelectWithReview(choices), Bounds: bounds[i], Index: i))
@@ -180,6 +195,6 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
             try { _detector?.Dispose(); }
             finally { foreach (var entry in _recognizers) entry.Recognizer.Dispose(); }
         }
-        _detector = null; _recognizers.Clear();
+        _detector = null; _recognizers.Clear(); _lineCache.Clear();
     })));
 }

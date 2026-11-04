@@ -16,8 +16,12 @@
                 <Button x:Name="RetryButton" Grid.Column="2" Content="重试" Click="OnRetry" Visibility="Collapsed"
                         Margin="8,0,0,0" Padding="8,4" Foreground="White" Background="#33445C" BorderThickness="0" />
             </Grid>
-            <TextBlock x:Name="StatusText" Grid.Row="2" Text="正在启动本地机翻…" Foreground="#D5DCE7" FontSize="12" AutomationProperties.LiveSetting="Polite"
+            <Grid Grid.Row="2"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <TextBlock x:Name="StatusText" Text="正在启动本地机翻…" Foreground="#D5DCE7" FontSize="12" AutomationProperties.LiveSetting="Polite"
                        LineHeight="17" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" />
+            <Button x:Name="ReadingButton" Grid.Column="1" Content="阅读译文" Click="OnReadTranslation" Visibility="Collapsed"
+                    Margin="6,0,0,0" Padding="6,4" VerticalAlignment="Top" Foreground="White" Background="#33445C" BorderThickness="0" />
+            </Grid>
         </Grid>
     </Border>
 </Window>

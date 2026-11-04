@@ -83,7 +83,9 @@ internal static class FontConsistencyTests
         var articleOnly = InPlaceLayoutService.BuildRegionPlan(bitmap, [regions[0]],
             [new(true, "主要文章", "machine-completed")]);
         var isolatedArticleSize = articleOnly.Items.Single().TextLayout!.FontSizePixels;
-        if (articleSize < isolatedArticleSize - .01 || articleSize <= sidebarSize + 3)
+        // A safely expanded sidebar can now retain a full-size font as well.
+        // Its size is not evidence that the independent article was shrunk.
+        if (articleSize < isolatedArticleSize - .01)
             throw new Exception($"A constrained sidebar reduced the article font: {articleSize} "
                 + $"vs isolated {isolatedArticleSize}; sidebar {sidebarSize}.");
 

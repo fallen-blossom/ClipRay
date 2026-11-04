@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
 using ClipRay.App.Settings;
+using ClipRay.App.Overlay;
 using Forms = System.Windows.Forms;
 
 namespace ClipRay.App.LiveTranslation;
@@ -11,6 +12,8 @@ public partial class LiveTranslationStopControlWindow : Window
     private readonly System.Drawing.Rectangle _region;
     private readonly System.Drawing.Rectangle _bounds;
     private readonly string _interfaceLanguage;
+    private string? _readingText;
+    private TranslationReadingWindow? _reader;
 
     public LiveTranslationStopControlWindow(System.Drawing.Rectangle region, string interfaceLanguage = "zh-CN")
     {
@@ -26,6 +29,9 @@ public partial class LiveTranslationStopControlWindow : Window
         RetryButton.Content = T("重试", "Retry");
         StatusText.Text = T("正在启动本地机翻…", "Starting local machine translation…");
         SourceInitialized += OnSourceInitialized;
+        ReadingButton.Content = T("阅读译文", "Read text");
+        ReadingButton.ToolTip = T("阅读未原位显示的成功译文", "Read successful translations kept off the image");
+        Closed += (_, _) => ClearReadingFallback();
     }
 
     private string T(string chinese, string english) => AppInterfaceLanguage.Text(_interfaceLanguage, chinese, english);
@@ -48,6 +54,42 @@ public partial class LiveTranslationStopControlWindow : Window
     public event EventHandler? RequestRetry;
 
     public bool CanPlaceOutside { get; }
+
+    // Caller must supply only the latest committed, source-pixel-validated frame.
+    public void SetReadingFallback(string text)
+    {
+        if (!Dispatcher.CheckAccess()) { Dispatcher.Invoke(() => SetReadingFallback(text)); return; }
+        if (string.IsNullOrWhiteSpace(text)) { ClearReadingFallback(); return; }
+        _readingText = text;
+        ReadingButton.Visibility = Visibility.Visible;
+        _reader?.UpdateText(text);
+    }
+
+    public void ClearReadingFallback()
+    {
+        if (!Dispatcher.CheckAccess()) { Dispatcher.Invoke(ClearReadingFallback); return; }
+        _readingText = null;
+        ReadingButton.Visibility = Visibility.Collapsed;
+        _reader?.Close();
+        _reader = null;
+    }
+
+    private void OnReadTranslation(object sender, RoutedEventArgs e)
+    {
+        if (_readingText is null) return;
+        if (_reader is not null) { _reader.Activate(); return; }
+        var reader = new TranslationReadingWindow(_readingText, _interfaceLanguage == "en") { Owner = this };
+        // Do not expose the reading surface to the source capture or other recordings.
+        if (!reader.ExcludeFromCapture())
+        {
+            reader.Close();
+            ShowStatus(T("阅读窗口无法排除截图，请重试", "Reader could not be excluded from capture. Try again."));
+            return;
+        }
+        _reader = reader;
+        reader.Closed += (_, _) => { if (ReferenceEquals(_reader, reader)) _reader = null; ReadingButton.Focus(); };
+        reader.Show();
+    }
 
     private void OnStop(object sender, RoutedEventArgs e) => RequestStop?.Invoke(this, EventArgs.Empty);
     private void OnRetry(object sender, RoutedEventArgs e) => RequestRetry?.Invoke(this, EventArgs.Empty);

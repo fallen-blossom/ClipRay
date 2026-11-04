@@ -52,13 +52,20 @@ internal static class LiveTranslationViewportResultPolicy
 
     internal static LiveTranslationViewportResultState Classify(
         LiveTranslationFrame frame,
-        LiveTranslationViewportMetrics metrics)
+        LiveTranslationViewportMetrics metrics, int verifiedReadingCount=0)
     {
-        if (frame.ResultState is LiveTranslationViewportResultState.Failed
-            or LiveTranslationViewportResultState.Stale)
+        if (frame.ResultState is LiveTranslationViewportResultState.Stale)
             return frame.ResultState;
+        // Reading fallback cannot authorize an unsafe retained overlay. Commit
+        // normally quarantines these; retained-frame remeasurement must also
+        // keep collisions, clipping and unreadable text behind the same gate.
         if (metrics.HasUnsafeLayout)
             return LiveTranslationViewportResultState.Failed;
+        // Reading entries are independently verified successful translations;
+        // they remain usable even when no original-position text can fit.
+        if(verifiedReadingCount>0) return LiveTranslationViewportResultState.AcceptablePartial;
+        if(frame.ResultState is LiveTranslationViewportResultState.Failed)
+            return frame.ResultState;
         if (metrics.ExpectedLayouts == 0)
             return frame.ErrorCategory == "none"
                 ? LiveTranslationViewportResultState.Ready

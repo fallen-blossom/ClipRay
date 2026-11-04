@@ -211,24 +211,6 @@ public static class InPlaceLayoutService
                 candidates[index].LayoutBounds,
                 candidates[index].Style);
         }
-        foreach (var cohort in candidates
-            .Select((candidate, index) => (candidate, index))
-            .Where(item => item.candidate.CohortId >= 0
-                && item.candidate.Region.Role != VisualTextRole.Body
-                && layouts[item.index].ShouldRender)
-            .GroupBy(static item => item.candidate.CohortId))
-        {
-            var sharedFontSize = cohort.Min(item => layouts[item.index].FontSizePixels);
-            foreach (var item in cohort)
-            {
-                layouts[item.index] = TranslationTextLayoutPolicy.FitAtMost(
-                    item.candidate.Text,
-                    item.candidate.LayoutBounds,
-                    item.candidate.Style,
-                    sharedFontSize);
-            }
-        }
-
         var items = new List<InPlaceLayoutItem>();
         for (var index = 0; index < candidates.Count; index++)
         {

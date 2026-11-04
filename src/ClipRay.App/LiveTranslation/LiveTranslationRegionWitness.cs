@@ -56,6 +56,13 @@ internal sealed class LiveTranslationRegionWitness
         return new(entries.ToArray());
     }
 
+    // Anchor reuse requires exact pixels. A uniform background adjustment is
+    // useful for display retention, but cannot certify the old text geometry.
+    public IReadOnlyList<InPlaceLayoutItem> ExactUnchangedItems(LiveTranslationPixelSnapshot current) =>
+        _entries.Where(entry=>entry.Bounds.Right<=current.Width && entry.Bounds.Bottom<=current.Height
+            && current.Hash(entry.Bounds).AsSpan().SequenceEqual(entry.Hash))
+            .Select(entry=>entry.Item).ToArray();
+
     public LiveTranslationRegionWitness RetainUnchanged(LiveTranslationPixelSnapshot current)
     {
         var retained = new List<Entry>();
