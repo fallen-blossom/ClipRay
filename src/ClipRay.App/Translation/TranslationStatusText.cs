@@ -8,6 +8,28 @@ public static class TranslationStatusText
     public const string DeepSeekPrivacyNotice = "云端仅发送 OCR 文本，不上传截图。";
     public const string LocalCompleted = "本地 LMT 翻译完成；未使用网络。";
 
+    public static string FormatOverlayOutcome(TranslationRouteKind route,
+        ApplicationTranslationOutcome outcome, DeepSeekCostEstimate? costEstimate = null)
+    {
+        var provider = route == TranslationRouteKind.Machine ? "本地机翻"
+            : route is TranslationRouteKind.DeepSeekFlash or TranslationRouteKind.DeepSeekPro ? "DeepSeek" : "本地 LMT";
+        var failures = outcome.Results.Count(static result => !result.IsSuccess);
+        var layoutFailures = outcome.LayoutRejections?.Count(static rejection =>
+            rejection.Reason != "identity-pixels-preserved") ?? 0;
+        var preserved = Math.Max(0, outcome.Regions.Count - outcome.LayoutItems.Count - failures - layoutFailures);
+        var complete = outcome.IsSuccess && failures == 0 && layoutFailures == 0;
+        var status = $"{(complete ? "翻译完成" : "翻译未完成")} · {provider}{FormatCompactCostEstimate(costEstimate)} · 已替换 {outcome.LayoutItems.Count} 处";
+        if (preserved > 0) status += $"，按规则保留 {preserved} 处";
+        if (failures > 0) status += $"，翻译失败 {failures} 处";
+        if (layoutFailures > 0) status += $"，排版未显示 {layoutFailures} 处";
+        if (outcome.LayoutItems.Any(static item => item.UnresolvedSourceStyleSpanCount > 0))
+            status += "，部分颜色或字号未能准确还原";
+        if (!complete) status += "；可切换模型重试，成功译文已保留。";
+        if (outcome.ExecutionTrace is { RecoveredCount: > 0 } trace)
+            status += $" · 机翻兜底恢复 {trace.RecoveredCount} 处";
+        return status;
+    }
+
     public static string FormatOverlayCompletion(
         bool isDeepSeek,
         int changedCount,

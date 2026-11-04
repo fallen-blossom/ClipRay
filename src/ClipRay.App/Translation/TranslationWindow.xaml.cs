@@ -48,7 +48,9 @@ public partial class TranslationWindow : Window
         _interfaceLanguage = AppInterfaceLanguage.Normalize(interfaceLanguage);
         _routeFileChecks = TranslationRouteCatalog.Options.ToDictionary(option => option.Kind,
             option => fileCheck?.Invoke(option.Kind));
+        Presentation.UtilityWindowTheme.Prepare();
         InitializeComponent();
+        Presentation.UtilityWindowTheme.ApplyPalette(this);
         SettingsText.SetLanguage(this, _interfaceLanguage);
         Title = T("ClipRay 翻译", "ClipRay Translation");
         RouteBox.ItemsSource = TranslationRouteCatalog.Options
@@ -182,7 +184,17 @@ public partial class TranslationWindow : Window
 
     private void InvalidatePendingTranslation()
     {
-        if (_closed || _pendingOperation is null) return;
+        if (_closed) return;
+        if (_pendingOperation is null)
+        {
+            if (!string.IsNullOrWhiteSpace(ResultText.Text))
+            {
+                ProgressStatus.Text = T("输入、模型或语言已改变；下方保留上次译文，请重新翻译。",
+                    "Text, model or language changed. The previous translation is kept below; translate again.");
+                ProgressStatus.ToolTip = null;
+            }
+            return;
+        }
         _operations.CancelPending();
         _pendingOperation = null;
         _pendingRequest = null;
@@ -303,7 +315,7 @@ public partial class TranslationWindow : Window
         model,
         request.TextKind,
         request.Scene,
-        request.TranslationHint);
+        request.TranslationHint) { SourceSpans = request.SourceSpans };
 
     private static string NormalizeLanguage(string value) => string.IsNullOrWhiteSpace(value) ? "auto" : value.Trim() switch
     {

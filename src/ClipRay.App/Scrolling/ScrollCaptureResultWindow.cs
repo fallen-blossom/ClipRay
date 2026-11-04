@@ -23,6 +23,8 @@ public sealed class ScrollCaptureResultWindow : Window
     private readonly string _savedPath;
     private readonly Func<bool>? _copyAgain;
     private readonly Func<Func<bool>, Task<bool>>? _copyAgainAsync;
+    private readonly Func<Func<bool>, Task<MediaCopyOutcome>>? _copyAgainWithOutcomeAsync;
+    private readonly System.Windows.Controls.Button _copyButton;
     private bool _copyPending;
     private bool _closed;
     internal Task LastCopyOperation { get; private set; } = Task.CompletedTask;
@@ -34,13 +36,14 @@ public sealed class ScrollCaptureResultWindow : Window
     private double _panStartVerticalOffset;
     private readonly string _language;
 
-    public ScrollCaptureResultWindow(Bitmap bitmap, ScrollCaptureStopReason reason, string savedPath, bool clipboardCopied, Func<bool>? copyAgain = null, string interfaceLanguage = "zh-CN", bool clipboardRequested = true, System.Windows.Media.Imaging.BitmapSource? previewSource = null, Func<Func<bool>, Task<bool>>? copyAgainAsync = null)
+    public ScrollCaptureResultWindow(Bitmap bitmap, ScrollCaptureStopReason reason, string savedPath, bool clipboardCopied, Func<bool>? copyAgain = null, string interfaceLanguage = "zh-CN", bool clipboardRequested = true, System.Windows.Media.Imaging.BitmapSource? previewSource = null, Func<Func<bool>, Task<bool>>? copyAgainAsync = null, bool clipboardPersistenceConfirmed = true, Func<Func<bool>, Task<MediaCopyOutcome>>? copyAgainWithOutcomeAsync = null)
     {
         _language = AppInterfaceLanguage.Normalize(interfaceLanguage);
         ArgumentNullException.ThrowIfNull(bitmap);
         _savedPath = Path.GetFullPath(savedPath ?? throw new ArgumentNullException(nameof(savedPath)));
         _copyAgain = copyAgain;
         _copyAgainAsync = copyAgainAsync;
+        _copyAgainWithOutcomeAsync = copyAgainWithOutcomeAsync;
         Closed += (_, _) => _closed = true;
         Title = reason is ScrollCaptureStopReason.EndOfScroll or ScrollCaptureStopReason.CompletedByUser
             ? T("长截图结果", "Scrolling capture result") : T("长截图部分结果", "Partial scrolling capture");
@@ -91,8 +94,13 @@ public sealed class ScrollCaptureResultWindow : Window
         toolbar.Children.Add(CreateToolbarButton(ToolbarIconKind.FitWidth, "适合宽度", ApplyFitWidth));
         toolbar.Children.Add(CreateToolbarButton(ToolbarIconKind.Reset, "原始大小", () => SetZoom(1, false)));
         toolbar.Children.Add(CreateToolbarButton(ToolbarIconKind.Folder, "在文件夹中显示", ShowInFolder));
-        toolbar.Children.Add(CreateToolbarButton(ToolbarIconKind.Copy, "再次复制", CopyAgain));
-        toolbar.Children.Add(CreateToolbarButton(ToolbarIconKind.Complete, "关闭", Close, ToolbarIconTone.Confirm));
+        _copyButton = CreateToolbarButton(ToolbarIconKind.Copy, "再次复制", CopyAgain);
+        _copyButton.IsEnabled = copyAgain is not null || copyAgainAsync is not null || copyAgainWithOutcomeAsync is not null;
+        toolbar.Children.Add(_copyButton);
+        var close = CreateToolbarButton(ToolbarIconKind.Complete, "关闭（Enter / Esc）", Close, ToolbarIconTone.Confirm);
+        close.IsDefault = true;
+        close.IsCancel = true;
+        toolbar.Children.Add(close);
 
         var root = new DockPanel();
         DockPanel.SetDock(toolbar, Dock.Bottom);
@@ -101,14 +109,16 @@ public sealed class ScrollCaptureResultWindow : Window
         root.Children.Add(_saveStatus);
         root.Children.Add(_viewer);
         Content = root;
-        _saveStatus.Text = SavedStatus(_language, clipboardRequested, clipboardCopied) + "\n" + _savedPath;
+        _saveStatus.Text = SavedStatus(_language, clipboardRequested, clipboardCopied, clipboardPersistenceConfirmed) + "\n" + _savedPath;
         _saveStatus.ToolTip = _saveStatus.Text;
         Loaded += (_, _) => ApplyFitWidth();
     }
 
     private string T(string chinese, string english) => AppInterfaceLanguage.Text(_language, chinese, english);
 
-    public static string SavedStatus(string language, bool clipboardRequested, bool clipboardCopied) => clipboardCopied
+    public static string SavedStatus(string language, bool clipboardRequested, bool clipboardCopied, bool clipboardPersistenceConfirmed = true) => clipboardCopied && !clipboardPersistenceConfirmed
+        ? AppInterfaceLanguage.Text(language, "已保存并复制；退出后的剪贴板保留未确认：", "Saved and copied; clipboard persistence after exit is unconfirmed:")
+        : clipboardCopied
         ? AppInterfaceLanguage.Text(language, "已保存并复制：", "Saved and copied:")
         : clipboardRequested
             ? AppInterfaceLanguage.Text(language, "已保存，但复制未完成。可点击“再次复制”重试。", "Saved, but not copied. Choose Copy again to retry.")
@@ -116,7 +126,13 @@ public sealed class ScrollCaptureResultWindow : Window
 
     private void ShowInFolder()
     {
-        Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_savedPath}\"") { UseShellExecute = true });
+        try { Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_savedPath}\"") { UseShellExecute = true }); }
+        catch
+        {
+            _saveStatus.Text = T("PNG 已保存，但文件夹未能打开；可按显示路径手动查找。", "PNG is saved, but the folder could not be opened. Use the displayed path to find it.") + "\n" + _savedPath;
+            _saveStatus.ToolTip = _saveStatus.Text;
+            _saveStatus.Foreground = System.Windows.Media.Brushes.OrangeRed;
+        }
     }
 
     private void CopyAgain()
@@ -129,19 +145,29 @@ public sealed class ScrollCaptureResultWindow : Window
     {
         _copyPending = true;
         var copied = false;
+        var persistenceConfirmed = true;
+        _copyButton.IsEnabled = false;
         try
         {
             _saveStatus.Text = T("正在复制…", "Copying…");
-            copied = _copyAgainAsync is not null
+            if (_copyAgainWithOutcomeAsync is not null)
+            {
+                var outcome = await _copyAgainWithOutcomeAsync(() => !_closed);
+                copied = outcome.Copied;
+                persistenceConfirmed = outcome.PersistenceConfirmed;
+            }
+            else copied = _copyAgainAsync is not null
                 ? await _copyAgainAsync(() => !_closed)
                 : _copyAgain?.Invoke() == true;
         }
         catch { }
-        finally { _copyPending = false; }
+        finally { _copyPending = false; if (!_closed) _copyButton.IsEnabled = true; }
         if (_closed) return;
-        _saveStatus.Text = copied ? T($"已重新复制：\n{_savedPath}", $"Copied again:\n{_savedPath}") : T($"复制未完成：\n{_savedPath}", $"Copy did not complete:\n{_savedPath}");
+        _saveStatus.Text = copied && !persistenceConfirmed
+            ? SavedStatus(_language, true, true, false) + "\n" + _savedPath
+            : copied ? T($"已重新复制：\n{_savedPath}", $"Copied again:\n{_savedPath}") : T($"复制未完成：\n{_savedPath}", $"Copy did not complete:\n{_savedPath}");
         _saveStatus.ToolTip = _saveStatus.Text;
-        _saveStatus.Foreground = copied ? System.Windows.Media.Brushes.LightGreen : System.Windows.Media.Brushes.OrangeRed;
+        _saveStatus.Foreground = copied && persistenceConfirmed ? System.Windows.Media.Brushes.LightGreen : System.Windows.Media.Brushes.OrangeRed;
     }
 
     private System.Windows.Controls.Button CreateToolbarButton(ToolbarIconKind icon, string label, Action action, ToolbarIconTone tone = ToolbarIconTone.Primary)
@@ -149,7 +175,7 @@ public sealed class ScrollCaptureResultWindow : Window
         if (_language == "en") label = label switch
         {
             "缩小" => "Zoom out", "放大" => "Zoom in", "适合宽度" => "Fit width", "原始大小" => "Original size",
-            "在文件夹中显示" => "Show in folder", "再次复制" => "Copy again", "关闭" => "Close", _ => label
+            "在文件夹中显示" => "Show in folder", "再次复制" => "Copy again", "关闭" => "Close", "关闭（Enter / Esc）" => "Close (Enter / Esc)", _ => label
         };
         var button = new System.Windows.Controls.Button
         {

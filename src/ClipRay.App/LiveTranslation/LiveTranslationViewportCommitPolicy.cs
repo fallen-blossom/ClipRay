@@ -36,11 +36,14 @@ internal static class LiveTranslationViewportCommitPolicy
     {
         var changes = LiveTranslationChangePlanner.Analyze(source, current, sourceRegions);
         var expected = frame.ExpectedLayoutCount > 0 ? frame.ExpectedLayoutCount : candidate.Count;
-        if (changes.IsViewportReplacement && !sourceGeometryVerified)
+        // Pixel-change shape can also come from segmented video. Inspect the
+        // region witnesses before treating it as a whole-viewport replacement.
+        // These entries certify their own source/render pixels independently.
+        var witness = candidate.RetainForViewportCommit(current, sameSourceText, sourceRegions);
+        if (changes.IsViewportReplacement && !sourceGeometryVerified && witness.Count == 0)
             return new(LiveTranslationViewportCommitState.Stale, LiveTranslationRegionWitness.Empty,
                 LiveTranslationViewportResultState.Stale,
                 new(expected, candidate.Count, 0, frame.RejectedLayoutCount), []);
-        var witness = candidate.RetainForViewportCommit(current, sameSourceText, sourceRegions);
         var items = witness.Items;
         var rejected = new Dictionary<InPlaceLayoutItem, string>(ReferenceEqualityComparer.Instance);
         foreach (var item in items)

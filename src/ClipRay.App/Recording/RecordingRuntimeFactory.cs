@@ -7,6 +7,7 @@ internal sealed class RecordingRuntimeFactory : IRecordingRuntime
     private readonly Func<ISystemAudioCapture?> _createAudio;
     private readonly Func<AudioCaptureFormat?,IMediaFoundationRecorder> _createEncoder;
     private readonly Func<IGraphicsCaptureSource> _createVideo;
+    private readonly Action? _beforeCapture;
     private ISystemAudioCapture? _audio;
     private IMediaFoundationRecorder? _encoder;
     private IGraphicsCaptureSource? _video;
@@ -16,8 +17,8 @@ internal sealed class RecordingRuntimeFactory : IRecordingRuntime
     public RecordingFaultSignal Faults { get; }
     public RecordingStopReport? Report { get; private set; }
     internal RecordingRuntimeFactory(Func<ISystemAudioCapture?> audio,Func<AudioCaptureFormat?,IMediaFoundationRecorder> encoder,
-        Func<IGraphicsCaptureSource> video,RecordingFaultSignal faults)
-    { _createAudio=audio;_createEncoder=encoder;_createVideo=video;Faults=faults; }
+        Func<IGraphicsCaptureSource> video,RecordingFaultSignal faults,Action? beforeCapture = null)
+    { _createAudio=audio;_createEncoder=encoder;_createVideo=video;Faults=faults;_beforeCapture=beforeCapture; }
     public Task StartAsync(CancellationToken token)
     {
         lock (_sync)
@@ -29,7 +30,7 @@ internal sealed class RecordingRuntimeFactory : IRecordingRuntime
                 _audio = RecordingStartupGuard.Execute(RecordingStartupStage.AudioDevice,_createAudio);
                 CheckStart(token); _encoder = _createEncoder(_audio?.Format);
                 CheckStart(token); _video = _createVideo();
-                CheckStart(token); _inner = new(_video,_audio,_encoder,Faults);
+                CheckStart(token); _inner = new(_video,_audio,_encoder,Faults,_beforeCapture);
                 await _inner.StartAsync(token).ConfigureAwait(false);
             });
         }

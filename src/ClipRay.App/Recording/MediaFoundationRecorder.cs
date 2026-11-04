@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.IO;
+using Vortice.Direct3D11;
 using Vortice.MediaFoundation;
 
 namespace ClipRay.App.Recording;
@@ -7,6 +8,9 @@ namespace ClipRay.App.Recording;
 public interface IMediaFoundationRecorder : IAsyncDisposable
 {
     RecordingStopReport? Report => null;
+    RecordingEncoderDiagnostics? EncoderDiagnostics => null;
+    ID3D11Device? SharedDevice => null;
+    bool AcceptsGpuFrames => false;
     Task StartAsync(CancellationToken cancellationToken);
 
     ValueTask WriteVideoAsync(VideoRecordingSample sample);
@@ -23,25 +27,40 @@ internal sealed class NativeRecordingEncoderBackend : IRecordingEncoderBackend
     private readonly int _width;
     private readonly int _height;
     private readonly AudioCaptureFormat? _audioFormat;
+    private readonly RecordingVideoOptions _videoOptions;
+    private readonly bool _preferGpuInput;
     private IMFSinkWriter? _writer;
+    private RecordingGpuVideoInput? _gpuInput;
     private int _videoStream;
     private int _audioStream;
     private int _started;
     public bool BeganWriting { get; private set; }
     private bool _mediaFoundationStarted;
+    public RecordingEncoderDiagnostics? EncoderDiagnostics { get; private set; }
+    public ID3D11Device? SharedDevice => BeganWriting ? _gpuInput?.Device : null;
+    public bool AcceptsGpuFrames => BeganWriting && _gpuInput is not null;
 
     public NativeRecordingEncoderBackend(
         RecordingOutputPaths paths,
         int width,
         int height,
-        AudioCaptureFormat? audioFormat)
+        AudioCaptureFormat? audioFormat,
+        RecordingVideoOptions? videoOptions = null,
+        bool preferGpuInput = false)
     {
         if (width < 2 || (width & 1) != 0) throw new ArgumentOutOfRangeException(nameof(width));
         if (height < 2 || (height & 1) != 0) throw new ArgumentOutOfRangeException(nameof(height));
-        _paths = paths;
+        _paths = paths with
+        {
+            PartialPath = ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(paths.PartialPath),
+            FinalPath = ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(paths.FinalPath),
+        };
         _width = width;
         _height = height;
         _audioFormat = audioFormat;
+        _videoOptions = videoOptions ?? new RecordingVideoOptions();
+        _videoOptions.Validate();
+        _preferGpuInput = preferGpuInput;
     }
 
     public void Start(CancellationToken cancellationToken)
@@ -52,16 +71,64 @@ internal sealed class NativeRecordingEncoderBackend : IRecordingEncoderBackend
         using (new FileStream(_paths.PartialPath, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
         RecordingStartupGuard.Execute(RecordingStartupStage.MediaFoundation, () => MediaFactory.MFStartup());
         _mediaFoundationStarted = true;
-        using var attributes = CreateSinkWriterAttributes();
-        _writer = RecordingStartupGuard.Execute(RecordingStartupStage.Mp4SinkWriter,
-            () => MediaFactory.MFCreateSinkWriterFromURL(_paths.PartialPath, null, attributes));
-        RecordingStartupGuard.Execute(RecordingStartupStage.VideoEncoder, () => ConfigureVideo(_writer));
-        if (_audioFormat is not null) RecordingStartupGuard.Execute(RecordingStartupStage.AudioEncoder, () => ConfigureAudio(_writer));
-        RecordingStartupGuard.Execute(RecordingStartupStage.SinkWriterStart, _writer.BeginWriting);
+        string? gpuFallbackReason = null;
+        if (_preferGpuInput)
+        {
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _gpuInput = RecordingGpuVideoInput.Create(_width, _height, _videoOptions.FramesPerSecond);
+                CreateWriter();
+                ConfigureVideo(_writer!);
+                EncoderDiagnostics = InspectEncoder();
+                var encoder = EncoderDiagnostics.Transforms.SingleOrDefault(item => item.Category == TransformCategoryGuids.VideoEncoder);
+                if (encoder is not { IsHardwareAccelerated: true, IsD3D11Aware: true })
+                    throw new NotSupportedException("The selected H.264 encoder does not expose D3D11 hardware input.");
+                _gpuInput.SetEncoderBindFlags(RecordingEncoderConfiguration.GetEncoderBindFlags(_writer!, _videoStream));
+            }
+            catch (Exception error) when (error is not OperationCanceledException)
+            {
+                gpuFallbackReason = $"{error.GetType().Name}:0x{unchecked((uint)error.HResult):X8}:{error.Message}";
+                // No sample has been submitted and BeginWriting has not run. Release all
+                // references before reopening the same reserved partial file with RGB32 input.
+                ReleaseWriter();
+                EncoderDiagnostics = null;
+            }
+        }
+        if (_writer is null)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            CreateWriter();
+            RecordingStartupGuard.Execute(RecordingStartupStage.VideoEncoder, () => ConfigureVideo(_writer!));
+            EncoderDiagnostics = InspectEncoder();
+        }
+        EncoderDiagnostics = EncoderDiagnostics! with
+        {
+            GpuInputRequested = _preferGpuInput,
+            GpuInputEnabled = _gpuInput is not null,
+            GpuFallbackReason = gpuFallbackReason
+        };
+        var activeWriter = _writer ?? throw new InvalidOperationException("Video encoder setup did not produce a Sink Writer.");
+        if (_audioFormat is not null) RecordingStartupGuard.Execute(RecordingStartupStage.AudioEncoder, () => ConfigureAudio(activeWriter));
+        RecordingStartupGuard.Execute(RecordingStartupStage.SinkWriterStart, activeWriter.BeginWriting);
         BeganWriting = true;
     }
     public void FinalizeEncoding() => _writer!.Finalize();
-    public void ReleaseWriter() { _writer?.Dispose(); _writer = null; }
+    private void CreateWriter()
+    {
+        using var attributes = CreateSinkWriterAttributes();
+        if (_gpuInput is not null) attributes.Set(SinkWriterAttributeKeys.D3DManager, _gpuInput.Manager).CheckError();
+        _writer = RecordingStartupGuard.Execute(RecordingStartupStage.Mp4SinkWriter,
+            () => MediaFactory.MFCreateSinkWriterFromURL(_paths.PartialPath, null, attributes));
+    }
+    private RecordingEncoderDiagnostics InspectEncoder() => RecordingEncoderConfiguration.Configure(_writer!, _videoStream, _videoOptions,
+        RecordingBitratePolicy.ForFrameSize(_width, _height, _videoOptions.FramesPerSecond, _videoOptions.Quality),
+        _gpuInput is not null ? "NV12/D3D11" : "RGB32");
+    public void ReleaseWriter()
+    {
+        _writer?.Dispose(); _writer = null;
+        _gpuInput?.Dispose(); _gpuInput = null;
+    }
     public void Shutdown()
     {
         if (_writer is not null) throw new InvalidOperationException("Writer still owns Media Foundation.");
@@ -69,8 +136,17 @@ internal sealed class NativeRecordingEncoderBackend : IRecordingEncoderBackend
     }
     public void WriteVideo(VideoRecordingSample sample)
     {
-        if (sample.Width != _width || sample.Height != _height || sample.BgraPixels.Length != checked(_width * _height * 4))
+        if (sample.Width != _width || sample.Height != _height)
             throw new InvalidOperationException("Video sample dimensions do not match the encoder.");
+        if (_gpuInput is not null)
+        {
+            var writer = _writer ?? throw new InvalidOperationException("Recorder is not running.");
+            using var nativeSample = _gpuInput.CreateSample(sample);
+            writer.WriteSample(_videoStream, nativeSample);
+            return;
+        }
+        if (sample.GpuTexture is not null || sample.BgraPixels.Length != checked(_width * _height * 4))
+            throw new InvalidOperationException("The CPU encoder requires a complete BGRA byte sample.");
         Write(sample.BgraPixels,sample.Timestamp100Nanoseconds,sample.Duration100Nanoseconds,_videoStream);
     }
     public void WriteAudio(AudioRecordingSample sample)
@@ -87,17 +163,19 @@ internal sealed class NativeRecordingEncoderBackend : IRecordingEncoderBackend
         writer.WriteSample(stream,sample);
     }
 
-    /// <summary>
-    /// 允许 Sink Writer 选用 Media Foundation 硬件 MFT；2560x1600 八秒录制实测
-    /// CPU 由 31s 降到 20s（软件编码路径）。
-    /// </summary>
+    /// <summary>Permit hardware MFT selection; the actual selected transform is reported separately.</summary>
     private static readonly Guid EnableHardwareTransforms = new("a634a91c-822b-41b9-a494-4de4643612b0");
 
     /// <summary>Keep native backpressure; application queues and held samples are bounded separately.</summary>
     public static IMFAttributes CreateSinkWriterAttributes()
     {
-        var attributes = MediaFactory.MFCreateAttributes(1);
-        try { attributes.Set(EnableHardwareTransforms, 1u); return attributes; }
+        var attributes = MediaFactory.MFCreateAttributes(2);
+        try
+        {
+            attributes.Set(EnableHardwareTransforms, 1u).CheckError();
+            attributes.Set(SinkWriterAttributeKeys.LowLatency, 1u).CheckError();
+            return attributes;
+        }
         catch { attributes.Dispose(); throw; }
     }
 
@@ -106,22 +184,36 @@ internal sealed class NativeRecordingEncoderBackend : IRecordingEncoderBackend
         using var output = MediaFactory.MFCreateMediaType();
         output.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
         output.Set(MediaTypeAttributeKeys.Subtype, H264Format);
-        output.Set(MediaTypeAttributeKeys.AvgBitrate, RecordingBitratePolicy.ForFrameSize(_width, _height, RecordingFrameRatePolicy.FramesPerSecond));
+        output.Set(MediaTypeAttributeKeys.AvgBitrate, RecordingBitratePolicy.ForFrameSize(_width, _height, _videoOptions.FramesPerSecond, _videoOptions.Quality));
         output.Set(MediaTypeAttributeKeys.InterlaceMode, 2u);
         output.Set(MediaTypeAttributeKeys.FrameSize, PackRatio((uint)_width, (uint)_height));
-        output.Set(MediaTypeAttributeKeys.FrameRate, PackRatio((uint)RecordingFrameRatePolicy.FramesPerSecond, 1));
+        output.Set(MediaTypeAttributeKeys.FrameRate, PackRatio((uint)_videoOptions.FramesPerSecond, 1));
         output.Set(MediaTypeAttributeKeys.PixelAspectRatio, PackRatio(1, 1));
+        if (_gpuInput is not null) SetNv12ColorSpace(output);
         _videoStream = writer.AddStream(output);
 
         using var input = MediaFactory.MFCreateMediaType();
         input.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
-        input.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.Rgb32);
+        input.Set(MediaTypeAttributeKeys.Subtype, _gpuInput is not null ? VideoFormatGuids.NV12 : VideoFormatGuids.Rgb32);
         input.Set(MediaTypeAttributeKeys.InterlaceMode, 2u);
         input.Set(MediaTypeAttributeKeys.FrameSize, PackRatio((uint)_width, (uint)_height));
-        input.Set(MediaTypeAttributeKeys.FrameRate, PackRatio((uint)RecordingFrameRatePolicy.FramesPerSecond, 1));
+        input.Set(MediaTypeAttributeKeys.FrameRate, PackRatio((uint)_videoOptions.FramesPerSecond, 1));
         input.Set(MediaTypeAttributeKeys.PixelAspectRatio, PackRatio(1, 1));
-        input.Set(MediaTypeAttributeKeys.DefaultStride, (uint)(_width * 4));
+        input.Set(MediaTypeAttributeKeys.DefaultStride, (uint)(_gpuInput is not null ? _width : _width * 4));
+        if (_gpuInput is not null)
+        {
+            // Match the processor's RGB-full BT.709 -> YCbCr-studio BT.709 conversion.
+            SetNv12ColorSpace(input);
+        }
         writer.SetInputMediaType(_videoStream, input, null);
+    }
+
+    private static void SetNv12ColorSpace(IMFAttributes type)
+    {
+        type.Set(MediaTypeAttributeKeys.VideoPrimaries, 2u).CheckError();
+        type.Set(MediaTypeAttributeKeys.TransferFunction, 5u).CheckError();
+        type.Set(MediaTypeAttributeKeys.YuvMatrix, 1u).CheckError();
+        type.Set(MediaTypeAttributeKeys.VideoNominalRange, 2u).CheckError();
     }
 
     private void ConfigureAudio(IMFSinkWriter writer)

@@ -20,6 +20,10 @@ internal sealed class TranslationChildLifetime(Action requestStop, Func<Task> wa
 
     internal static Process Start(ProcessStartInfo info, Func<Exception> startFailure)
     {
+        NativeRuntimePrivacy.ConfigureLocalChild(info);
+        info.FileName = LocalPathPolicy.RequireLocal(info.FileName);
+        if (!string.IsNullOrWhiteSpace(info.WorkingDirectory))
+            info.WorkingDirectory = LocalPathPolicy.RequireLocal(info.WorkingDirectory);
         var process = new Process { StartInfo = info };
         try
         {

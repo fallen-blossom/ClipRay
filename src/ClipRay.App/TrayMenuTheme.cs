@@ -1,18 +1,42 @@
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 
 namespace ClipRay.App;
 
 internal static class TrayMenuTheme
 {
-    public static void Apply(ContextMenuStrip menu)
+    public static void Apply(ToolStripDropDown menu)
     {
         ArgumentNullException.ThrowIfNull(menu);
         menu.BackColor = Color.FromArgb(24, 29, 39);
         menu.ForeColor = Color.FromArgb(239, 243, 250);
         menu.Renderer = new ToolStripProfessionalRenderer(new DarkColorTable()) { RoundedEdges = false };
-        menu.ShowImageMargin = false;
-        menu.ShowCheckMargin = false;
+        if (menu is ToolStripDropDownMenu dropDown)
+        {
+            dropDown.ShowImageMargin = true;
+            dropDown.ShowCheckMargin = false;
+        }
+    }
+
+    public static Bitmap CreateSettingsIcon()
+    {
+        var image = new Bitmap(16, 16);
+        using var graphics = Graphics.FromImage(image);
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        // Eight teeth and a hollow center remain legible at the normal tray menu scale.
+        var points = Enumerable.Range(0, 32).Select(index =>
+        {
+            var angle = index * Math.PI / 16 - Math.PI / 2;
+            var radius = index % 4 is 0 or 3 ? 7f : 5.4f;
+            return new PointF(8 + (float)Math.Cos(angle) * radius, 8 + (float)Math.Sin(angle) * radius);
+        }).ToArray();
+        using var shape = new GraphicsPath(FillMode.Alternate);
+        shape.AddPolygon(points);
+        shape.AddEllipse(5.3f, 5.3f, 5.4f, 5.4f);
+        using var brush = new SolidBrush(Color.FromArgb(239, 243, 250));
+        graphics.FillPath(brush, shape);
+        return image;
     }
 
     private sealed class DarkColorTable : ProfessionalColorTable

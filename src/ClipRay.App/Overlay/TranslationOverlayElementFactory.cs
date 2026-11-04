@@ -22,32 +22,7 @@ public static class TranslationOverlayElementFactory
             throw new ArgumentOutOfRangeException(nameof(pixelScaleY));
 
         var layout = item.TextLayout ?? TranslationTextLayoutPolicy.CreatePreview(item.Bounds.Height);
-        var text = new TextBlock
-        {
-            Text = item.Text,
-            TextWrapping = TextWrapping.Wrap,
-            VerticalAlignment = VerticalAlignment.Center,
-            FontWeight = layout.FontWeight switch
-            {
-                SourceFontWeight.Bold => FontWeights.Bold,
-                SourceFontWeight.SemiBold => FontWeights.SemiBold,
-                _ => FontWeights.Normal,
-            },
-            FontStyle = layout.IsItalic ? FontStyles.Italic : FontStyles.Normal,
-            Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(
-                item.ForegroundColor.R, item.ForegroundColor.G, item.ForegroundColor.B)),
-            FontFamily = new System.Windows.Media.FontFamily(layout.FontFamilyName),
-            FontSize = layout.FontSizePixels / pixelScaleY,
-            LineHeight = layout.LineHeightPixels / pixelScaleY,
-            TextAlignment = layout.Alignment switch
-            {
-                SourceTextAlignment.Center => TextAlignment.Center,
-                SourceTextAlignment.Right => TextAlignment.Right,
-                _ => TextAlignment.Left,
-            },
-            RenderTransformOrigin = new System.Windows.Point(0.5, 0.5),
-            RenderTransform = new RotateTransform(layout.RotationDegrees),
-        };
+        var text = new TranslatedTextElement(item, layout, pixelScaleX, pixelScaleY);
         var container = new Grid { ClipToBounds = true };
         if (item.MaskedPatchPng is { Length: > 0 } maskedBytes)
         {
@@ -71,6 +46,30 @@ public static class TranslationOverlayElementFactory
         container.Width = Math.Max(0, Math.Max(1, item.Bounds.Width / pixelScaleX));
         container.Height = Math.Max(0, Math.Max(1, item.Bounds.Height / pixelScaleY));
         return container;
+    }
+
+    // Both the interactive overlay and PNG export draw the exact FormattedText
+    // measured by the layout policy. TextBlock has different wrapping/baseline
+    // behavior and could clip text that had passed the export layout checks.
+    private sealed class TranslatedTextElement(InPlaceLayoutItem item,
+        TranslationTextLayout layout, double scaleX, double scaleY) : FrameworkElement
+    {
+        protected override void OnRender(DrawingContext drawing)
+        {
+            if (!layout.ShouldRender) return;
+            drawing.PushTransform(new ScaleTransform(1 / scaleX, 1 / scaleY));
+            if (Math.Abs(layout.RotationDegrees) > .001)
+                drawing.PushTransform(new RotateTransform(layout.RotationDegrees,
+                    item.Bounds.Width / 2, item.Bounds.Height / 2));
+            drawing.PushClip(new RectangleGeometry(new Rect(0, 0, item.Bounds.Width, item.Bounds.Height)));
+            var color = item.ForegroundColor;
+            var formatted = TranslationTextLayoutPolicy.Format(item.Text, item.Bounds.Width, layout,
+                new SolidColorBrush(System.Windows.Media.Color.FromArgb(color.A, color.R, color.G, color.B)));
+            drawing.DrawText(formatted, new System.Windows.Point(0, 0));
+            drawing.Pop();
+            if (Math.Abs(layout.RotationDegrees) > .001) drawing.Pop();
+            drawing.Pop();
+        }
     }
 
     private static BitmapSource LoadBitmap(byte[] bytes)

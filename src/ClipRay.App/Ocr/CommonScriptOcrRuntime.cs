@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Diagnostics;
 using System.IO;
 using ClipRay.Core.Geometry;
 using RapidOcrNet;
@@ -11,7 +12,8 @@ namespace ClipRay.App.Ocr;
 // cannot remove a primary line merely because a tiny box overlaps it.
 internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<PixelRect, IReadOnlyList<ScriptOcrCandidate>>? observeCandidates = null,
     Action? initializeBackend = null, Func<SKBitmap, CancellationToken, IReadOnlyList<OcrWord>>? recognizeBackend = null,
-    Action? releaseBackend = null) : IOcrRuntime, IOcrWarmup, IDisposable, IAsyncDisposable
+    Action? releaseBackend = null, Action<OcrRuntimeStageTrace>? observeStage = null,
+    Action<SKBitmap, RapidOcrOptions>? observeDetectorInput = null) : IOcrRuntime, IOcrWarmup, IDisposable, IAsyncDisposable
 {
     internal static IReadOnlyList<string> RecognitionScripts { get; } = ["latin", "cjk"];
 
@@ -24,6 +26,7 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
     {
         if (initializeBackend is not null) { initializeBackend(); return; }
         if (_detector is not null) return;
+        NativeRuntimePrivacy.Initialize();
         var v5 = Path.Combine(AppContext.BaseDirectory, "models", "v5");
         var cjk = RapidOcrModelPaths.ResolveForRuntime();
         using var options = RapidOcr.GetDefaultSessionOptions(OcrExecutionPolicy.SelectThreads(Environment.ProcessorCount));
@@ -31,10 +34,10 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
         var detector = new RapidOcr();
         try
         {
-            detector.InitModels(Path.Combine(v5, "ch_PP-OCRv5_mobile_det.onnx"),
-                Path.Combine(v5, "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx"),
-                Path.Combine(v5, "latin_PP-OCRv5_rec_mobile_infer.onnx"),
-                Path.Combine(v5, "ppocrv5_latin_dict.txt"), options);
+            detector.InitModels(LocalPathPolicy.RequireLocal(Path.Combine(v5, "ch_PP-OCRv5_mobile_det.onnx")),
+                LocalPathPolicy.RequireLocal(Path.Combine(v5, "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx")),
+                LocalPathPolicy.RequireLocal(Path.Combine(v5, "latin_PP-OCRv5_rec_mobile_infer.onnx")),
+                LocalPathPolicy.RequireLocal(Path.Combine(v5, "ppocrv5_latin_dict.txt")), options);
             foreach (var script in includeKorean ? new[] { "latin", "cjk", "korean" } : RecognitionScripts)
             {
                 var paths = script switch
@@ -57,6 +60,8 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
         }
         void Add(string script, string model, string dictionary)
         {
+            model = LocalPathPolicy.RequireLocal(model);
+            dictionary = LocalPathPolicy.RequireLocal(dictionary);
             var recognizer = new TextRecognizer();
             try { recognizer.InitModel(model, dictionary, options); _recognizers.Add((script, Path.GetFileName(model), recognizer)); }
             catch { recognizer.Dispose(); throw; }
@@ -68,27 +73,42 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
         using var admission = _lifetime.Enter();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
         cancellationToken = linked.Token;
+        var phase = Stopwatch.StartNew();
         using var prepared = OcrPolarityPlan.CreatePreparedBitmap(bitmap);
         using var image = SKBitmap.Decode(await OcrBitmapEncoder.EncodePngAsync(prepared, null, cancellationToken).ConfigureAwait(false));
         if (image is null) throw new OcrUnavailableException("The local OCR image could not be decoded.");
+        observeStage?.Invoke(new("polarity-encode-decode", phase.Elapsed.TotalMilliseconds));
+        phase.Restart();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            observeStage?.Invoke(new("runtime-wait", phase.Elapsed.TotalMilliseconds));
             cancellationToken.ThrowIfCancellationRequested();
-            Initialize();
-            return await Task.Run(() => recognizeBackend is null ? Recognize(image, cancellationToken)
-                : recognizeBackend(image, cancellationToken), cancellationToken).ConfigureAwait(false);
+            return await Task.Run(() =>
+            {
+                phase.Restart();
+                Initialize();
+                observeStage?.Invoke(new("initialize", phase.Elapsed.TotalMilliseconds));
+                cancellationToken.ThrowIfCancellationRequested();
+                return recognizeBackend is null ? Recognize(image, cancellationToken) : recognizeBackend(image, cancellationToken);
+            }, cancellationToken).ConfigureAwait(false);
         }
         finally { _gate.Release(); }
     }
 
     private IReadOnlyList<OcrWord> Recognize(SKBitmap image, CancellationToken token)
     {
-        var boxes = _detector!.DetectBoxes(image, RapidOcrOptions.Default with { DoAngle = false, UnClipRatio = 1.0f });
+        var options = RapidOcrOptions.Default with { DoAngle = false, UnClipRatio = 1.0f };
+        observeDetectorInput?.Invoke(image, options);
+        var phase = Stopwatch.StartNew();
+        var boxes = _detector!.DetectBoxes(image, options);
+        observeStage?.Invoke(new("detect-boxes", phase.Elapsed.TotalMilliseconds, boxes.Count));
+        token.ThrowIfCancellationRequested();
         var crops = new List<SKBitmap>();
         var bounds = new List<PixelRect>();
         try
         {
+            phase.Restart();
             foreach (var box in boxes)
             {
                 var rect = new SKRectI(Math.Max(0, box.BoxPoints.Min(p => p.X) - 2),
@@ -101,8 +121,10 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
                 crops.Add(crop);
                 bounds.Add(new(rect.Left, rect.Top, rect.Width, rect.Height));
             }
+            observeStage?.Invoke(new("crop-lines", phase.Elapsed.TotalMilliseconds, crops.Count));
             if (crops.Count == 0) return [];
             var candidates = Enumerable.Range(0, crops.Count).Select(_ => new List<ScriptOcrCandidate>()).ToArray();
+            var recognitionLines = Enumerable.Range(0, crops.Count).Select(_ => new Dictionary<string, TextLine>()).ToArray();
             foreach (var entry in _recognizers)
             {
                 token.ThrowIfCancellationRequested();
@@ -111,21 +133,30 @@ internal sealed class CommonScriptOcrRuntime(bool includeKorean = false, Action<
                     && candidate.Text.Count(char.IsLetter) >= 4
                     && candidate.Text.All(c => c < '\u0250'))).ToArray();
                 if(indices.Length == 0) break;
+                phase.Restart();
                 var lines = entry.Recognizer.GetTextLines(indices.Select(i=>crops[i]).ToArray());
+                observeStage?.Invoke(new("recognize-" + entry.Script, phase.Elapsed.TotalMilliseconds, indices.Length));
                 for (var i = 0; i < lines.Length; i++)
+                {
+                    recognitionLines[indices[i]][entry.Script] = lines[i];
                     candidates[indices[i]].Add(ScriptOcrCandidate.FromRecognition(ScriptOcrSelection.RestoreReadingOrder(string.Concat(lines[i].Chars ?? []), entry.Script),
                         lines[i].CharScores, entry.Script));
+                }
             }
             if (observeCandidates is not null)
                 for (var i = 0; i < candidates.Length; i++) observeCandidates(bounds[i], candidates[i].ToArray());
-            return candidates.Select((choices, i) => (Selection: ScriptOcrSelection.SelectWithReview(choices), Bounds: bounds[i]))
+            return candidates.Select((choices, i) => (Selection: ScriptOcrSelection.SelectWithReview(choices), Bounds: bounds[i], Index: i))
                 .Where(item => item.Selection.Candidate is not null).Select(item =>
                 {
                     var choice = item.Selection.Candidate!;
                     var modelId = _recognizers.Single(entry => entry.Script == choice.Script).ModelId;
-                    return new OcrWord(choice.Text, item.Bounds,
-                        OcrWordEvidence.FromScriptCandidate(choice, modelId) with { AlternativeText = item.Selection.AlternativeText })
-                        { IsDetectedLine = true };
+                    var evidence = OcrWordEvidence.FromScriptCandidate(choice, modelId) with { AlternativeText = item.Selection.AlternativeText };
+                    return new OcrWord(choice.Text, item.Bounds, evidence)
+                    {
+                        IsDetectedLine = true,
+                        RecognitionWords = NativeOcrWordGeometry.FromCtcLine(recognitionLines[item.Index][choice.Script],
+                            item.Bounds, choice.Text, evidence)
+                    };
                 }).ToArray();
         }
         finally { foreach (var crop in crops) crop.Dispose(); }

@@ -16,7 +16,9 @@ internal static class LongCapturePipelineTests
             SizeLimitKeepsTheAcceptedPartial(root);
             CompletionWithoutExternalCancellationWorks(root);
             MidRunEventsAndFailureStageSurvive(root);
-            Console.WriteLine("PASS 5 long-capture pipeline regressions");
+            PaceUsesMeasuredDistanceAndKeepsOverlap();
+            UnsettledViewportIsRetriedBeforeScrolling(root);
+            Console.WriteLine("PASS 7 long-capture pipeline regressions");
         }
         finally { Directory.Delete(root, true); }
     }
@@ -95,6 +97,69 @@ internal static class LongCapturePipelineTests
             new FrameStitcher(maximumOverlapRows: capture.Height - 1, minimumOverlapRows: Math.Max(1, capture.Height / 4)));
 
     private static void Require(bool condition, string message) { if (!condition) throw new Exception(message); }
+
+    private static void PaceUsesMeasuredDistanceAndKeepsOverlap()
+    {
+        var pace = new ScrollCapturePace(600);
+        Require(pace.WheelDelta == -120, "The first scroll must measure one normal notch.");
+        pace.ObserveAccepted(48, -120, 1);
+        Require(pace.WheelDelta == -240, "A small confirmed displacement did not accelerate.");
+        pace.ObserveAccepted(96, -240, 1);
+        pace.ObserveAccepted(144, -360, 1);
+        Require(pace.WheelDelta == -480, "Normal small scrolls did not reach the bounded faster step.");
+        pace.ObserveAccepted(192, -480, 1);
+        Require(pace.WheelDelta == -480, "The four-notch bound was exceeded.");
+        pace.Reset();
+        pace.ObserveAccepted(180, -120, 1);
+        Require(pace.WheelDelta == -120, "Large native steps must not be multiplied.");
+        pace.ObserveAccepted(20, -120, 1);
+        Require(pace.WheelDelta == -120, "A clipped step at the bottom falsely increased speed.");
+        pace.ObserveAccepted(20, -120, 0.8);
+        Require(pace.WheelDelta == -120, "Uncertain alignment was used to accelerate.");
+        var shortViewport = new ScrollCapturePace(80);
+        shortViewport.ObserveAccepted(48, -120, 1);
+        Require(shortViewport.WheelDelta == -120, "A short selection lost its overlap margin.");
+    }
+
+    private static void UnsettledViewportIsRetriedBeforeScrolling(string root)
+    {
+        using var first = PatternCaptureBitmap(0);
+        using var moved = PatternCaptureBitmap(10);
+        using var repaint = new Bitmap(40, 80);
+        using (var g = Graphics.FromImage(repaint)) g.Clear(Color.Magenta);
+        using var settled = PatternCaptureBitmap(20);
+        Require(new FrameStitcher().Analyze(moved, repaint).Disposition == FrameStitchDisposition.LowConfidence,
+            "The retry fixture must actually exercise uncertain overlap.");
+        var input = new CountingInput();
+        using var session = new ScrollCaptureSession(new Rectangle(0, 0, 40, 80), ScrollCaptureMode.Automatic,
+            new SequenceCapture([first, moved, repaint, settled]), input, new Settler(), root,
+            new ScrollCaptureOptions(MaximumFrames: 3, MaximumPolls: 3, SettleDelay: TimeSpan.Zero));
+        using var result = session.RunAsync(CancellationToken.None).GetAwaiter().GetResult();
+        using var composite = result.CreateComposite();
+        Require(result.AcceptedFrameCount == 3 && input.Calls == 2 && composite.Height == 100,
+            "An unconfirmed viewport triggered more wheel input or lost content.");
+        for (var y = 0; y < composite.Height; y++)
+            Require(composite.GetPixel(8, y) == PatternCapture.Pixel(8, y), "Retry changed source row order.");
+    }
+
+    private static Bitmap PatternCaptureBitmap(int offset)
+    {
+        var image = new Bitmap(40, 80);
+        for (var y = 0; y < image.Height; y++)
+        for (var x = 0; x < image.Width; x++) image.SetPixel(x, y, PatternCapture.Pixel(x, y + offset));
+        return image;
+    }
+
+    private sealed class SequenceCapture(Bitmap[] frames) : IScrollRegionCapture
+    {
+        private int _index;
+        public Bitmap Capture(Rectangle region) => frames[_index++].Clone(region, frames[0].PixelFormat);
+    }
+    private sealed class CountingInput : IScrollInputService
+    {
+        public int Calls;
+        public Task SendWheelAsync(Point point, int delta, CancellationToken token) { Calls++; return Task.CompletedTask; }
+    }
 
     private sealed class PatternCapture(int width, int height, int step, int maximumCalls = int.MaxValue) : IScrollRegionCapture
     {

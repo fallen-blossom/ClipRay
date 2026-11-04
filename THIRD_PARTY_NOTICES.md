@@ -4,6 +4,8 @@ ClipRay's own code uses PolyForm Noncommercial 1.0.0. The components listed belo
 
 ## .NET dependencies
 
+`SourceVisualStyleEstimator` reuses MORT's `OverlayColorAnalyzer` (MIT), pinned to commit `e8adc8c82168b4875c91b0ed6a38f1fca4e3634f` from https://github.com/kmonkeyhead/MORT. The algorithm body is retained under `src/ClipRay.App/Translation/Upstream/Mort`; only its namespace and source header change. The original MIT notice is included as `licenses/mort-MIT.txt`. No upstream updater, network client or native subproject is bundled with this reuse.
+
 The following versions were checked against `src/ClipRay.App/packages.lock.json` and the corresponding cached NuGet package metadata on 2026-10-06. Their original packaged license/notice files and NuGet metadata are retained under `licenses/nuget`. For MIT expression-only packages, the permission text is accompanied by the package's original copyright metadata. `scripts/Collect-PackageNotices.ps1` reproduces this collection from the pinned package cache.
 
 | Component | Version | License | Upstream |

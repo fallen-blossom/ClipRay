@@ -24,6 +24,9 @@ public sealed class ScrollCaptureControlWindow : Window
     private readonly GlobalHotkey? _secondaryStopHotkey;
     private readonly bool _excludeFromCapture;
     private readonly System.Windows.Controls.Button _automaticButton;
+    private readonly WrapPanel _captureActions;
+    private readonly System.Windows.Controls.ProgressBar _endingProgress;
+    private bool _completionRequested;
     private bool _automaticScrolling;
     private bool _automaticWasStarted;
     private readonly string _language;
@@ -67,7 +70,7 @@ public sealed class ScrollCaptureControlWindow : Window
         };
         Grid.SetRow(Status, 0);
         root.Children.Add(Status);
-        var controls = new WrapPanel
+        var controls = _captureActions = new WrapPanel
         {
             Orientation = System.Windows.Controls.Orientation.Horizontal,
             HorizontalAlignment = System.Windows.HorizontalAlignment.Left,
@@ -80,13 +83,18 @@ public sealed class ScrollCaptureControlWindow : Window
         controls.Children.Add(_automaticButton);
 
         var cancel = CreateLabeledButton(ToolbarIconKind.Cancel, ToolbarIconTone.Danger, T("取消", "Cancel"));
-        cancel.Click += (_, _) => CancelRequested?.Invoke(this, EventArgs.Empty);
+        cancel.Click += (_, _) => { if (_completionRequested) return; SetEnding(true); CancelRequested?.Invoke(this, EventArgs.Empty); };
         controls.Children.Add(cancel);
         var complete = CreateLabeledButton(ToolbarIconKind.Complete, ToolbarIconTone.Confirm, T("完成", "Finish"));
-        complete.Click += (_, _) => StopRequested?.Invoke(this, EventArgs.Empty);
+        complete.IsDefault = true;
+        complete.Click += (_, _) => RequestCompletion();
         controls.Children.Add(complete);
         Grid.SetRow(controls, 1);
         root.Children.Add(controls);
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _endingProgress = new System.Windows.Controls.ProgressBar { IsIndeterminate = true, Height = 5, Visibility = Visibility.Collapsed, Margin = new Thickness(6) };
+        Grid.SetRow(_endingProgress, 2);
+        root.Children.Add(_endingProgress);
         Content = new Border
         {
             Child = root,
@@ -97,7 +105,7 @@ public sealed class ScrollCaptureControlWindow : Window
         };
         PreviewKeyDown += OnPreviewKeyDown;
         SourceInitialized += (_, _) => AffinityApplied = !_excludeFromCapture || SetWindowDisplayAffinity(new WindowInteropHelper(this).Handle, WdaExcludeFromCapture);
-        Closed += (_, _) => { if (!IsNormalTeardown) StopRequested?.Invoke(this, EventArgs.Empty); };
+        Closed += (_, _) => { if (!IsNormalTeardown) RequestCompletion(); };
     }
 
     public event EventHandler? StopRequested;
@@ -110,6 +118,7 @@ public sealed class ScrollCaptureControlWindow : Window
     private string T(string chinese, string english) => AppInterfaceLanguage.Text(_language, chinese, english);
     public void SetProgress(ScrollCaptureProgress progress)
     {
+        if (_completionRequested) return;
         if (progress.AutomaticScrolling is {} automatic && automatic != _automaticScrolling)
         {
             _automaticScrolling = automatic;
@@ -196,6 +205,7 @@ public sealed class ScrollCaptureControlWindow : Window
 
     private void ToggleAutomaticScrolling()
     {
+        if (_completionRequested) return;
         _automaticScrolling = !_automaticScrolling;
         if (_automaticScrolling) _automaticWasStarted = true;
         var label = AutomaticControlLabel();
@@ -212,8 +222,24 @@ public sealed class ScrollCaptureControlWindow : Window
         ? T("暂停滚动", "Pause scrolling")
         : _automaticWasStarted ? T("继续滚动", "Resume scrolling") : T("启动自动滚动", "Start automatic scrolling");
 
+    internal void SetEnding(bool cancelled)
+    {
+        _completionRequested = true;
+        _captureActions.IsEnabled = false;
+        _endingProgress.Visibility = Visibility.Visible;
+        Status.Text = cancelled ? T("正在停止采集并保留片段…", "Stopping capture and keeping pieces…") : T("正在结束采集…", "Finishing capture…");
+    }
+
+    private void RequestCompletion()
+    {
+        if (_completionRequested) return;
+        SetEnding(false);
+        StopRequested?.Invoke(this, EventArgs.Empty);
+    }
+
     private void OnPreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
+        if (e.Key is Key.ImeProcessed or Key.DeadCharProcessed || Keyboard.FocusedElement is System.Windows.Controls.Primitives.TextBoxBase) return;
         var key = HotkeyCapturePolicy.ResolveEventKey(
             e.Key,
             e.SystemKey,
@@ -222,7 +248,7 @@ public sealed class ScrollCaptureControlWindow : Window
         if (key == Key.Enter || key == Key.Return
             || HotkeyCapturePolicy.MatchesAny(_stopHotkey, _secondaryStopHotkey, key, HotkeyCapturePolicy.ReadCurrentModifiers()))
         {
-            StopRequested?.Invoke(this, EventArgs.Empty);
+            RequestCompletion();
             e.Handled = true;
         }
     }

@@ -32,6 +32,7 @@ public sealed record VisualTextRegion(
 {
     public IReadOnlyList<OcrWord> OriginalOcrWords { get; init; } = Array.Empty<OcrWord>();
     public bool SharesParentOcrEvidence { get; init; }
+    public IReadOnlyList<SourceVisualStyleSpan> SourceStyleSpans { get; init; } = [];
 }
 
 public static class VisualTextRegionBuilder
@@ -53,7 +54,8 @@ public static class VisualTextRegionBuilder
     {
         ArgumentNullException.ThrowIfNull(blocks);
         var origins = new Dictionary<OcrTextBlock, IReadOnlyList<OcrWord>>(ReferenceEqualityComparer.Instance);
-        foreach (var block in blocks) origins[block] = Array.AsReadOnly(block.Words.ToArray());
+        foreach (var block in blocks) origins[block] = Array.AsReadOnly(
+            (block.PrimaryRecognitionWords.Count > 0 ? block.PrimaryRecognitionWords : block.Words).ToArray());
         IEnumerable<OcrTextBlock> Track(OcrTextBlock parent, IEnumerable<OcrTextBlock> children)
         {
             foreach (var child in children)
@@ -72,9 +74,6 @@ public static class VisualTextRegionBuilder
                 ? block
                 : TrimTrailingColoredDecoration(source, block, blocks)]))
             .SelectMany(block => Track(block, SplitTranslationLinkPrefix(block)))
-            .SelectMany(block => Track(block, source is null
-                ? [block]
-                : SplitStableColorSpans(source, block, blocks)))
             .SelectMany(block => Track(block, SplitInlineIdentityBadge(block)))
             .Where(static block => !string.IsNullOrWhiteSpace(block.Text) && !block.Bounds.IsEmpty)
             .OrderBy(static block => block.Bounds.Top)
@@ -134,8 +133,75 @@ public static class VisualTextRegionBuilder
             .Select((group, index) => (identityNames.Contains(group[0])
                 ? CreateRegion(index, group, medianHeight, likelyBodyLeft) with { Role = VisualTextRole.IdentityMetadata }
                 : CreateRegion(index, group, medianHeight, likelyBodyLeft)) with
-                { OriginalOcrWords = Array.AsReadOnly(group.SelectMany(line => origins[line]).Distinct().ToArray()) })
+                {
+                    OriginalOcrWords = Array.AsReadOnly(group.SelectMany(line => origins[line]).Distinct().ToArray()),
+                    SourceStyleSpans = source is null ? [] : EstimateStyleSpans(source, group, ordered),
+                })
             .ToArray();
+    }
+
+    private static IReadOnlyList<SourceVisualStyleSpan> EstimateStyleSpans(
+        Bitmap source, IReadOnlyList<OcrTextBlock> lines, IReadOnlyList<OcrTextBlock> siblings)
+    {
+        var spans = new List<SourceVisualStyleSpan>();
+        var unresolvedGeometry = false;
+        var offset = 0;
+        foreach (var line in lines.OrderBy(static line => line.Bounds.Top).ThenBy(static line => line.Bounds.Left))
+        {
+            // Only real OCR word geometry is usable evidence. Synthetic rectangles
+            // proportional to text length cannot identify a source color boundary.
+            var words = line.Words.Count > 0 ? line.Words : [new OcrWord(line.Text, line.Bounds)];
+            var cursor = 0;
+            foreach (var word in words.OrderBy(static word => word.Bounds.Left))
+            {
+                var text = word.Text.Trim();
+                if (text.Length == 0 || word.Bounds.IsEmpty) continue;
+                var start = line.Text.IndexOf(text, cursor, StringComparison.Ordinal);
+                if (start < 0) continue;
+                cursor = start + text.Length;
+                var wordBlock = new OcrTextBlock(text, word.Bounds, [word]);
+                var style = SourceVisualStyleEstimator.Estimate(source, wordBlock, siblings, SampleBacking(source, word.Bounds));
+                if (words.Count == 1 && (OcrStyleGeometryRefiner.HasMaterialInkColors(source, word.Bounds)
+                    || OcrStyleGeometryRefiner.HasEnoughLatinText(text)
+                        && OcrStyleGeometryRefiner.HasMaterialInkHeightVariation(source, word.Bounds)))
+                {
+                    style = style with { Confidence = VisualStyleConfidence.Low };
+                    unresolvedGeometry = true;
+                }
+                spans.Add(new(offset + start, text.Length, text, word.Bounds, style));
+            }
+            offset += line.Text.Length + 1;
+        }
+        if (spans.Count == 0) return [];
+        // Ordinary uniform text is already handled by the region's base style.
+        // Do not ask a model to align every word or add uncertainty to that path.
+        if (!unresolvedGeometry && spans.All(span => SameSpanStyle(spans[0], span))) return [];
+        var sourceText = string.Join('\n', lines.OrderBy(static line => line.Bounds.Top).ThenBy(static line => line.Bounds.Left).Select(static line => line.Text));
+        var merged = new List<SourceVisualStyleSpan>();
+        foreach (var span in spans)
+        {
+            if (merged.Count > 0 && SameSpanStyle(merged[^1], span)
+                && merged[^1].Style.Confidence != VisualStyleConfidence.Low && span.Style.Confidence != VisualStyleConfidence.Low
+                && string.IsNullOrWhiteSpace(sourceText[(merged[^1].Start + merged[^1].Length)..span.Start]))
+            {
+                var previous = merged[^1];
+                var left = Math.Min(previous.Bounds.Left, span.Bounds.Left); var top = Math.Min(previous.Bounds.Top, span.Bounds.Top);
+                var right = Math.Max(previous.Bounds.Right, span.Bounds.Right); var bottom = Math.Max(previous.Bounds.Bottom, span.Bounds.Bottom);
+                merged[^1] = previous with { Length = span.Start + span.Length - previous.Start,
+                    Text = sourceText[previous.Start..(span.Start + span.Length)], Bounds = new(left, top, right-left, bottom-top) };
+            }
+            else merged.Add(span);
+        }
+        return merged;
+    }
+
+    private static bool SameSpanStyle(SourceVisualStyleSpan first, SourceVisualStyleSpan second)
+    {
+        var a = first.Style; var b = second.Style;
+        var sizeA = a.EstimatedFontSizePixels ?? a.GlyphHeightPixels; var sizeB = b.EstimatedFontSizePixels ?? b.GlyphHeightPixels;
+        return ColorDistance(a.ForegroundColor, b.ForegroundColor) < 36
+            && Math.Max(sizeA, sizeB) <= Math.Min(sizeA, sizeB) * 1.20
+            && a.FontCategory == b.FontCategory && a.FontWeight == b.FontWeight && a.IsItalic == b.IsItalic;
     }
 
     private static bool IsAdjacentDisplayName(OcrTextBlock name, IReadOnlyList<OcrTextBlock> blocks)
@@ -150,64 +216,6 @@ public static class VisualTextRegionBuilder
             && account.Bounds.Left - name.Bounds.Right <= Math.Max(name.Bounds.Height, account.Bounds.Height) * 2.5
             && Math.Abs((name.Bounds.Top + name.Bounds.Height / 2)
                 - (account.Bounds.Top + account.Bounds.Height / 2)) <= Math.Max(name.Bounds.Height, account.Bounds.Height) * 0.35);
-    }
-
-    private static IEnumerable<OcrTextBlock> SplitStableColorSpans(
-        Bitmap source,
-        OcrTextBlock block,
-        IReadOnlyList<OcrTextBlock> siblings)
-    {
-        if (IsTranslationLink(block.Text)) return [block];
-        var words = ResolveWords(block)
-            .Where(static word => !string.IsNullOrWhiteSpace(word.Text) && !word.Bounds.IsEmpty)
-            .OrderBy(static word => word.Bounds.Left)
-            .ToArray();
-        if (words.Length < 2) return [block];
-
-        var styled = words.Select(word =>
-        {
-            var wordBlock = new OcrTextBlock(word.Text, word.Bounds, [word]);
-            var wordBacking = SampleBacking(source, word.Bounds);
-            return (Word: word, Style: SourceVisualStyleEstimator.Estimate(source, wordBlock, siblings, wordBacking));
-        }).ToArray();
-        var groups = new List<List<OcrWord>>();
-        var currentGroup = new List<OcrWord> { styled[0].Word };
-        var pendingUncertain = new List<OcrWord>();
-        SourceVisualStyle? stableAnchor = styled[0].Style.Confidence == VisualStyleConfidence.Low
-            ? null
-            : styled[0].Style;
-        for (var index = 1; index < styled.Length; index++)
-        {
-            var current = styled[index].Style;
-            if (current.Confidence == VisualStyleConfidence.Low)
-            {
-                pendingUncertain.Add(styled[index].Word);
-                continue;
-            }
-
-            var stableChange = stableAnchor is not null
-                && HasMaterialColorChange(stableAnchor.ForegroundColor, current.ForegroundColor);
-            if (stableChange)
-            {
-                groups.Add(currentGroup);
-                currentGroup = [.. pendingUncertain, styled[index].Word];
-            }
-            else
-            {
-                currentGroup.AddRange(pendingUncertain);
-                currentGroup.Add(styled[index].Word);
-            }
-            pendingUncertain.Clear();
-            stableAnchor = current;
-        }
-        currentGroup.AddRange(pendingUncertain);
-        groups.Add(currentGroup);
-        if (groups.Count == 1) return [block];
-        var split = groups.Select(CreateBlockFromWords).ToArray();
-        var backing = SampleBacking(source, block.Bounds);
-        return block.Words.Count < 2
-            ? RefineSyntheticSpanBounds(source, block, split, siblings, backing)
-            : split;
     }
 
     private static IEnumerable<OcrTextBlock> RemoveLeadingDecorativeGlyph(OcrTextBlock block)
@@ -407,129 +415,6 @@ public static class VisualTextRegionBuilder
         return new OcrTextBlock(block.Text, bounds, [new OcrWord(block.Text, bounds)]);
     }
 
-    private static OcrTextBlock[] RefineSyntheticSpanBounds(
-        Bitmap source,
-        OcrTextBlock original,
-        OcrTextBlock[] spans,
-        IReadOnlyList<OcrTextBlock> siblings,
-        Color backing)
-    {
-        if (spans.Length < 2) return spans;
-        var styles = spans
-            .Select(span => SourceVisualStyleEstimator.Estimate(source, span, siblings, backing))
-            .ToArray();
-        var boundaries = new double[spans.Length - 1];
-        for (var index = 0; index < boundaries.Length; index++)
-        {
-            var expected = (spans[index].Bounds.Right + spans[index + 1].Bounds.Left) / 2;
-            boundaries[index] = FindColorTransition(
-                source,
-                original.Bounds,
-                styles[index].ForegroundColor,
-                styles[index + 1].ForegroundColor,
-                backing,
-                expected);
-        }
-
-        var refined = new OcrTextBlock[spans.Length];
-        for (var index = 0; index < spans.Length; index++)
-        {
-            var left = index == 0 ? spans[index].Bounds.Left : boundaries[index - 1];
-            var right = index == spans.Length - 1 ? spans[index].Bounds.Right : boundaries[index];
-            var bounds = new PixelRect(
-                left,
-                spans[index].Bounds.Top,
-                Math.Max(1, right - left),
-                spans[index].Bounds.Height);
-            refined[index] = new OcrTextBlock(
-                spans[index].Text,
-                bounds,
-                [new OcrWord(spans[index].Text, bounds)]);
-        }
-        return refined;
-    }
-
-    private static double FindColorTransition(
-        Bitmap source,
-        PixelRect originalBounds,
-        Color leftColor,
-        Color rightColor,
-        Color backing,
-        double expected)
-    {
-        var radius = Math.Max(8, originalBounds.Height * 2);
-        var searchLeft = Math.Clamp((int)Math.Floor(expected - radius), (int)originalBounds.Left, source.Width - 1);
-        var searchRight = Math.Clamp((int)Math.Ceiling(expected + radius), searchLeft + 1, Math.Min(source.Width, (int)originalBounds.Right));
-        var top = Math.Clamp((int)Math.Floor(originalBounds.Top), 0, source.Height);
-        var bottom = Math.Clamp((int)Math.Ceiling(originalBounds.Bottom), top, source.Height);
-        var columns = new List<(int X, bool IsRight)>();
-        for (var x = searchLeft; x < searchRight; x++)
-        {
-            var leftDistance = 0d;
-            var rightDistance = 0d;
-            var ink = 0;
-            for (var y = top; y < bottom; y++)
-            {
-                var pixel = source.GetPixel(x, y);
-                if (ColorDistance(pixel, backing) < 24) continue;
-                leftDistance += ColorDistance(pixel, leftColor);
-                rightDistance += ColorDistance(pixel, rightColor);
-                ink++;
-            }
-            if (ink > 0) columns.Add((x, rightDistance < leftDistance));
-        }
-
-        var candidates = new List<double>();
-        for (var index = 1; index < columns.Count; index++)
-        {
-            if (columns[index - 1].IsRight || !columns[index].IsRight) continue;
-            if (columns[index].X - columns[index - 1].X > originalBounds.Height) continue;
-            candidates.Add((columns[index - 1].X + columns[index].X + 1) / 2d);
-        }
-        var resolved = candidates.Count == 0
-            ? expected
-            : candidates.OrderBy(candidate => Math.Abs(candidate - expected)).First();
-        return Math.Clamp(resolved, originalBounds.Left + 1, originalBounds.Right - 1);
-    }
-
-    private static IEnumerable<OcrWord> ResolveWords(OcrTextBlock block)
-    {
-        if (block.Words.Count >= 2) return block.Words;
-        var matches = Regex.Matches(block.Text, @"\S+")
-            .Cast<Match>()
-            .ToArray();
-        if (matches.Length < 2) return block.Words;
-
-        var totalUnits = Math.Max(1, TextWidthUnits(block.Text));
-        return matches.Select(match =>
-        {
-            var startUnits = TextWidthUnits(block.Text.AsSpan(0, match.Index));
-            var endUnits = TextWidthUnits(block.Text.AsSpan(0, match.Index + match.Length));
-            var left = block.Bounds.Left + block.Bounds.Width * startUnits / totalUnits;
-            var right = block.Bounds.Left + block.Bounds.Width * endUnits / totalUnits;
-            return new OcrWord(
-                match.Value,
-                new PixelRect(left, block.Bounds.Top, Math.Max(1, right - left), block.Bounds.Height));
-        }).ToArray();
-    }
-
-    private static double TextWidthUnits(ReadOnlySpan<char> text)
-    {
-        var units = 0d;
-        foreach (var value in text)
-        {
-            units += value switch
-            {
-                _ when IsCjk(value) => 1,
-                _ when char.IsWhiteSpace(value) => 0.35,
-                _ when char.IsUpper(value) => 0.72,
-                _ when char.IsLetterOrDigit(value) => 0.56,
-                _ => 0.35,
-            };
-        }
-        return units;
-    }
-
     private static OcrTextBlock CreateBlockFromWords(IReadOnlyList<OcrWord> words)
     {
         var left = words.Min(static word => word.Bounds.Left);
@@ -643,15 +528,6 @@ public static class VisualTextRegionBuilder
             && previousText[^1] is '.' or '?' or '!' or '。' or '？' or '！'
             && !ContinuesWrappedParagraph(previous, current))
             return false;
-        if (styles is not null
-            && styles.TryGetValue(previous, out var previousStyle)
-            && styles.TryGetValue(current, out var currentStyle)
-            && previousStyle.Confidence != VisualStyleConfidence.Low
-            && currentStyle.Confidence != VisualStyleConfidence.Low
-            && HasMaterialColorChange(previousStyle.ForegroundColor, currentStyle.ForegroundColor))
-        {
-            return false;
-        }
         if (currentIsHorizontalRowMember) return false;
         if (previous.Bounds.Height >= medianHeight * 1.12
             && current.Bounds.Height <= previous.Bounds.Height * 0.82)
@@ -763,16 +639,6 @@ public static class VisualTextRegionBuilder
         : text.Any(c=>c is >= '\u0400' and <= '\u052f') ? "cyrillic"
         : text.Any(c=>c is >= '\u0600' and <= '\u06ff') ? "arabic"
         : IsChineseProse(text) ? "zh" : "latin";
-
-    private static bool HasMaterialColorChange(Color first, Color second)
-    {
-        // Antialiasing and inferred word boxes alter the sampled luminance of white/gray
-        // copy. That is not an inline color boundary and must not destroy sentence context.
-        static bool IsNeutral(Color color) =>
-            Math.Max(color.R, Math.Max(color.G, color.B)) - Math.Min(color.R, Math.Min(color.G, color.B)) <= 24;
-        return !(IsNeutral(first) && IsNeutral(second))
-            && ColorDistance(first, second) >= MaterialColorDistance;
-    }
 
     private static bool IsHorizontalPeer(OcrTextBlock first, OcrTextBlock second)
     {

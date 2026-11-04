@@ -190,6 +190,9 @@ public sealed class ScrollCaptureSession : IDisposable
         var announcedNoMovement = false;
         var stage = "capture";
         var automaticVersion = Volatile.Read(ref _automaticVersion);
+        var pace = new ScrollCapturePace(_physicalPixelRegion.Height);
+        var retryWithoutInput = false;
+        var pendingWheelDelta = 0;
         try
         {
             SetState(ScrollCaptureState.Capturing);
@@ -208,9 +211,24 @@ public sealed class ScrollCaptureSession : IDisposable
                 if (segments.Count >= _options.MaximumFrames) { reason = ScrollCaptureStopReason.FrameLimit; break; }
                 if (AutomaticScrollingEnabled)
                 {
-                    if (automaticVersion != Volatile.Read(ref _automaticVersion)) { consecutiveUnusableFrames=0; automaticVersion=Volatile.Read(ref _automaticVersion); }
+                    if (automaticVersion != Volatile.Read(ref _automaticVersion))
+                    {
+                        consecutiveUnusableFrames = 0;
+                        automaticVersion = Volatile.Read(ref _automaticVersion);
+                        pace.Reset();
+                        retryWithoutInput = false;
+                        pendingWheelDelta = 0;
+                    }
                     stage = "input";
-                    try { await _input.SendWheelAsync(Center(_physicalPixelRegion), ScrollInputService.DefaultWheelDelta, cancellationToken); }
+                    try
+                    {
+                        if (!retryWithoutInput)
+                        {
+                            pendingWheelDelta = pace.WheelDelta;
+                            await _input.SendWheelAsync(Center(_physicalPixelRegion), pendingWheelDelta, cancellationToken);
+                            _diagnostics?.RecordEvent("wheel_sent", new { Delta = pendingWheelDelta });
+                        }
+                    }
                     catch (Exception error) when (error is not OperationCanceledException)
                     {
                         SetAutomaticScrolling(false);
@@ -230,6 +248,10 @@ public sealed class ScrollCaptureSession : IDisposable
                 ThrowIfStopping(cancellationToken);
                 if (analysis.Disposition == FrameStitchDisposition.Append)
                 {
+                    if (AutomaticScrollingEnabled)
+                        pace.ObserveAccepted(current.Height - analysis.OverlapRows, pendingWheelDelta, analysis.Confidence);
+                    pendingWheelDelta = 0;
+                    retryWithoutInput = false;
                     var nextSize = new Size(current.Width, checked(compositeSize.Height + current.Height - analysis.OverlapRows));
                     if (nextSize.Height > _options.MaximumCompositeHeight || (long)nextSize.Width * nextSize.Height > _options.MaximumCompositePixels)
                     {
@@ -256,6 +278,9 @@ public sealed class ScrollCaptureSession : IDisposable
                 }
                 if (!AutomaticScrollingEnabled)
                 {
+                    pace.Reset();
+                    pendingWheelDelta = 0;
+                    retryWithoutInput = false;
                     if (!announcedNoMovement)
                     {
                         ProgressChanged?.Invoke(this, new ScrollCaptureProgress(
@@ -265,6 +290,10 @@ public sealed class ScrollCaptureSession : IDisposable
                     }
                     continue;
                 }
+                // A moving/repainting frame is not permission to scroll farther.
+                // Retry this viewport before another wheel can lose its overlap.
+                retryWithoutInput = analysis.Disposition == FrameStitchDisposition.LowConfidence;
+                if (!retryWithoutInput) pace.Reset();
                 if (!hasObservedMovement)
                 {
                     if (++consecutiveUnusableFrames >= _options.InitialNoProgressPolls)

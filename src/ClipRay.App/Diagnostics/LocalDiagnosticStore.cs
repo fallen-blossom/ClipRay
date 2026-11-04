@@ -117,7 +117,7 @@ internal sealed class LocalDiagnosticSession
 internal static class DiagnosticProjection
 {
     private static readonly HashSet<string> ContentKeys=new(StringComparer.OrdinalIgnoreCase) {
-        "text","OcrText","AlternativeText","source","restored","Scene","TranslationHint","prompt","response","payload","message" };
+        "text","OcrText","PrimaryRecognitionText","AlternativeText","source","restored","Scene","TranslationHint","prompt","response","payload","message" };
     private static readonly HashSet<string> StructuralStatuses=new(StringComparer.OrdinalIgnoreCase) {
         "success","failed","cancelled","partial","completed","translated","preserved","fallback","rejected","ready","pending","not-attempted","stopped",
         "ocr-empty","translation-count-mismatch","layout-failed","layout-incomplete","translation-failed" };
@@ -155,6 +155,15 @@ internal static class DiagnosticProjection
                 || normalized=="status"&&StructuralStatuses.Contains(text);
             var timestamp=normalized.EndsWith("utc")&&DateTimeOffset.TryParse(text,out _);
             var language=normalized is "sourcelanguage" or "targetlanguage" && text is "简体中文" or "繁體中文" or "繁体中文" or "英语" or "日语" or "韩语" or "自动";
+            // Closed values expose typography evidence without retaining OCR text.
+            var styleMetadata = normalized is "foregroundargb" or "backgroundargb"
+                && text.Length == 8 && text.All(char.IsAsciiHexDigit)
+                || normalized is "confidence" or "styleconfidence" && text is "Low" or "Medium" or "High"
+                || normalized is "alignment" && text is "Left" or "Center" or "Right"
+                || normalized is "fontweight" or "weight" && text is "Normal" or "SemiBold" or "Bold"
+                || normalized is "fontcategory" && text is "SansSerif" or "Serif" or "Monospace";
+            identifier |= styleMetadata;
+            identifier |= normalized == "whitespacerepair" && text == "windows-word-boundaries";
             if(!content && (!identifier || text.Length>160 || !timestamp&&!language&&text.Any(c=>!char.IsAsciiLetterOrDigit(c)&&c is not '-' and not '_' and not '.' and not '/' and not ' ' and not '+')))
                 return new JsonObject { ["string_length"]=text.Length };
             return text.Length<=2048?JsonValue.Create(text):new JsonObject { ["diagnostic_truncated"]=true,["string_length"]=text.Length,["prefix"]=text[..2048] };

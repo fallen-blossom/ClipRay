@@ -7,6 +7,7 @@ using System.Windows.Input;
 using ClipRay.App.Overlay;
 using ClipRay.App.Capture;
 using Button = System.Windows.Controls.Button;
+using Control = System.Windows.Controls.Control;
 using Brushes = System.Windows.Media.Brushes;
 
 namespace ClipRay.App.Translation;
@@ -39,7 +40,9 @@ public partial class TranslationWorkbenchWindow : Window
         _document = document;
         _fileCheck = fileCheck;
         _copy = copy ?? (text => System.Windows.Clipboard.SetText(text));
+        Presentation.UtilityWindowTheme.Prepare();
         InitializeComponent();
+        Presentation.UtilityWindowTheme.ApplyPalette(this);
         CommandBindings.Add(new CommandBinding(TranslateRegionCommand, async (_, _) =>
         { if (_selected is Guid id && _document.Session?.Regions.FirstOrDefault(region => region.Id == id) is { } region
               && HasAvailableLanguage(region)) await _document.TranslateAsync(id); },
@@ -268,7 +271,8 @@ public partial class TranslationWorkbenchWindow : Window
             var existing = RegionCanvas.Children.OfType<Button>().FirstOrDefault(button => (Guid)button.Tag == region.Id);
             if (existing is not null)
             {
-                existing.BorderBrush = region.Id == _selected ? Brushes.DeepSkyBlue : Brushes.SlateGray;
+                existing.SetResourceReference(Control.BorderBrushProperty,
+                    region.Id == _selected ? "TextControlFocusedBorderBrush" : "TextFillColorTertiaryBrush");
                 existing.BorderThickness = new Thickness(region.Id == _selected ? 2 : 1);
                 existing.ToolTip = region.Draft;
                 System.Windows.Automation.AutomationProperties.SetName(existing, F("选择区域：{0}", region.Draft));
@@ -280,10 +284,11 @@ public partial class TranslationWorkbenchWindow : Window
                 Tag = region.Id, Width = Math.Max(1, bounds.Width), Height = Math.Max(1, bounds.Height),
                 Padding = new Thickness(0), Margin = new Thickness(0),
                 Background = Brushes.Transparent,
-                BorderBrush = region.Id == _selected ? Brushes.DeepSkyBlue : Brushes.SlateGray,
                 BorderThickness = new Thickness(region.Id == _selected ? 2 : 1),
                 ToolTip = region.Draft
             };
+            button.SetResourceReference(Control.BorderBrushProperty,
+                region.Id == _selected ? "TextControlFocusedBorderBrush" : "TextFillColorTertiaryBrush");
             // An explicit template keeps the source visible beneath standard button hover states.
             var border = new FrameworkElementFactory(typeof(Border));
             border.SetBinding(Border.BorderBrushProperty, new System.Windows.Data.Binding("BorderBrush") { RelativeSource = System.Windows.Data.RelativeSource.TemplatedParent });

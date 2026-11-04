@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using ClipRay.App.Infrastructure;
@@ -35,14 +36,14 @@ public sealed record RapidOcrModelPaths(string Detector, string Recognizer, stri
     }
 
     private static bool HasModelSet(string directory) =>
-        File.Exists(Path.Combine(directory, "PP-OCRv6_det_small.onnx"))
-        && File.Exists(Path.Combine(directory, "PP-OCRv6_rec_small.onnx"))
-        && File.Exists(Path.Combine(directory, "ppocrv6_small_dict.txt"));
+        ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(Path.Combine(directory, "PP-OCRv6_det_small.onnx"))
+        && ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(Path.Combine(directory, "PP-OCRv6_rec_small.onnx"))
+        && ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(Path.Combine(directory, "ppocrv6_small_dict.txt"));
 
     private static string RequireFile(string directory, string name)
     {
         var path = Path.Combine(directory, name);
-        return File.Exists(path)
+        return ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(path)
             ? path
             : throw new OcrUnavailableException("The locked local PP-OCRv6 model set is incomplete.");
     }
@@ -73,13 +74,13 @@ public sealed record KoreanRapidOcrModelPaths(string Recognizer, string Dictiona
     }
 
     private static bool HasModelSet(string directory) =>
-        File.Exists(Path.Combine(directory, "korean_PP-OCRv5_rec_mobile.onnx"))
-        && File.Exists(Path.Combine(directory, "ppocrv5_korean_dict.txt"));
+        ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(Path.Combine(directory, "korean_PP-OCRv5_rec_mobile.onnx"))
+        && ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(Path.Combine(directory, "ppocrv5_korean_dict.txt"));
 
     private static string RequireFile(string directory, string name)
     {
         var path = Path.Combine(directory, name);
-        return File.Exists(path)
+        return ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(path)
             ? path
             : throw new OcrUnavailableException("The Korean PP-OCRv5 supplemental model set is incomplete.");
     }
@@ -94,7 +95,8 @@ public static class RapidOcrThreadPolicy
     }
 }
 
-internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool useLatinModel = false, int? threadCountOverride = null, bool disableSpinning = true, Action<OcrResult>? observeResult = null) : IOcrRuntime, IOcrWarmup, IDisposable, IAsyncDisposable
+internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool useLatinModel = false, int? threadCountOverride = null, bool disableSpinning = true, Action<OcrResult>? observeResult = null,
+    Action<OcrRuntimeStageTrace>? observeStage = null, Action<SKBitmap, RapidOcrOptions>? observeDetectorInput = null) : IOcrRuntime, IOcrWarmup, IDisposable, IAsyncDisposable
 {
     private const string ClassifierName = "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx";
     private const string V5DetectorName = "ch_PP-OCRv5_mobile_det.onnx";
@@ -113,20 +115,32 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
         cancellationToken = linked.Token;
         ObjectDisposedException.ThrowIf(_disposed, this);
         cancellationToken.ThrowIfCancellationRequested();
+        var phase = Stopwatch.StartNew();
         using var prepared = OcrPolarityPlan.CreatePreparedBitmap(bitmap);
         var png = await OcrBitmapEncoder.EncodePngAsync(prepared, null, cancellationToken).ConfigureAwait(false);
         using var skBitmap = SKBitmap.Decode(png)
             ?? throw new OcrUnavailableException("The local OCR image could not be decoded.");
-
+        observeStage?.Invoke(new("polarity-encode-decode", phase.Elapsed.TotalMilliseconds));
+        phase.Restart();
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var ocr = EnsureInitialized();
-            cancellationToken.ThrowIfCancellationRequested();
+            observeStage?.Invoke(new("runtime-wait", phase.Elapsed.TotalMilliseconds));
             var result = await Task.Run(
-                () => ocr.Detect(
-                    skBitmap,
-                    (useKoreanSupplement || useLatinModel ? RapidOcrOptions.Default : RapidOcrOptions.PPOCRv6) with { DoAngle = false }),
+                () =>
+                {
+                    phase.Restart();
+                    var ocr = EnsureInitialized();
+                    observeStage?.Invoke(new("initialize", phase.Elapsed.TotalMilliseconds));
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var options = (useKoreanSupplement || useLatinModel ? RapidOcrOptions.Default : RapidOcrOptions.PPOCRv6)
+                        with { DoAngle = false, ReturnWordBox = true, ReturnSingleCharBox = false };
+                    observeDetectorInput?.Invoke(skBitmap, options);
+                    phase.Restart();
+                    var output = ocr.Detect(skBitmap, options);
+                    observeStage?.Invoke(new("native-detect-recognize", phase.Elapsed.TotalMilliseconds, output.TextBlocks.Length));
+                    return output;
+                },
                 cancellationToken).ConfigureAwait(false);
             observeResult?.Invoke(result);
             return ConvertResult(result, _recognizerModelId,
@@ -143,9 +157,15 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
                     var top = block.BoxPoints.Min(static point => point.Y);
                     var right = block.BoxPoints.Max(static point => point.X);
                     var bottom = block.BoxPoints.Max(static point => point.Y);
-                    return new OcrWord(block.Text, new PixelRect(left, top, right - left, bottom - top),
-                        new OcrWordEvidence("rapidocr", modelId, script,
-                            OcrQualityPolicy.RawConfidence(block.CharScores), modelHash)) { IsDetectedLine = true };
+                    var bounds = new PixelRect(left, top, right - left, bottom - top);
+                    var evidence = new OcrWordEvidence("rapidocr", modelId, script,
+                        OcrQualityPolicy.RawConfidence(block.CharScores), modelHash);
+                    return new OcrWord(block.Text, bounds, evidence)
+                    {
+                        IsDetectedLine = true,
+                        RecognitionWords = NativeOcrWordGeometry.FromNativeWords(block.WordResults, block.Text, bounds, evidence,
+                            block.Chars, block.CharScores)
+                    };
                 })
                 .ToArray();
 
@@ -173,8 +193,9 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
     private RapidOcr EnsureInitialized()
     {
         if (_ocr is not null) return _ocr;
+        NativeRuntimePrivacy.Initialize();
         var classifier = Path.Combine(AppContext.BaseDirectory, "models", "v5", ClassifierName);
-        if (!File.Exists(classifier))
+        if (!ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(classifier))
             throw new OcrUnavailableException("The packaged PP-OCR orientation classifier is unavailable.");
 
         var modelSet = useLatinModel ? CreateLatinModelSet(classifier) : useKoreanSupplement
@@ -190,6 +211,13 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
                 sessionOptions.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
                 sessionOptions.AddSessionConfigEntry("session.inter_op.allow_spinning", "0");
             }
+            modelSet = modelSet with
+            {
+                DetModelPath = LocalPathPolicy.RequireLocal(modelSet.DetModelPath),
+                ClsModelPath = LocalPathPolicy.RequireLocal(modelSet.ClsModelPath),
+                RecModelPath = LocalPathPolicy.RequireLocal(modelSet.RecModelPath),
+                KeysPath = LocalPathPolicy.RequireLocal(modelSet.KeysPath),
+            };
             ocr.InitModels(modelSet, sessionOptions);
             _recognizerModelId = Path.GetFileName(modelSet.RecModelPath);
             try
@@ -229,7 +257,7 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
         var detector = Path.Combine(directory, V5DetectorName);
         var recognizer = Path.Combine(directory, "latin_PP-OCRv5_rec_mobile_infer.onnx");
         var dictionary = Path.Combine(directory, "ppocrv5_latin_dict.txt");
-        if (!File.Exists(detector) || !File.Exists(recognizer) || !File.Exists(dictionary))
+        if (!ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(detector) || !ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(recognizer) || !ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(dictionary))
             throw new OcrUnavailableException("The packaged local Latin OCR model set is incomplete.");
         return RapidOcrModelSet.PPOCRv5Latin with
         {
@@ -242,7 +270,7 @@ internal sealed class RapidOcrRuntime(bool useKoreanSupplement = false, bool use
     {
         var paths = KoreanRapidOcrModelPaths.ResolveForRuntime();
         var detector = Path.Combine(AppContext.BaseDirectory, "models", "v5", V5DetectorName);
-        if (!File.Exists(detector))
+        if (!ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(detector))
             throw new OcrUnavailableException("The packaged PP-OCRv5 detector is unavailable.");
         return RapidOcrModelSet.PPOCRv5Latin with
         {

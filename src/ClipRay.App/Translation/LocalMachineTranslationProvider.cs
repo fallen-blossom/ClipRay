@@ -5,11 +5,13 @@ namespace ClipRay.App.Translation;
 public sealed record MachineTranslationProcessRequest(
     string SourceLanguage,
     string TargetLanguage,
-    IReadOnlyList<string> Texts);
+    IReadOnlyList<string> Texts,
+    bool ReturnAlignments = false);
 
 public sealed record MachineTranslationProcessResult(IReadOnlyList<string> Texts,
     TranslationExecutionEvidence? Evidence = null,
-    IReadOnlyList<TranslationExecutionEvidence?>? TextEvidence = null);
+    IReadOnlyList<TranslationExecutionEvidence?>? TextEvidence = null,
+    IReadOnlyList<IReadOnlyList<TranslationTextAlignment>>? TextAlignments = null);
 
 public sealed class MachineTranslationRuntimeException(string status) : InvalidOperationException(status)
 {
@@ -128,18 +130,23 @@ public sealed class LocalMachineTranslationProvider(IMachineTranslationProcess p
 
         IReadOnlyList<string> translated;
         var executionEvidence = new TranslationExecutionEvidence?[workItems.Length];
+        var textAlignments = new IReadOnlyList<TranslationTextAlignment>[workItems.Length];
+        Array.Fill(textAlignments, Array.Empty<TranslationTextAlignment>());
+        var returnAlignments = requests.Any(static request => request.SourceSpans.Count > 0);
         try
         {
             var response = await _process.TranslateWithEvidenceAsync(
                 new MachineTranslationProcessRequest(
                     processLanguage,
                     "zh",
-                    workItems.Select(static item => item.Text).ToArray()),
+                    workItems.Select(static item => item.Text).ToArray(), returnAlignments),
                 cancellationToken).ConfigureAwait(false);
             translated = response.Texts;
             if (response.TextEvidence is { } perText && perText.Count == workItems.Length)
                 executionEvidence = perText.ToArray();
             else if (response.TextEvidence is null) Array.Fill(executionEvidence, response.Evidence);
+            if (response.TextAlignments is { } alignment && alignment.Count == workItems.Length)
+                textAlignments = alignment.ToArray();
         }
         catch (OperationCanceledException)
         {
@@ -160,11 +167,12 @@ public sealed class LocalMachineTranslationProvider(IMachineTranslationProcess p
                 try
                 {
                     var singleResponse = await _process.TranslateWithEvidenceAsync(
-                        new MachineTranslationProcessRequest(processLanguage, "zh", [workItems[index].Text]),
+                        new MachineTranslationProcessRequest(processLanguage, "zh", [workItems[index].Text], returnAlignments),
                         cancellationToken).ConfigureAwait(false);
                     var single = singleResponse.Texts;
                     executionEvidence[index] = singleResponse.TextEvidence is { Count: 1 } perText
                         ? perText[0] : singleResponse.TextEvidence is null ? singleResponse.Evidence : null;
+                    if (singleResponse.TextAlignments is { Count: 1 } singleAlignment) textAlignments[index] = singleAlignment[0];
                     if (single.Count == 1)
                         translatedSegments[workItems[index].RequestIndex][workItems[index].SegmentIndex] = single[0];
                     else
@@ -186,7 +194,7 @@ public sealed class LocalMachineTranslationProvider(IMachineTranslationProcess p
                     failures[index] = "machine-provider-failed";
                 }
             }
-            return CreateResults(requests, protectedTexts, translatedSegments, workItems, failures, executionEvidence);
+            return CreateResults(requests, protectedTexts, translatedSegments, workItems, failures, executionEvidence, textAlignments);
         }
 
         if (translated.Count != workItems.Length)
@@ -201,7 +209,7 @@ public sealed class LocalMachineTranslationProvider(IMachineTranslationProcess p
 
         for (var index = 0; index < workItems.Length; index++)
             translatedSegments[workItems[index].RequestIndex][workItems[index].SegmentIndex] = translated[index];
-        return CreateResults(requests, protectedTexts, translatedSegments, workItems, new string?[workItems.Length], executionEvidence);
+        return CreateResults(requests, protectedTexts, translatedSegments, workItems, new string?[workItems.Length], executionEvidence, textAlignments);
     }
 
     private IReadOnlyList<TranslationResult> CreateResults(
@@ -210,7 +218,8 @@ public sealed class LocalMachineTranslationProvider(IMachineTranslationProcess p
         IReadOnlyList<string[]> translatedSegments,
         IReadOnlyList<MachineTranslationWorkItem> workItems,
         IReadOnlyList<string?> failures,
-        IReadOnlyList<TranslationExecutionEvidence?>? executionEvidence = null)
+        IReadOnlyList<TranslationExecutionEvidence?>? executionEvidence = null,
+        IReadOnlyList<IReadOnlyList<TranslationTextAlignment>>? textAlignments = null)
     {
         var results = new TranslationResult[requests.Count];
         for (var requestIndex = 0; requestIndex < requests.Count; requestIndex++)
@@ -251,7 +260,35 @@ public sealed class LocalMachineTranslationProvider(IMachineTranslationProcess p
                     results[requestIndex] = new TranslationResult(false, string.Empty, "machine-output-unchanged");
                     continue;
                 }
-                results[requestIndex] = new TranslationResult(true, restored, "machine-completed");
+                var mapped = new List<TranslationTextAlignment>();
+                var sourceOffset = 0;
+                var targetOffset = 0;
+                for (var segmentIndex = 0; segmentIndex < protectedTexts[requestIndex].Segments.Count; segmentIndex++)
+                {
+                    var segment = protectedTexts[requestIndex].Segments[segmentIndex];
+                    var translatedSegment = translatedSegments[requestIndex][segmentIndex];
+                    var output = segment.ShouldTranslate
+                        ? segment.Text[..(segment.Text.Length - segment.Text.TrimStart().Length)] + translatedSegment.Trim()
+                            + segment.Text[segment.Text.TrimEnd().Length..]
+                        : translatedSegment;
+                    var workIndex = -1;
+                    for (var position = 0; position < workItems.Count; position++)
+                        if (workItems[position].RequestIndex == requestIndex && workItems[position].SegmentIndex == segmentIndex)
+                        { workIndex = position; break; }
+                    if (workIndex >= 0 && textAlignments is not null)
+                    {
+                        var leadingSource = segment.Text.Length - segment.Text.TrimStart().Length;
+                        var leadingTarget = translatedSegment.Length - translatedSegment.TrimStart().Length;
+                        foreach (var alignment in textAlignments[workIndex])
+                            if (TranslationStyleResolver.ValidRange(alignment.SourceStart, alignment.SourceLength, segment.Text.Length)
+                                && TranslationStyleResolver.ValidRange(alignment.TargetStart - leadingTarget, alignment.TargetLength, translatedSegment.Trim().Length))
+                                mapped.Add(alignment with { SourceStart = sourceOffset + alignment.SourceStart,
+                                    TargetStart = targetOffset + leadingSource + alignment.TargetStart - leadingTarget });
+                    }
+                    sourceOffset += segment.Text.Length;
+                    targetOffset += output.Length;
+                }
+                results[requestIndex] = new TranslationResult(true, restored, "machine-completed") { TextAlignments = mapped };
                 continue;
             }
             try { onIntegrityFailure?.Invoke(requests[requestIndex].OcrText, restored, mismatch.Value); }

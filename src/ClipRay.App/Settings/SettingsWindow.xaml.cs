@@ -21,6 +21,7 @@ public partial class SettingsWindow : Window
     private readonly ICredentialVault _credentialVault;
     private readonly SettingsConnectionTester _connectionTester;
     private readonly Func<string, CancellationToken, Task<TranslationResult>> _localProviderTest;
+    private readonly Func<SettingsTranslationTestRequest, CancellationToken, Task<TranslationResult>>? _localProviderDraftTest;
     private readonly Func<DeepSeekCostSummary> _loadDeepSeekCostSummary;
     private readonly Func<DeepSeekCostSummary> _resetDeepSeekCostSummary;
     private readonly Func<CleanupScheduleRegistrationStatus> _loadCleanupScheduleStatus;
@@ -74,13 +75,17 @@ public partial class SettingsWindow : Window
         Func<DeepSeekCostSummary> resetDeepSeekCostSummary,
         Func<CleanupScheduleRegistrationStatus>? loadCleanupScheduleStatus = null,
         Func<bool>? loadStartupStatus = null,
-        SettingsWindowEnvironment? environment = null)
+        SettingsWindowEnvironment? environment = null,
+        Func<SettingsTranslationTestRequest, CancellationToken, Task<TranslationResult>>? localProviderDraftTest = null)
     {
+        Presentation.UtilityWindowTheme.Prepare();
         InitializeComponent();
+        Presentation.UtilityWindowTheme.ApplyPalette(this);
         _applyCoordinator = applyCoordinator;
         _credentialVault = credentialVault;
         _connectionTester = new SettingsConnectionTester(providerFactory);
         _localProviderTest = localProviderTest;
+        _localProviderDraftTest = localProviderDraftTest;
         _loadDeepSeekCostSummary = loadDeepSeekCostSummary;
         _resetDeepSeekCostSummary = resetDeepSeekCostSummary;
         _settings = initialSettings;
@@ -189,6 +194,7 @@ public partial class SettingsWindow : Window
         ScreenshotDirectoryBox.Text = _settings.ScreenshotDirectory;
         LongCaptureDirectoryBox.Text = _settings.LongCaptureDirectory;
         RecordingDirectoryBox.Text = _settings.RecordingDirectory;
+        LoadRecordingControls();
         CopyToClipboardBox.IsChecked = _settings.CopyToClipboard;
         BorderFeedbackBox.IsChecked = _settings.ShowBorderFeedback;
         LiveStopControlBox.IsChecked = _settings.ShowLiveTranslationStopControl;
@@ -240,7 +246,7 @@ public partial class SettingsWindow : Window
     {
         if (_draftState?.Action == SettingsPrimaryAction.Refresh)
         {
-            return TryRefreshRuntimeData();
+            return true;
         }
 
         return TryApplyCurrentSettings();
@@ -280,14 +286,31 @@ public partial class SettingsWindow : Window
 
     private void SettingsWindow_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
+        if (e.Key is Key.ImeProcessed or Key.DeadCharProcessed) return;
         var key = HotkeyCapturePolicy.ResolveEventKey(
             e.Key,
             e.SystemKey,
             e.ImeProcessedKey,
             e.DeadCharProcessedKey);
-        if (key != Key.S || Keyboard.Modifiers != ModifierKeys.Control) return;
+        if (!ShouldRunPrimaryShortcut(Keyboard.FocusedElement as DependencyObject ?? e.OriginalSource as DependencyObject,
+                key, Keyboard.Modifiers)) return;
         ExecutePrimaryAction();
         e.Handled = true;
+    }
+
+    internal bool ShouldRunPrimaryShortcut(DependencyObject? focused, Key key, ModifierKeys modifiers)
+    {
+        if (key != Key.S || modifiers != ModifierKeys.Control) return false;
+        // Window PreviewKeyDown runs before the child capture handler. Preserve
+        // the focused shortcut editor's right to capture Ctrl+S itself.
+        for (var current = focused; current is not null;)
+        {
+            if (current is System.Windows.Controls.TextBox box && _hotkeyValues.ContainsKey(box)) return false;
+            current = current is System.Windows.Media.Visual or System.Windows.Media.Media3D.Visual3D
+                ? System.Windows.Media.VisualTreeHelper.GetParent(current)
+                : current is FrameworkContentElement content ? content.Parent : null;
+        }
+        return true;
     }
 
     private bool TryRefreshRuntimeData()
@@ -446,9 +469,12 @@ public partial class SettingsWindow : Window
         string? provider = null;
         try
         {
-            SaveSettingsDraft();
-            operation = _connectionOperations.Begin();
             provider = SelectedProvider();
+            var trial = new SettingsTranslationTestRequest(provider, SelectedValue(TranslationTargetLanguageBox),
+                NullIfWhiteSpace(LocalLmtModelPathBox.Text), LocalTrialInputBox.Text);
+            var credential = _selectedCredentialName ?? CredentialVault.FixedDeepSeekSlot;
+            var model = SelectedValue(ModelBox);
+            operation = _connectionOperations.Begin();
             if (provider is "Local LMT" or "Machine")
             {
                 LocalTrialResultBox.Clear();
@@ -460,11 +486,8 @@ public partial class SettingsWindow : Window
             TestProviderButton.IsEnabled = false;
             var result = await SettingsProviderTestRouter.TestAsync(
                 provider,
-                token => _localProviderTest(LocalTrialInputBox.Text, token),
-                token => _connectionTester.TestAsync(
-                    _selectedCredentialName ?? CredentialVault.FixedDeepSeekSlot,
-                    SelectedValue(ModelBox),
-                    token),
+                token => _localProviderDraftTest is { } testDraft ? testDraft(trial, token) : _localProviderTest(trial.Text, token),
+                token => _connectionTester.TestAsync(credential, model, token),
                 operation.Value.Token);
             if (CanDeliverConnection(operation))
             {
@@ -499,7 +522,7 @@ public partial class SettingsWindow : Window
             if (!CanDeliverConnection(operation)) return;
             if (operation is null)
             {
-                ShowStatus(Ui("无法保存测试设置；未启动翻译测试。", "Could not save test settings; translation test was not started."), success: false);
+                ShowStatus(Ui("无法准备连接测试；设置草稿仍未保存。", "Could not prepare the connection test. Settings changes remain unsaved."), success: false);
             }
             else
             {
@@ -793,9 +816,11 @@ public partial class SettingsWindow : Window
             ModelBox.Visibility = deepSeek ? Visibility.Visible : Visibility.Collapsed;
             CredentialValueBox.IsEnabled = deepSeek;
             LocalModelPanel.Visibility = localLmt ? Visibility.Visible : Visibility.Collapsed;
+            TestProviderButton.Visibility = localLmt ? Visibility.Collapsed : Visibility.Visible;
             CredentialCard.Visibility = deepSeek ? Visibility.Visible : Visibility.Collapsed;
             DeepSeekCostPanel.Visibility = deepSeek ? Visibility.Visible : Visibility.Collapsed;
             TestProviderButton.Content = provider == "DeepSeek" ? Ui("验证连接", "Test connection") : Ui("验证并试译", "Test translation");
+            RefreshSettingsNavigation();
         }
     }
 
@@ -861,6 +886,8 @@ public partial class SettingsWindow : Window
             StartupBox,
             CleanupScheduleBox,
             MachineFallbackBox,
+            RecordingCursorBox,
+            RecordingSystemAudioBox,
         ];
         foreach (var box in checkBoxes)
         {
@@ -877,6 +904,8 @@ public partial class SettingsWindow : Window
             LiveProviderBox,
             ModelBox,
             TranslationTargetLanguageBox,
+            RecordingFrameRateBox,
+            RecordingQualityBox,
         ];
         foreach (var box in comboBoxes) box.SelectionChanged += (_, _) => ObserveSettingsDraft();
     }
@@ -907,18 +936,24 @@ public partial class SettingsWindow : Window
         LocalModelStatusText.Text = Ui(_localStatusChinese, _localStatusEnglish);
         foreach (var entry in _hotkeyValues)
             entry.Key.Text = entry.Value is null ? Ui("未设置", "Not set") : HotkeyDisplayFormatter.Format(entry.Value);
-        Title = SettingsHeading.Text = Ui("ClipRay 设置", "ClipRay Settings");
-        VersionText.Text = ApplicationVersion;
-        SettingsSubtitle.Text = Ui("截图、快捷键、翻译与本地模型", "Capture, shortcuts, translation and local models");
-        OutputNavigation.Content = Ui("输出与维护", "Output and maintenance");
-        StartupNavigation.Content = Ui("启动", "Startup");
+        Title = Ui("ClipRay 设置", "ClipRay Settings");
+        SettingsHeading.Text = "ClipRay";
+        var releaseVersion = typeof(SettingsWindow).Assembly.GetName().Version?.ToString(3) ?? "1.0.6";
+        var build = System.Text.RegularExpressions.Regex.Match(ApplicationVersion, "[0-9a-f]{40}", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        VersionText.Text = Ui("版本 ", "Version ") + (build.Success ? $"{releaseVersion} · {build.Value[..7]}" : releaseVersion);
+        VersionText.ToolTip = ApplicationVersion;
+        SettingsSubtitle.Text = Ui("按任务找到需要的设置", "Set up your daily workflow");
+        OutputNavigation.Content = Ui("保存与复制", "Save and copy");
+        StartupNavigation.Content = Ui("常规", "General");
+        RefreshSettingsNavigation();
         HotkeysNavigation.Content = Ui("快捷键", "Shortcuts");
-        TranslationNavigation.Content = Ui("翻译", "Translation");
+        TranslationNavigation.Content = Ui("翻译与模型", "Translation");
         CloseSettingsButton.Content = Ui("关闭", "Close");
         UninstallButton.Content = Ui("卸载 ClipRay", "Uninstall ClipRay");
-        TutorialButton.Content = Ui("查看使用教程 ↗", "User guide ↗");
+        TutorialButton.Content = Ui("打开使用帮助", "Open user guide");
         TutorialButton.ToolTip = Ui("打开随 ClipRay 安装的离线使用教程", "Open the bundled offline user guide (Chinese)");
         UpdateAccessibleNames();
+        RefreshRecordingEstimate();
         UpdatePrimaryActionState();
     }
 
@@ -931,6 +966,7 @@ public partial class SettingsWindow : Window
         Name(ScreenshotDirectoryBox, "截图保存目录", "Screenshot save folder");
         Name(LongCaptureDirectoryBox, "长截图保存目录", "Scrolling capture save folder");
         Name(RecordingDirectoryBox, "录屏保存目录", "Recording save folder");
+        SetRecordingAccessibleNames();
         Name(CleanupRetentionDaysBox, "文件保留天数", "File retention days");
         Name(CleanupFrequencyBox, "自动清理频率", "Scheduled cleanup frequency");
         Name(CleanupWeeklyDayBox, "自动清理星期", "Scheduled cleanup weekday");
@@ -976,6 +1012,10 @@ public partial class SettingsWindow : Window
         ScreenshotDirectoryBox.Text,
         LongCaptureDirectoryBox.Text,
         RecordingDirectoryBox.Text,
+        SelectedValue(RecordingFrameRateBox),
+        SelectedValue(RecordingQualityBox),
+        RecordingCursorBox.IsChecked == true,
+        RecordingSystemAudioBox.IsChecked == true,
         CopyToClipboardBox.IsChecked == true,
         BorderFeedbackBox.IsChecked == true,
         LiveStopControlBox.IsChecked == true,
@@ -1023,11 +1063,20 @@ public partial class SettingsWindow : Window
     {
         if (_draftState is null) return;
         var save = _draftState.Action == SettingsPrimaryAction.Save;
-        SaveSettingsButton.Content = save ? Ui("保存设置", "Save settings") : Ui("立即刷新", "Refresh now");
-        SaveSettingsButton.Style = (Style)FindResource(save ? "PrimaryButton" : "RefreshButton");
-        SaveSettingsButton.ToolTip = save
-            ? Ui("保存当前修改（Ctrl+S）", "Save changes (Ctrl+S)")
-            : Ui("刷新 DeepSeek 费用、清理状态和凭据列表（Ctrl+S）", "Refresh DeepSeek costs, cleanup status and credentials (Ctrl+S)");
+        SaveSettingsButton.Content = Ui("保存设置", "Save settings");
+        SaveSettingsButton.Style = (Style)FindResource("PrimaryButton");
+        SaveSettingsButton.IsEnabled = save;
+        SaveSettingsButton.ToolTip = Ui("保存当前修改（Ctrl+S）", "Save changes (Ctrl+S)");
+        RefreshSettingsButton.IsEnabled = !save;
+        RefreshSettingsButton.ToolTip = save
+            ? Ui("先保存当前修改，再刷新状态", "Save your changes before refreshing status")
+            : Ui("刷新费用、清理状态和凭据列表", "Refresh costs, cleanup status and credentials");
+        var pending = Ui("有未保存的更改。", "You have unsaved changes.");
+        if (save && (StatusPanel.Opacity == 0 || StatusText.Text == Ui("设置已保存并立即生效。", "Settings saved and applied.")
+            || StatusText.Text == Ui("没有未保存的更改。", "No unsaved changes.")))
+            ShowInfoStatus(pending);
+        else if (!save && StatusText.Text == pending)
+            ShowInfoStatus(Ui("没有未保存的更改。", "No unsaved changes."));
         System.Windows.Automation.AutomationProperties.SetName(SaveSettingsButton, SaveSettingsButton.Content.ToString()!);
     }
 
@@ -1043,8 +1092,8 @@ public partial class SettingsWindow : Window
     {
         if (_lastCleanupSchedule is null) return;
         CleanupLastRunText.Text = CleanupRunStatusFormatter.Format(_lastCleanupRun, interfaceLanguage: _settings.InterfaceLanguage);
-        CleanupLastRunText.ToolTip = _lastCleanupRun is null ? null : string.Join(Environment.NewLine,
-            _lastCleanupRun.Items.Select(item => $"{item.Status}: {item.Path} ({item.Reason})"));
+        CleanupReasonsText.Text = CleanupRunStatusFormatter.FormatReasons(_lastCleanupRun, _settings.InterfaceLanguage);
+        CleanupLastRunText.ToolTip = CleanupReasonsText.Text;
         CleanupScheduleStateText.Text = CleanupScheduleStatusFormatter.Format(
             _settings.CleanupScheduleEnabled,
             _lastCleanupSchedule, _settings.InterfaceLanguage);
@@ -1072,6 +1121,7 @@ public partial class SettingsWindow : Window
         }
         _lastApplyInterfaceOnly = false;
         CleanupDailyTimeBox.Text = CleanupTimeInputPolicy.Normalize(CleanupDailyTimeBox.Text);
+        var recording = ReadRecordingOptions();
         var updated = new AppSettings
         {
             RegionCaptureHotkey = GetRequiredHotkeyValue(RegionHotkeyBox),
@@ -1099,6 +1149,10 @@ public partial class SettingsWindow : Window
             ScreenshotDirectory = Path.GetFullPath(ScreenshotDirectoryBox.Text),
             LongCaptureDirectory = Path.GetFullPath(LongCaptureDirectoryBox.Text),
             RecordingDirectory = Path.GetFullPath(RecordingDirectoryBox.Text),
+            RecordingFramesPerSecond = recording.FramesPerSecond,
+            RecordingQuality = recording.Quality,
+            RecordingIncludeCursor = recording.IncludeCursor,
+            RecordingIncludeSystemAudio = recording.IncludeSystemAudio,
             DefaultOutputLayoutRoot = _outputDirectoriesEdited ? null : _settings.DefaultOutputLayoutRoot,
             CopyToClipboard = CopyToClipboardBox.IsChecked == true,
             ShowBorderFeedback = BorderFeedbackBox.IsChecked == true,
@@ -1248,27 +1302,17 @@ public partial class SettingsWindow : Window
             false => "M 3,3 L 15,15 M 15,3 L 3,15",
             null => "M 9,2 A 7,7 0 1 1 8.9,2 M 9,6 L 9,10 M 9,13 L 9,14",
         });
-        if (success == true)
+        StatusIcon.SetResourceReference(System.Windows.Shapes.Shape.StrokeProperty, success switch
         {
-            var rainbow = CreateStatusRainbowBrush(0.95);
-            StatusIcon.Stroke = rainbow;
-            StatusPanel.BorderBrush = rainbow;
-            StatusPanel.Background = CreateStatusRainbowBrush(0.16);
-        }
-        else
-        {
-            var foreground = success == false ? "#FF7B88" : "#75CFFF";
-            var border = success == false ? "#934953" : "#3E6E91";
-            var background = success == false ? "#351E24" : "#172A3A";
-            StatusIcon.Stroke = new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(foreground));
-            StatusPanel.BorderBrush = new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(border));
-            StatusPanel.Background = new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(background));
-        }
+            true => "SystemFillColorSuccessBrush",
+            false => "SystemFillColorCriticalBrush",
+            null => "TextFillColorSecondaryBrush",
+        });
+        StatusPanel.BorderBrush = System.Windows.Media.Brushes.Transparent;
+        StatusPanel.Background = System.Windows.Media.Brushes.Transparent;
         StatusPanel.BeginAnimation(OpacityProperty, null);
         StatusPanel.Opacity = 1;
         if (!SystemParameters.ClientAreaAnimation) return;
-
-        if (success == true) AnimateRainbowSuccess();
 
         StatusPanel.BeginAnimation(OpacityProperty, new DoubleAnimation(0.25, 1, TimeSpan.FromMilliseconds(260))
         {
@@ -1361,7 +1405,7 @@ public partial class SettingsWindow : Window
     private void SectionNavigation_Click(object sender, RoutedEventArgs e)
     {
         if (sender is FrameworkElement { Tag: string name } && FindName(name) is FrameworkElement section)
-            section.BringIntoView();
+            ShowSettingsPage(section.Name);
     }
 
     private void StartSignatureMotion()

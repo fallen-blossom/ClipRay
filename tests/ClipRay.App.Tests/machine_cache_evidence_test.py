@@ -11,6 +11,7 @@ from types import SimpleNamespace
 worker = Path(sys.argv[1])
 tree = ast.parse(worker.read_text(encoding="utf-8-sig"))
 main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+policy = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "select_machine_device")
 
 class Tokenizer:
     def __init__(self, **kwargs):
@@ -42,7 +43,7 @@ namespace = {
     "is_chinese_prose": lambda text: text == "中文", "LITERAL_PATTERN": re.compile(r"never-matches"),
     "restore_aligned_literals": lambda tokens, result, tokenizer, language: "translated",
 }
-exec(compile(ast.Module(body=[main], type_ignores=[]), str(worker), "exec"), namespace)
+exec(compile(ast.Module(body=[policy, main], type_ignores=[]), str(worker), "exec"), namespace)
 assert namespace["main"]() == 0
 responses = [json.loads(line) for line in output.getvalue().splitlines()]
 assert responses[0]["textBackends"][0]["device"] == "cuda"

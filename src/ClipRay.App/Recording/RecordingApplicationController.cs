@@ -1,15 +1,21 @@
 using System.Drawing;
 using ClipRay.App.Settings;
+using ClipRay.App.Capture;
 
 namespace ClipRay.App.Recording;
 
-internal sealed record RecordingRunOptions(string OutputDirectory, bool CopyToClipboard, string InterfaceLanguage);
+internal sealed record RecordingRunOptions(string OutputDirectory, bool CopyToClipboard, string InterfaceLanguage,
+    RecordingVideoOptions? Video = null, bool Interactive = true)
+{
+    public RecordingVideoOptions VideoOptions => Video ?? new();
+}
 internal interface IRecordingFeedback : IDisposable { bool IsReady { get; } }
 internal interface IRecordingPendingPreview
 {
     bool IsClosed { get; }
     void Pending(string message);
     void Attach(bool copied);
+    void Attach(MediaCopyOutcome outcome) => Attach(outcome.Copied);
     void Fail(string message);
 }
 internal interface IRecordingEnvironment
@@ -17,10 +23,14 @@ internal interface IRecordingEnvironment
     IReadOnlyList<Rectangle> Monitors();
     RecordingOutputPaths Paths(string root);
     IRecordingFeedback PrepareFeedback(Rectangle effectiveRegion, Action stop);
+    IRecordingFeedback PrepareFeedback(Rectangle effectiveRegion, Action stop, bool interactive) => PrepareFeedback(effectiveRegion, stop);
     IRecordingRuntime CreateRuntime(RecordingMonitorMapping mapping, RecordingOutputPaths paths, bool silent, RecordingFaultSignal faults);
+    IRecordingRuntime CreateRuntime(RecordingMonitorMapping mapping, RecordingOutputPaths paths, bool silent,
+        RecordingFaultSignal faults, RecordingVideoOptions options) => CreateRuntime(mapping, paths, silent, faults);
     Task<bool> ConfirmSilentAsync(string message);
     IRecordingPendingPreview OpenPendingPreview(string path, string language);
     bool CopyFile(string path);
+    MediaCopyOutcome CopyFileWithOutcome(string path) => new(CopyFile(path) ? ClipboardPublicationState.Persisted : ClipboardPublicationState.NotPublished);
     void Notify(string message);
     Task DispatchAsync(Action action);
 }
@@ -33,10 +43,16 @@ internal sealed class RecordingApplicationController(IRecordingEnvironment envir
     internal TimeSpan StopBudget { get; set; } = TimeSpan.FromSeconds(2);
     internal bool IsBusy => _current is not null;
     internal RecordingStopReport? LastReport { get; private set; }
+    internal Guid? ActiveRunId => _current?.Id;
+    internal Guid? LastRunId { get; private set; }
+    internal RecordingRunOptions? ActiveOptions => _current?.Options;
+    internal RecordingOutputPaths? ActivePaths => _current?.Paths;
+    internal string State => _current is null ? "idle" : _current.StopRequested ? "saving" : _current.Started ? "recording" : "starting";
     internal IReadOnlyList<string> DeliveryErrors { get; private set; } = [];
     internal Task? PhysicalCompletion => _current?.Completion;
     private sealed class Run(RecordingRunOptions options)
     {
+        internal readonly Guid Id = Guid.NewGuid();
         internal readonly RecordingRunOptions Options = options;
         internal readonly TaskCompletionSource Initialized = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal RecordingOutputPaths? Paths;
@@ -59,22 +75,23 @@ internal sealed class RecordingApplicationController(IRecordingEnvironment envir
         void CheckStartupDelivery() { if (run.StopRequested || !CanDeliver()) throw new OperationCanceledException(); }
         try
         {
+            run.Options.VideoOptions.Validate();
             var monitors = environment.Monitors();
             var mapping = RecordingStartupGuard.Execute(RecordingStartupStage.Selection,
                 () => RecordingGeometry.Normalize(RecordingGeometry.MapToMonitor(request.PhysicalPixelRegion,monitors)));
             run.Paths = environment.Paths(options.OutputDirectory);
-            run.Feedback = environment.PrepareFeedback(RecordingGeometry.EffectiveRegion(mapping), () => _ = StopAsync());
+            run.Feedback = environment.PrepareFeedback(RecordingGeometry.EffectiveRegion(mapping), () => _ = StopAsync(),run.Options.Interactive);
             if (run.StopRequested || !CanDeliver())
             {
                 run.Feedback.Dispose(); run.Feedback = null;
                 throw new OperationCanceledException();
             }
             if (!run.Feedback.IsReady) throw new RecordingStartupException(RecordingStartupStage.RecordingUi,new InvalidOperationException("capture-controls-not-safe"));
-            for (var silent = false; ; silent = true)
+            for (var silent = !run.Options.VideoOptions.IncludeSystemAudio; ; silent = true)
             {
                 CheckStartupDelivery();
                 var faults = new RecordingFaultSignal();
-                run.Session = new RecordingSession(environment.CreateRuntime(mapping,run.Paths,silent,faults));
+                run.Session = new RecordingSession(environment.CreateRuntime(mapping,run.Paths,silent,faults,run.Options.VideoOptions));
                 faults.Raised += fault => { _ = environment.DispatchAsync(() => { if (ReferenceEquals(_current,run)) _ = StopAsync(); }); };
                 if (run.StopRequested || !CanDeliver()) { run.Session.RequestStop(); throw new OperationCanceledException(); }
                 try { await run.Session.StartAsync(CancellationToken.None); break; }
@@ -83,6 +100,8 @@ internal sealed class RecordingApplicationController(IRecordingEnvironment envir
                     // Do not create another native owner until this failed attempt actually retired.
                     await run.Session.StopAsync().WaitAsync(StopBudget);
                     if (!run.Session.Report.ResourcesReleased) throw;
+                    // A background CLI never opens a consent dialog or silently changes audio policy.
+                    if (!run.Options.Interactive) throw;
                     CheckStartupDelivery();
                     var recovery = run.Session.Report.Saved && System.IO.File.Exists(run.Paths.FinalPath) ? run.Paths.FinalPath
                         : System.IO.File.Exists(run.Paths.PartialPath) ? run.Paths.PartialPath : null;
@@ -138,7 +157,7 @@ internal sealed class RecordingApplicationController(IRecordingEnvironment envir
         run.Completion = completion.Task;
         Safe(run,"stop-request", () => run.Session?.RequestStop());
         Safe(run,"feedback-close", () => run.Feedback?.Dispose()); run.Feedback = null;
-        if (preview && run.Paths is not null)
+        if (preview && run.Options.Interactive && run.Paths is not null)
             Safe(run,"preview-create", () => run.Preview = environment.OpenPendingPreview(run.Paths.FinalPath,run.Options.InterfaceLanguage));
         Safe(run,"status", () => environment.Notify(Text(run.Options,"正在保存录屏…","Saving recording…")));
         _ = CompleteAsync(run,completion);
@@ -159,11 +178,16 @@ internal sealed class RecordingApplicationController(IRecordingEnvironment envir
             await environment.DispatchAsync(() =>
             {
                 LastReport = report;
+                LastRunId = run.Id;
                 if (report.Saved && report.Paths is not null)
                 {
-                    var copied = false;
-                    if (run.Started && run.Options.CopyToClipboard) Safe(run,"clipboard", () =>
-                    { copied = environment.CopyFile(report.Paths.FinalPath); if (!copied) run.DeliveryErrors.Add("clipboard-unavailable"); });
+                    var copied = new MediaCopyOutcome(ClipboardPublicationState.NotPublished);
+                    if (!_closing && run.Started && run.Options.CopyToClipboard) Safe(run,"clipboard", () =>
+                    {
+                        copied = environment.CopyFileWithOutcome(report.Paths.FinalPath);
+                        if (!copied.Copied) run.DeliveryErrors.Add("clipboard-unavailable");
+                        else if (!copied.PersistenceConfirmed) run.DeliveryErrors.Add("clipboard-persistence-unconfirmed");
+                    });
                     if (run.Preview is { IsClosed:false }) Safe(run,"preview-attach", () => run.Preview.Attach(copied));
                 }
                 else if (run.Preview is { IsClosed:false }) Safe(run,"preview-failure", () => run.Preview.Fail(Outcome(run,report)));
@@ -210,7 +234,8 @@ internal sealed class RecordingApplicationController(IRecordingEnvironment envir
             : Text(run.Options,$"录屏未完成；临时路径：{report.Paths?.PartialPath ?? run.Paths?.PartialPath}",$"Recording incomplete; partial path: {report.Paths?.PartialPath ?? run.Paths?.PartialPath}");
         if (report.FirstFault is { } fault) result += $" [{fault.Stage}: 0x{unchecked((uint)fault.Error.HResult):X8}]";
         if (!report.ResourcesReleased) result += Text(run.Options,"；资源释放失败，暂不能开始新录屏。","; resource release failed; new recording is blocked.");
-        if (run.DeliveryErrors.Count > 0) result += Text(run.Options,"；复制或预览反馈失败，文件状态不变。","; copy or preview feedback failed; file status is unchanged.");
+        if (run.DeliveryErrors.Contains("clipboard-persistence-unconfirmed")) result += Text(run.Options,"；已复制，退出后的剪贴板保留未确认。","; copied; clipboard persistence after exit is unconfirmed.");
+        if (run.DeliveryErrors.Any(error => error != "clipboard-persistence-unconfirmed")) result += Text(run.Options,"；复制或预览反馈失败，文件状态不变。","; copy or preview feedback failed; file status is unchanged.");
         return result;
     }
     private static string Text(RecordingRunOptions options,string chinese,string english) => AppInterfaceLanguage.Text(options.InterfaceLanguage,chinese,english);

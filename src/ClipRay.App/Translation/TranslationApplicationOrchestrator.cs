@@ -107,7 +107,8 @@ public sealed class TranslationApplicationOrchestrator
             throw new ArgumentException("Region identities must be unique.", nameof(siblings));
         var template = VisualTranslationRequestFactory.Create(regions, input.TargetLanguage, DeepSeekModels.Flash)[0];
         var request = new TranslationRequest(input.SourceLanguage, input.TargetLanguage, template.OcrText,
-            template.Model, template.TextKind, template.Scene, template.TranslationHint);
+            template.Model, template.TextKind, template.Scene, template.TranslationHint)
+            { SourceSpans = template.SourceSpans };
         cancellationToken.ThrowIfCancellationRequested();
         var batch = await _translate(input.Route, [request], cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
@@ -225,6 +226,9 @@ public sealed class TranslationApplicationOrchestrator
         }).ToArray());
         var model = DeepSeekModels.Flash;
         var requests = VisualTranslationRequestFactory.Create(regions, targetLanguage, model);
+        // Scope/grouping/style extraction are local recognition work too. Include
+        // them in the stage that the user is actually waiting on.
+        ocrMilliseconds = stage.ElapsedMilliseconds;
         TranslationPipelineTrace.RecordProjected("translation_requests", () => new
         {
             route = route.ToString(), target_language = targetLanguage,

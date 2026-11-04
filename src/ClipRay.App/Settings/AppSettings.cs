@@ -1,6 +1,8 @@
 using ClipRay.App.Infrastructure;
 using System.Globalization;
 using System.IO;
+using ClipRay.App.Recording;
+using System.Text.Json.Serialization;
 
 namespace ClipRay.App.Settings;
 
@@ -58,6 +60,18 @@ public sealed record AppSettings
     public string LongCaptureDirectory { get; init; } = string.Empty;
 
     public string RecordingDirectory { get; init; } = string.Empty;
+
+    public int RecordingFramesPerSecond { get; init; } = 60;
+
+    [JsonConverter(typeof(JsonStringEnumConverter<RecordingQuality>))]
+    public RecordingQuality RecordingQuality { get; init; } = RecordingQuality.Balanced;
+
+    public bool RecordingIncludeCursor { get; init; } = true;
+
+    public bool RecordingIncludeSystemAudio { get; init; } = true;
+
+    public RecordingVideoOptions CreateRecordingVideoOptions() => new(
+        RecordingFramesPerSecond, RecordingQuality, RecordingIncludeCursor, RecordingIncludeSystemAudio);
 
     // Written only when the complete layout is known to be the generated default.
     // Unmarked legacy folders remain ambiguous, even when their names look familiar.
@@ -153,6 +167,7 @@ public sealed record AppSettings
 
     public void Validate()
     {
+        CreateRecordingVideoOptions().Validate();
         if (string.IsNullOrWhiteSpace(ScreenshotDirectory))
         {
             throw new InvalidOperationException("截图目录不能为空。");
@@ -167,6 +182,9 @@ public sealed record AppSettings
         {
             throw new InvalidOperationException("长截图目录不能为空。");
         }
+        LocalPathPolicy.RequireLocal(ScreenshotDirectory);
+        LocalPathPolicy.RequireLocal(LongCaptureDirectory);
+        LocalPathPolicy.RequireLocal(RecordingDirectory);
 
         if (CleanupRetentionDays is < 1 or > 3650)
         {

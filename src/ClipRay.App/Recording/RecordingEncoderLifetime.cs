@@ -1,4 +1,5 @@
 using ClipRay.App.Infrastructure;
+using Vortice.Direct3D11;
 using Vortice.MediaFoundation;
 
 namespace ClipRay.App.Recording;
@@ -7,6 +8,9 @@ namespace ClipRay.App.Recording;
 public interface IRecordingEncoderBackend
 {
     bool BeganWriting { get; }
+    RecordingEncoderDiagnostics? EncoderDiagnostics => null;
+    ID3D11Device? SharedDevice => null;
+    bool AcceptsGpuFrames => false;
     void Start(CancellationToken token);
     void WriteVideo(VideoRecordingSample sample);
     void WriteAudio(AudioRecordingSample sample);
@@ -24,11 +28,15 @@ public sealed class MediaFoundationRecorder : IMediaFoundationRecorder
     private readonly IRecordingEncoderBackend _backend;
     private readonly RecordingFaultSignal _faults;
     private Task? _startTask, _stopTask;
-    public MediaFoundationRecorder(RecordingOutputPaths paths, int width, int height, AudioCaptureFormat? audioFormat)
-        : this(paths, new NativeRecordingEncoderBackend(paths,width,height,audioFormat), new RecordingFaultSignal()) { }
+    public MediaFoundationRecorder(RecordingOutputPaths paths, int width, int height, AudioCaptureFormat? audioFormat,
+        RecordingVideoOptions? videoOptions = null, bool preferGpuInput = false)
+        : this(paths, new NativeRecordingEncoderBackend(paths,width,height,audioFormat,videoOptions,preferGpuInput), new RecordingFaultSignal()) { }
     public MediaFoundationRecorder(RecordingOutputPaths paths, IRecordingEncoderBackend backend, RecordingFaultSignal faults)
     { _paths = paths; _backend = backend; _faults = faults; }
     public RecordingStopReport? Report { get; private set; }
+    public RecordingEncoderDiagnostics? EncoderDiagnostics => _backend.EncoderDiagnostics;
+    public ID3D11Device? SharedDevice => _backend.SharedDevice;
+    public bool AcceptsGpuFrames => _backend.AcceptsGpuFrames;
     public Task StartAsync(CancellationToken token)
     {
         lock (_sync)

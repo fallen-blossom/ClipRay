@@ -30,7 +30,17 @@ public static class MediaClipboardDataFactory
         // it. Supply a packed DIB explicitly for native editors and image history.
         data.SetData(System.Windows.DataFormats.Dib,
             new MemoryStream(encodedDib ?? EncodeDib(image), writable: false), autoConvert: false);
-        data.SetImage(image);
+        // WPF renders CF_BITMAP through a BMP encoder. A frozen decoder-backed
+        // BitmapFrame prepared on another thread can still fail that native
+        // rendering path. Publish a pixel-backed source created on this thread;
+        // keep the original PNG (including alpha) and packed DIB unchanged.
+        var stride = checked((checked(image.PixelWidth * image.Format.BitsPerPixel) + 7) / 8);
+        var pixels = new byte[checked(stride * image.PixelHeight)];
+        image.CopyPixels(pixels, stride, 0);
+        var clipboardImage = BitmapSource.Create(image.PixelWidth, image.PixelHeight,
+            image.DpiX, image.DpiY, image.Format, image.Palette, pixels, stride);
+        clipboardImage.Freeze();
+        data.SetImage(clipboardImage);
         AddFile(data, path);
         return data;
     }
@@ -104,16 +114,22 @@ public static class MediaClipboardPublisher
         var image = data.GetData(System.Windows.DataFormats.Bitmap) as BitmapSource;
         var pngBytes = (data.GetData(MediaClipboardDataFactory.PngFormat) as MemoryStream)?.Length;
         var dibBytes = (data.GetData(System.Windows.DataFormats.Dib, autoConvert: false) as MemoryStream)?.Length;
-        MediaDeliveryTrace.Record("clipboard_started", operationId, new { Width = image?.PixelWidth, Height = image?.PixelHeight,
+        MediaDeliveryTrace.Record("clipboard_started", operationId, new { Backend = "windows-history-options", Width = image?.PixelWidth, Height = image?.PixelHeight,
             PngBytes = pngBytes, DibBytes = dibBytes, FileCount = data.GetFileDropList()?.Count ?? 0, HistoryRequested = true, CloudUploadRequested = false });
         for (var attempt = 0; ; attempt++)
         {
             try
             {
-                // Flush OLE data so the media survives the originating window/process.
-                System.Windows.Clipboard.SetDataObject(data, copy: true);
+                WindowsMediaClipboard.Publish(data);
                 MediaDeliveryTrace.Record("clipboard_completed", operationId, new { Attempts = attempt + 1, ElapsedMs = timer.Elapsed.TotalMilliseconds });
                 return;
+            }
+            catch (ClipboardPersistenceException exception)
+            {
+                var cause = exception.InnerException ?? exception;
+                MediaDeliveryTrace.Record("clipboard_persistence_unconfirmed", operationId, new { Attempts = attempt + 1, ElapsedMs = timer.Elapsed.TotalMilliseconds,
+                    ContentPublished = true, Type = cause.GetType().Name, cause.HResult });
+                throw;
             }
             catch (ExternalException) when (attempt < 4)
             {

@@ -71,23 +71,35 @@ public sealed class CompletedOutputStore
     }
 
     public bool TryGetEligible(string path, CleanupFileKind kind, DateTime cutoff, out CompletedOutputReceipt? receipt)
+        => TryGetEligible(path, kind, cutoff, out receipt, out _);
+
+    public bool TryGetEligible(string path, CleanupFileKind kind, DateTime cutoff,
+        out CompletedOutputReceipt? receipt, out string reason)
     {
         receipt = null;
+        reason = "receipt-unavailable";
         try
         {
             var full = System.IO.Path.GetFullPath(path);
             var proof = ReceiptPath(full);
-            if (!File.Exists(full) || !File.Exists(proof) || !IsOrdinaryPath(full) || !IsOrdinaryPath(proof)) return false;
+            if (!File.Exists(full)) { reason = "output-missing"; return false; }
+            if (!File.Exists(proof)) { reason = "completion-receipt-missing"; return false; }
+            if (!IsOrdinaryPath(full) || !IsOrdinaryPath(proof)) { reason = "output-or-receipt-unsafe"; return false; }
             var proofInfo = new FileInfo(proof);
-            if (proofInfo.Length > 16_384) return false;
+            if (proofInfo.Length > 16_384) { reason = "completion-receipt-invalid"; return false; }
             var record = JsonSerializer.Deserialize<CompletedOutputReceipt>(File.ReadAllText(proof));
             var info = new FileInfo(full);
             if (record is null || record.Schema != 1 || record.State != "saved" || record.Kind != kind
                 || !string.Equals(record.Path, full, StringComparison.OrdinalIgnoreCase) || !IsOrdinaryPath(record.Path)
-                || record.Size <= 0 || record.Size != info.Length || record.WrittenUtc != info.LastWriteTimeUtc
-                || record.WrittenUtc >= cutoff || record.Sha256?.Length != 64
-                || !string.Equals(record.Sha256, HashFile(full), StringComparison.OrdinalIgnoreCase)) return false;
+                || record.Size <= 0) { reason = "completion-receipt-invalid"; return false; }
+            if (record.Size != info.Length || record.WrittenUtc != info.LastWriteTimeUtc)
+            { reason = "output-metadata-changed"; return false; }
+            if (record.WrittenUtc >= cutoff) { reason = "within-retention"; return false; }
+            if (record.Sha256?.Length != 64) { reason = "completion-receipt-invalid"; return false; }
+            if (!string.Equals(record.Sha256, HashFile(full), StringComparison.OrdinalIgnoreCase))
+            { reason = "output-content-changed"; return false; }
             receipt = record;
+            reason = "completed-expired";
             return true;
         }
         catch { return false; }

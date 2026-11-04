@@ -61,6 +61,7 @@ public sealed record TranslationRequest
     public TranslationTextKind TextKind { get; }
     public string Scene { get; }
     public string TranslationHint { get; }
+    public IReadOnlyList<TranslationSourceSpan> SourceSpans { get; init; } = [];
 }
 
 internal sealed class ProtectedTranslationText

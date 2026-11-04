@@ -35,7 +35,10 @@ public static class TextReplacementMask
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(region);
         var mask = new Bitmap(source.Width, source.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-        var words = region.Lines.SelectMany(static line => line.Words).ToArray();
+        // CTC word intervals locate style spans; blank/time-step boundaries can
+        // cut through real glyphs. Follow connected ink into the detected parent
+        // line, while leaving isolated, unrecognized icons in word gaps alone.
+        var words = region.Lines.SelectMany(ReplacementWords).ToArray();
         if (words.Length == 0)
         {
             var bounds = Clamp(region.Bounds, source);
@@ -72,6 +75,9 @@ public static class TextReplacementMask
                 }
             }
 
+            if (word.IsDetectedLine && word.RecognitionWords.Count > 0)
+                ink = ConnectedRecognizedInk(ink, bounds, word.RecognitionWords, protectedNeighborBounds);
+
             foreach (var pixel in ink)
             {
                 for (var dy = -1; dy <= 1; dy++)
@@ -89,7 +95,9 @@ public static class TextReplacementMask
 
         if (marked == 0 && region.Role == VisualTextRole.Control)
         {
-            foreach (var word in words)
+            // A failed parent-line seed cannot authorize clearing its gaps.
+            foreach (var word in region.Lines.SelectMany(static line =>
+                ReplacementWords(line with { PrimaryRecognitionWords = [] })))
             {
                 var bounds = Clamp(word.Bounds, source);
                 for (var y = (int)bounds.Top; y < (int)bounds.Bottom; y++)
@@ -140,6 +148,74 @@ public static class TextReplacementMask
             (int)Math.Round(cluster.Average(static color => color.R)),
             (int)Math.Round(cluster.Average(static color => color.G)),
             (int)Math.Round(cluster.Average(static color => color.B)));
+    }
+
+    private static string Compact(string text) => string.Concat(text.Where(static value => !char.IsWhiteSpace(value)));
+
+    private static IEnumerable<ClipRay.App.Ocr.OcrWord> ReplacementWords(ClipRay.App.Ocr.OcrTextBlock line)
+    {
+        var parents = line.PrimaryRecognitionWords;
+        var parentText = Compact(string.Concat(parents.Select(static word => word.Text)));
+        var text = Compact(line.Text);
+        var matches = string.Equals(parentText, text, StringComparison.Ordinal)
+            || line.SelectionBounds.HasValue && text.Length > 0
+                && string.Equals(Compact(string.Concat(line.Words.Select(static word => word.Text))), text, StringComparison.Ordinal)
+                && parentText.Contains(text, StringComparison.Ordinal);
+        var useParents = matches && parents.Count > 0
+            && parents.All(static word => word.IsDetectedLine && word.RecognitionWords.Count > 0);
+        foreach (var word in useParents ? parents : line.Words)
+        {
+            if (line.SelectionBounds is not { } clip) { yield return word; continue; }
+            clip = new PixelRect(Math.Max(clip.Left, line.Bounds.Left), Math.Max(clip.Top, line.Bounds.Top),
+                Math.Max(0, Math.Min(clip.Right, line.Bounds.Right) - Math.Max(clip.Left, line.Bounds.Left)),
+                Math.Max(0, Math.Min(clip.Bottom, line.Bounds.Bottom) - Math.Max(clip.Top, line.Bounds.Top)));
+            var left = Math.Max(word.Bounds.Left, clip.Left);
+            var top = Math.Max(word.Bounds.Top, clip.Top);
+            var right = Math.Min(word.Bounds.Right, clip.Right);
+            var bottom = Math.Min(word.Bounds.Bottom, clip.Bottom);
+            if (right <= left || bottom <= top) continue;
+            yield return word with
+            {
+                Bounds = new(left, top, right - left, bottom - top),
+                // Seed only the selected glyph boxes, never an excluded sibling.
+                RecognitionWords = useParents ? line.Words : word.RecognitionWords,
+            };
+        }
+    }
+
+    private static List<(int X,int Y)> ConnectedRecognizedInk(List<(int X,int Y)> ink, PixelRect bounds,
+        IReadOnlyList<ClipRay.App.Ocr.OcrWord> recognized, IReadOnlyList<PixelRect>? protectedBounds)
+    {
+        var left=(int)bounds.Left; var top=(int)bounds.Top;
+        var width=(int)bounds.Width; var height=(int)bounds.Height;
+        var states=new byte[checked(width*height)];
+        foreach(var pixel in ink)
+            if(!IsProtected(pixel.X,pixel.Y,protectedBounds)) states[(pixel.Y-top)*width+pixel.X-left]=1;
+        var output=new List<(int X,int Y)>();
+        foreach(var pixel in ink)
+        {
+            var initial=(pixel.Y-top)*width+pixel.X-left;
+            if(states[initial]!=1) continue;
+            var component=new List<(int X,int Y)> {pixel};
+            states[initial]=2;
+            var hasRecognizedInk=false;
+            for(var index=0;index<component.Count;index++)
+            {
+                var current=component[index];
+                hasRecognizedInk |= recognized.Any(word=>current.X>=word.Bounds.Left && current.X<word.Bounds.Right
+                    && current.Y>=word.Bounds.Top && current.Y<word.Bounds.Bottom);
+                for(var dy=-1;dy<=1;dy++)
+                for(var dx=-1;dx<=1;dx++)
+                {
+                    var x=current.X+dx-left; var y=current.Y+dy-top;
+                    if(x<0||x>=width||y<0||y>=height||states[y*width+x]!=1) continue;
+                    states[y*width+x]=2;
+                    component.Add((x+left,y+top));
+                }
+            }
+            if(hasRecognizedInk) output.AddRange(component);
+        }
+        return output;
     }
 
     private static bool IsProtected(int x, int y, IReadOnlyList<PixelRect>? protectedBounds)

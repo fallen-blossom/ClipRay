@@ -302,6 +302,9 @@ internal static class BackgroundTask3LifetimeTests
     internal static ClipRay.App.App FakeApp()
     {
         var app = (ClipRay.App.App)RuntimeHelpers.GetUninitializedObject(typeof(ClipRay.App.App));
+        var modelNetwork = new ModelNetworkAccessPolicy();
+        modelNetwork.EnableDeepSeek();
+        Set(app, "_modelNetworkPolicy", modelNetwork);
         Set(app, "_liveStartup", new LiveTranslationStartupCoordinator());
         Set(app, "_overlayTranslationOperations", new UiOperationOwner());
         Set(app, "_translationRetirements", new ResourceRetirementRegistry());
@@ -311,7 +314,7 @@ internal static class BackgroundTask3LifetimeTests
         Set(app, "_machineOcr", new OcrService(() => new FakeOcr((_, _) => Task.FromResult<IReadOnlyList<OcrWord>>([]))));
         Set(app, "_translationServices", new TranslationRuntimeServices(() => throw new Exception("No real cloud"),
             () => new OcrService(() => new FakeOcr((_, _) => Task.FromResult<IReadOnlyList<OcrWord>>([])))));
-        Set(app, "_settings", new AppSettings { Provider = "DeepSeek", LiveTranslationProvider = "Machine", MachineTranslationFallbackEnabled = false,
+        Set(app, "_settings", new AppSettings { Provider = "DeepSeek", HasExplicitProviderChoice = true, LiveTranslationProvider = "Machine", MachineTranslationFallbackEnabled = false,
             ScreenshotDirectory = Path.GetTempPath(), LongCaptureDirectory = Path.GetTempPath(), RecordingDirectory = Path.GetTempPath() });
         return app;
     }

@@ -57,7 +57,7 @@ public static class SelectionCapturePolicy
                 if (BelongsToSelection(relativeSelection, block.Bounds)
                     && TryIntersect(block.Bounds, relativeSelection, out var clipped))
                 {
-                    constrained.Add(block with { Bounds = clipped });
+                    constrained.Add(block with { Bounds = clipped, SelectionBounds = relativeSelection });
                 }
                 continue;
             }
@@ -69,7 +69,40 @@ public static class SelectionCapturePolicy
             {
                 if (TryIntersect(selectedBlock.Bounds, relativeSelection, out var clipped))
                 {
-                    constrained.Add(selectedBlock with { Bounds = clipped });
+                    // Regrouping selected CTC words must not discard the detector's
+                    // original line. Keep provenance separate from the hard pixel
+                    // boundary so a partial selection cannot authorize wider erasure.
+                    var parents = block.PrimaryRecognitionWords.Where(parent =>
+                        parent.Bounds.Top < selectedBlock.Bounds.Bottom
+                        && parent.Bounds.Bottom > selectedBlock.Bounds.Top
+                        && parent.Bounds.Left < selectedBlock.Bounds.Right
+                        && parent.Bounds.Right > selectedBlock.Bounds.Left).ToArray();
+                    if (parents.Length > 0)
+                    {
+                        var left = Math.Min(clipped.Left, parents.Min(static word => word.Bounds.Left));
+                        var top = Math.Min(clipped.Top, parents.Min(static word => word.Bounds.Top));
+                        var right = Math.Max(clipped.Right, parents.Max(static word => word.Bounds.Right));
+                        var bottom = Math.Max(clipped.Bottom, parents.Max(static word => word.Bounds.Bottom));
+                        // Retain a selected glyph's connected edge ink, but stop
+                        // before any sibling excluded by center/overlap policy.
+                        foreach (var excluded in block.Words.Except(selectedBlock.Words))
+                        {
+                            if (excluded.Bounds.Left + excluded.Bounds.Width / 2
+                                < selectedBlock.Bounds.Left + selectedBlock.Bounds.Width / 2)
+                                left = Math.Max(left, excluded.Bounds.Right);
+                            else
+                                right = Math.Min(right, excluded.Bounds.Left);
+                        }
+                        TryIntersect(new(left, top, right - left, bottom - top), relativeSelection, out clipped);
+                    }
+                    constrained.Add(selectedBlock with
+                    {
+                        Bounds = clipped,
+                        PrimaryRecognitionText = block.PrimaryRecognitionText,
+                        PrimaryRecognitionWords = parents,
+                        WhitespaceRepair = block.WhitespaceRepair,
+                        SelectionBounds = relativeSelection,
+                    });
                 }
             }
         }

@@ -29,6 +29,7 @@ internal static partial class BackgroundTask4Tests
             ("legacy-settings", LegacySettings),
             ("late-connection-exit", LateConnectionExit),
             ("hotkey-status-lifecycle", HotkeyStatusLifecycle),
+            ("recording-preferences", RecordingSettingsWindowRoundTrip),
         ];
 
     internal static int Run(string[] args)

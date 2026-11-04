@@ -25,7 +25,7 @@ internal sealed class LiveTranslationStartupCoordinator
             var selected = region ?? await operation.AwaitAsync(select(operation));
             operation.CheckCurrent();
             if (selected is null) return;
-            await operation.AwaitAsync(warming, TimeSpan.FromSeconds(12));
+            await operation.AwaitAsync(warming, TimeSpan.FromSeconds(route == TranslationRouteKind.Machine ? 65 : 12));
             operation.CheckCurrent();
             await operation.AwaitAsync(start(operation, selected.Value));
         }

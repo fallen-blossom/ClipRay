@@ -28,6 +28,7 @@ internal static partial class BackgroundTask5Tests
         ("finalize-failure", () => FinalizeFailure().GetAwaiter().GetResult()),
         ("startup-reentrant-stop", () => StartupReentrantStop().GetAwaiter().GetResult()),
         ("clock-pacer", ClockPacer),
+        ("app-recording-options", () => AppRecordingOptions().GetAwaiter().GetResult()),
         ("review-startup-exit", () => ReviewStartupExit().GetAwaiter().GetResult()),
         ("review-cancel-exit", () => ReviewCancelExit().GetAwaiter().GetResult()),
         ("review-startup-delivery", () => ReviewStartupDelivery().GetAwaiter().GetResult()),
@@ -51,6 +52,29 @@ internal static partial class BackgroundTask5Tests
         Check(pump.HeldBytes==0&&pump.HeldSamples==0,"Audio leases retained.");
         var bad=new RecordingAudioPump(new(48000,2,16,false),_=>ValueTask.CompletedTask,new());
         Check(!bad.TryPost([1,2,3],0),"Misaligned audio accepted.");await bad.CompleteAsync();
+    }
+    private static async Task AppRecordingOptions()
+    {
+        using var held = new ManualResetEventSlim();
+        var env = new Environment { HoldStart = held };
+        var app = NewApp(env, copy:false);
+        var settings = BackgroundTask3LifetimeTests.Field<AppSettings>(app, "_settings") with
+        {
+            RecordingFramesPerSecond=24, RecordingQuality=RecordingQuality.High,
+            RecordingIncludeCursor=false, RecordingIncludeSystemAudio=false,
+        };
+        BackgroundTask3LifetimeTests.Set(app, "_settings", settings);
+        var start=Start(app);
+        try
+        {
+            await env.BackendCreated.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            BackgroundTask3LifetimeTests.Set(app, "_settings", settings with { RecordingFramesPerSecond=60, RecordingIncludeSystemAudio=true });
+            held.Set();
+            Check(await start.WaitAsync(TimeSpan.FromSeconds(3)), "Recording with custom options did not start.");
+            Check(env.SelectedOptions==settings.CreateRecordingVideoOptions() && env.SilentAttempts.SequenceEqual([true]) && env.Prompts==0,
+                "Settings changed the active recording, or audio-off still prompted for audio.");
+        }
+        finally { held.Set(); await app.RecordingController.StopAsync(); }
     }
     private static async Task VideoLeases()
     {
@@ -185,6 +209,7 @@ internal static partial class BackgroundTask5Tests
                 &&app.LastExitWarning is not null&&app.RecordingController.IsBusy,"Managed exit ignored held recording ownership.");
         }
         finally{held.Set();if(app.RecordingController.PhysicalCompletion is {} task)await task.WaitAsync(TimeSpan.FromSeconds(3));}
+        Check(env.Copies == 0 && app.RecordingController.LastReport is { Saved: true }, "Accepted exit published late clipboard data or lost the finalized recording.");
         Check(await app.RequestManagedShutdownAsync(()=>Task.FromResult(true),()=>finals++,TimeSpan.FromSeconds(2))&&finals==1,"Retired recording blocked final managed exit.");
     }
     private static async Task Construction()
@@ -245,7 +270,7 @@ internal static partial class BackgroundTask5Tests
     }
     private static void ClockPacer()
     {
-        Check(RecordingFrameRatePolicy.SampleDuration100Nanoseconds==10_000_000L/30,"Sample clock mismatches encoder target.");
+        Check(RecordingFrameRatePolicy.SampleDuration100Nanoseconds==10_000_000L/60,"Sample clock mismatches encoder target.");
         var pacer=new RecordingFramePacer(30,1_000_000);var captured=0;
         for(var i=0;i<120;i++)if(pacer.ShouldCapture(i*16600L))captured++;
         Check(captured is >=59 and <=61,"Near-60Hz pacing collapsed.");
@@ -286,6 +311,9 @@ internal static partial class BackgroundTask5Tests
         public IReadOnlyList<Rectangle> Monitors()=>FailAt=="monitor"?throw new IOException("monitors"):[new(-200,-100,500,400)];
         public RecordingOutputPaths Paths(string root){if(FailAt=="paths")throw new IOException("paths");var paths=NewPaths();CreatedPaths.Add(paths);return paths;}
         public IRecordingFeedback PrepareFeedback(Rectangle region,Action stop){if(FailAt=="feedback")throw new IOException("feedback");Region=region;Feedback.Ready=ReadyOverride??FailAt!="ready";Feedback.OnClose=()=>Events.Enqueue("feedback-close");if(StopInFeedback)stop();return Feedback;}
+        internal bool? LastInteractive;
+        public IRecordingFeedback PrepareFeedback(Rectangle region,Action stop,bool interactive)
+        { LastInteractive=interactive; return PrepareFeedback(region,stop); }
         public IRecordingRuntime CreateRuntime(RecordingMonitorMapping mapping,RecordingOutputPaths paths,bool silent,RecordingFaultSignal faults)
         {
             Mapping=mapping;Faults=faults;SilentAttempts.Add(silent);faults.Raised+=_=>FaultObserved.TrySetResult();
@@ -302,6 +330,9 @@ internal static partial class BackgroundTask5Tests
                 Backends.Add(backend);BackendCreated.TrySetResult();return new MediaFoundationRecorder(paths,backend,faults);
             },()=>{var video=new Source{Faults=faults};Videos.Add(video);return video;},faults);
         }
+        internal RecordingVideoOptions? SelectedOptions;
+        public IRecordingRuntime CreateRuntime(RecordingMonitorMapping mapping,RecordingOutputPaths paths,bool silent,RecordingFaultSignal faults,RecordingVideoOptions options)
+        { SelectedOptions=options; return CreateRuntime(mapping,paths,silent,faults); }
         public Task<bool> ConfirmSilentAsync(string message){Prompts++;PromptMessages.Add(message);Check(Videos.All(v=>v.Starts==0),"Captured before silent consent.");return Task.FromResult(SilentAccepted);}
         public IRecordingPendingPreview OpenPendingPreview(string path,string language){Events.Enqueue("preview");Preview.Creates++;if(PreviewCreateFailure)throw new IOException("preview create");Preview.AttachFailure=PreviewAttachFailure;return Preview;}
         public bool CopyFile(string path){Copies++;Check(File.ReadAllBytes(path).SequenceEqual(Backend.Bytes),"Copied before actual commit.");if(CopyThrow)throw new IOException("clipboard");return !CopyFailure;}

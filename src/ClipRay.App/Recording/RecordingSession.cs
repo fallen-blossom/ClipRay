@@ -198,12 +198,14 @@ public static class RecordingGeometry
 
 public sealed class RecordingTimeline
 {
-    private readonly long _epochQpc;
+    private long? _epochQpc;
     private readonly long _qpcFrequency;
     private readonly object _sync = new();
     private readonly Dictionary<RecordingStream, long> _lastTimestamp = [];
 
-    public RecordingTimeline(long epochQpc, long qpcFrequency)
+    public RecordingTimeline(long epochQpc, long qpcFrequency) : this((long?)epochQpc, qpcFrequency) { }
+
+    private RecordingTimeline(long? epochQpc, long qpcFrequency)
     {
         if (qpcFrequency <= 0) throw new ArgumentOutOfRangeException(nameof(qpcFrequency));
         _epochQpc = epochQpc;
@@ -212,22 +214,33 @@ public sealed class RecordingTimeline
 
     public static RecordingTimeline StartNow() => new(Stopwatch.GetTimestamp(), Stopwatch.Frequency);
 
-    public long GetTimestamp100Nanoseconds(RecordingStream stream, long qpc)
+    public static RecordingTimeline CreatePending() => CreatePending(Stopwatch.Frequency);
+    internal static RecordingTimeline CreatePending(long frequency) => new(null, frequency);
+    public void BeginCapture() => BeginCapture(Stopwatch.GetTimestamp());
+    internal void BeginCapture(long qpc)
     {
-        if (qpc < _epochQpc) throw new InvalidOperationException("A sample predates the recording epoch.");
-        var delta = qpc - _epochQpc;
-        var timestamp = checked((long)((decimal)delta * 10_000_000m / _qpcFrequency));
         lock (_sync)
         {
+            if (_epochQpc is not null) throw new InvalidOperationException("The recording epoch is already set.");
+            _epochQpc = qpc;
+        }
+    }
+
+    public long GetTimestamp100Nanoseconds(RecordingStream stream, long qpc)
+    {
+        lock (_sync)
+        {
+            var epoch = _epochQpc ?? throw new InvalidOperationException("Capture has not begun.");
+            if (qpc < epoch) throw new InvalidOperationException("A sample predates the recording epoch.");
+            var timestamp = checked((long)((decimal)(qpc - epoch) * 10_000_000m / _qpcFrequency));
             if (_lastTimestamp.TryGetValue(stream, out var previous) && timestamp <= previous)
             {
                 throw new InvalidOperationException($"Non-monotonic {stream} timestamp.");
             }
 
             _lastTimestamp[stream] = timestamp;
+            return timestamp;
         }
-
-        return timestamp;
     }
 }
 
@@ -236,15 +249,15 @@ public sealed record RecordingOutputPaths(string PartialPath, string FinalPath)
     public static RecordingOutputPaths Create(string outputRoot, DateTime timestamp)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputRoot);
-        var directory = Path.Combine(outputRoot, timestamp.ToString("yyyy-MM-dd"));
+        var directory = ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(Path.Combine(outputRoot, timestamp.ToString("yyyy-MM-dd")));
         var baseStem = $"ClipRay-Recording_{timestamp:yyyy-MM-dd_HH-mm-ss-fff}";
         for (var suffix = 0; ; suffix++)
         {
             var suffixText = suffix == 0 ? string.Empty : $"_{suffix + 1}";
             var stem = baseStem + suffixText;
             var paths = new RecordingOutputPaths(
-                Path.Combine(directory, stem + ".partial.mp4"),
-                Path.Combine(directory, stem + ".mp4"));
+                ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(Path.Combine(directory, stem + ".partial.mp4")),
+                ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(Path.Combine(directory, stem + ".mp4")));
             if (!File.Exists(paths.PartialPath) && !File.Exists(paths.FinalPath)) return paths;
         }
     }
@@ -255,6 +268,11 @@ public sealed class RecordingFileMover
     internal ClipRay.App.Cleanup.CompletedOutputStore CompletedOutputs { get; set; } = new();
     public void Finalize(RecordingOutputPaths paths)
     {
+        paths = paths with
+        {
+            PartialPath = ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(paths.PartialPath),
+            FinalPath = ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(paths.FinalPath),
+        };
         if (!File.Exists(paths.PartialPath))
         {
             throw new FileNotFoundException("The partial recording does not exist.", paths.PartialPath);

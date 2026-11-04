@@ -165,7 +165,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "ClipRay win-x64 restore failed with exit code $LASTEXITCODE." }
         & dotnet publish (Join-Path $WorkspaceRoot 'src\ClipRay.App\ClipRay.App.csproj') `
             -c Release -r win-x64 --self-contained true --no-restore `
-            -p:DebugType=None -p:DebugSymbols=false "-p:InformationalVersion=$informationalVersion" -p:IncludeSourceRevisionInInformationalVersion=false -p:ClipRayIncludeCudaRuntime=$($includeLocalModel.ToString().ToLowerInvariant()) -o $staging | Out-Host
+            -p:DebugType=None -p:DebugSymbols=false -p:ClipRayIncludeInternalDocs=false "-p:InformationalVersion=$informationalVersion" -p:IncludeSourceRevisionInInformationalVersion=false -p:ClipRayIncludeCudaRuntime=$($includeLocalModel.ToString().ToLowerInvariant()) -o $staging | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "ClipRay publish failed with exit code $LASTEXITCODE." }
 
         New-Item -ItemType Directory -Path (Join-Path $staging 'licenses') -Force | Out-Null
@@ -220,13 +220,14 @@ try {
 
     Assert-InstallerStagingFlavor $staging $Flavor $WorkspaceRoot $approvedLocalModelSha256
 
-    $requiredTestNamedRuntimeFiles = @(
-        'machine-translation/runtime/Lib/site-packages/numpy/_pytesttester.py'
+    $allowedDistributionNames = @(
+        'machine-translation/runtime/Lib/site-packages/numpy/_pytesttester.py',
+        'docs/release/1.0.6-preview.3.zh-CN.md'
     )
     $forbidden = Get-ChildItem -LiteralPath $staging -Recurse -File | Where-Object {
         $relativePath = $_.FullName.Substring($staging.TrimEnd([IO.Path]::DirectorySeparatorChar).Length + 1).Replace('\', '/')
         ($_.Extension -in @('.pdb', '.cs', '.csproj', '.sln', '.ps1') -or $_.Name -match '(?i)(test|probe|preview)') `
-            -and $relativePath -notin $requiredTestNamedRuntimeFiles
+            -and $relativePath -notin $allowedDistributionNames
     }
     if ($forbidden) { throw "Release staging contains forbidden development files: $($forbidden.FullName -join ', ')" }
 

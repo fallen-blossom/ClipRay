@@ -59,6 +59,17 @@ internal static class InterfaceLanguageTests
         window.SettingsApplied += (_, value) => { if (!AppInterfaceLanguage.IsOnlyInterfaceChange(previous, value)) throw new Exception("Form normalized unrelated settings"); previous = value; events++; };
         try
         {
+            foreach (var page in new[] { "StartupSection", "OutputSection", "HelpSection" })
+            {
+                window.ShowSettingsPage(page);
+                var preview = (FrameworkElement)window.Content;
+                preview.Measure(new System.Windows.Size(800, 600));
+                preview.Arrange(new Rect(0, 0, 800, 600)); preview.UpdateLayout();
+                var bitmap = new RenderTargetBitmap(800, 600, 96, 96, PixelFormats.Pbgra32); bitmap.Render(preview);
+                var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(bitmap));
+                using var capture = File.Create(Path.Combine(root, "settings-zh-" + page + ".png")); png.Save(capture);
+            }
+            window.ShowSettingsPage("StartupSection");
             ((System.Windows.Controls.ComboBox)window.FindName("InterfaceLanguageBox")).SelectedIndex = 2;
             memory.Fail = true;
             ((System.Windows.Controls.Button)window.FindName("SaveSettingsButton")).RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
@@ -71,8 +82,10 @@ internal static class InterfaceLanguageTests
             var frequency = (ComboBox)window.FindName("CleanupFrequencyBox");
             if (frequency.SelectedItem is not ComboBoxItem { Content: "Daily", Tag: "每天" }
                 || ((CheckBox)window.FindName("StartupBox")).Content?.ToString() != "Start ClipRay when signing in to Windows (current user)"
-                || ((Button)window.FindName("SaveSettingsButton")).Content?.ToString() != "Refresh now")
+                || ((Button)window.FindName("SaveSettingsButton")).Content?.ToString() != "Save settings"
+                || ((Button)window.FindName("SaveSettingsButton")).IsEnabled)
                 throw new Exception("Translated display changed stable choices or made the form dirty.");
+            VerifyNavigationDrafts(window, memory, root);
             if (((System.Windows.Documents.Run)window.FindName("StartupStateText")).Text != "Disabled"
                 || ((System.Windows.Documents.Run)window.FindName("CleanupScheduleStateText")).Text != "Disabled (no task)"
                 || ((Button)window.FindName("TestProviderButton")).Content?.ToString() != "Test translation")
@@ -104,6 +117,7 @@ internal static class InterfaceLanguageTests
                 var page = new PngBitmapEncoder(); page.Frames.Add(BitmapFrame.Create(narrow));
                 using var output = File.Create(Path.Combine(root, $"settings-en-{offset}.png")); page.Save(output);
             }
+            window.ShowSettingsPage("TranslationSection");
             var providerBox = (ComboBox)window.FindName("ProviderBox");
             var previousProvider = providerBox.SelectedItem;
             providerBox.SelectedItem = providerBox.Items.OfType<ComboBoxItem>().Single(item => Equals(item.Content, "DeepSeek"));
@@ -145,7 +159,7 @@ internal static class InterfaceLanguageTests
             ((Button)window.FindName("SaveSettingsButton")).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
             if (events != 2 || frequency.SelectedItem is not ComboBoxItem { Content: "每天", Tag: "每天" }
                 || !((TextBlock)window.FindName("VersionText")).Text.StartsWith("版本 ", StringComparison.Ordinal)
-                || ((Button)window.FindName("SaveSettingsButton")).Content?.ToString() != "立即刷新")
+                || ((Button)window.FindName("SaveSettingsButton")).Content?.ToString() != "保存设置")
                 throw new Exception("Chinese restoration changed choices or draft state.");
             VerifyAccessibleName(window, "ScreenshotDirectoryBox", "截图保存目录");
             VerifyAccessibleName(window, "ChooseScreenshotFolderButton", "选择截图保存目录");
@@ -415,23 +429,37 @@ internal static class InterfaceLanguageTests
     private static void VerifyTestSaveFlow(AppSettings initial)
     {
         var memory = new MemoryStore { Fail = true }; var calls = 0; var cloudCalls = 0;
+        SettingsTranslationTestRequest? capturedDraft = null;
         var window = new SettingsWindow(initial, null, new SettingsApplyCoordinator(memory, new NoStartup(), "test.exe"),
             new EmptyVault(), () => { cloudCalls++; throw new Exception("Unexpected cloud access"); },
-            (_, _) => { calls++; if (calls == 2) throw new IOException("private diagnostic fixture"); if (calls == 3) throw new OperationCanceledException(); return Task.FromResult(new TranslationResult(true, "fixture translation", "fixture-ok")); },
+            (_, _) => throw new Exception("Saved-settings provider delegate must not run when a draft tester is supplied"),
             DeepSeekCostSummary.Empty(DateTimeOffset.UtcNow), () => DeepSeekCostSummary.Empty(DateTimeOffset.UtcNow),
-            () => throw new Exception("Unexpected reset"), () => new(CleanupScheduleRegistrationState.Missing), () => false);
+            () => throw new Exception("Unexpected reset"), () => new(CleanupScheduleRegistrationState.Missing), () => false,
+            localProviderDraftTest: (draft, _) =>
+            {
+                capturedDraft = draft; calls++;
+                if (calls == 2) throw new IOException("private diagnostic fixture");
+                if (calls == 3) throw new OperationCanceledException();
+                return Task.FromResult(new TranslationResult(true, "fixture translation", "fixture-ok"));
+            });
         try
         {
             ((CheckBox)window.FindName("CopyToClipboardBox")).IsChecked = !initial.CopyToClipboard;
+            ((System.Windows.Controls.TextBox)window.FindName("LocalTrialInputBox")).Text = "unsaved fixture text";
             var test = (Button)window.FindName("TestProviderButton");
             test.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
-            if (calls != 0 || string.IsNullOrWhiteSpace(((TextBlock)window.FindName("StatusText")).Text))
-                throw new Exception("Test did not report save failure before provider access.");
+            // Testing a provider must work with a dirty draft even when saving
+            // unrelated settings would fail. Only the Save action may commit it.
+            if (calls != 1 || memory.Saved is not null || capturedDraft is not { Text: "unsaved fixture text" }
+                || capturedDraft.Provider != initial.Provider
+                || ((Button)window.FindName("SaveSettingsButton")).Content?.ToString() != "Save settings")
+                throw new Exception("Provider test persisted unrelated settings or cleared the unsaved draft.");
+            var key = System.Windows.Input.Key.S;
+            var control = System.Windows.Input.ModifierKeys.Control;
+            if (window.ShouldRunPrimaryShortcut((DependencyObject)window.FindName("RegionHotkeyBox"), key, control)
+                || !window.ShouldRunPrimaryShortcut((DependencyObject)window.FindName("LocalTrialInputBox"), key, control))
+                throw new Exception("Ctrl+S did not preserve the shortcut editor's local capture semantics.");
             memory.Fail = false;
-            test.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
-            if (calls != 1 || memory.Saved?.CopyToClipboard == initial.CopyToClipboard
-                || ((Button)window.FindName("SaveSettingsButton")).Content?.ToString() != "Refresh now")
-                throw new Exception("Successful test did not synchronize the saved draft.");
             test.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
             var resultBox = (System.Windows.Controls.TextBox)window.FindName("LocalTrialResultBox");
             var localStatus = (TextBlock)window.FindName("LocalModelStatusText");
@@ -445,6 +473,11 @@ internal static class InterfaceLanguageTests
             test.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
             if (calls != 4 || resultBox.Text != "fixture translation" || !test.IsEnabled)
                 throw new Exception("Retry did not recover after a provider exception.");
+            if (memory.Saved is not null) throw new Exception("A connection retry committed the unsaved draft.");
+            ((Button)window.FindName("SaveSettingsButton")).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            if (memory.Saved is null || memory.Saved.CopyToClipboard == initial.CopyToClipboard
+                || ((Button)window.FindName("SaveSettingsButton")).Content?.ToString() != "Save settings")
+                throw new Exception("Explicit Save did not commit the draft after provider testing.");
             var live = (ComboBox)window.FindName("LiveProviderBox");
             live.SelectedItem = live.Items.OfType<ComboBoxItem>().Single(item => Equals(item.Tag, "DeepSeek"));
             ((PasswordBox)window.FindName("CredentialValueBox")).Password = "not-a-key";
@@ -494,6 +527,69 @@ internal static class InterfaceLanguageTests
         public Task<TranslationResult> TestCandidateConnectionAsync(string key, string model, CancellationToken token) => throw new NotSupportedException();
         public Task<TranslationResult> TranslateAsync(TranslationRequest request, string name, CancellationToken token) => throw new NotSupportedException();
         public Task<IReadOnlyList<TranslationResult>> TranslateBlocksAsync(IReadOnlyList<TranslationRequest> requests, string name, CancellationToken token) => throw new NotSupportedException();
+    }
+
+    private static void VerifyNavigationDrafts(SettingsWindow window, MemoryStore store, string output)
+    {
+        var folder = (System.Windows.Controls.TextBox)window.FindName("ScreenshotDirectoryBox");
+        var original = folder.Text;
+        var committed = store.Saved;
+        var themeKeys = new[] { "WindowBackground", "WindowForeground", "CardBackgroundFillColorDefaultBrush", "CardBackground", "CardStrokeColorDefaultBrush", "TextFillColorPrimaryBrush", "TextFillColorSecondaryBrush", "SolidBackgroundFillColorBaseBrush" };
+        File.WriteAllText(Path.Combine(output, "settings-theme-diagnostics.json"), System.Text.Json.JsonSerializer.Serialize(new
+        {
+            HighContrast = SystemParameters.HighContrast,
+            Framework = System.Diagnostics.FileVersionInfo.GetVersionInfo(typeof(Window).Assembly.Location).ProductVersion,
+            Resources = themeKeys.ToDictionary(key => key, key => window.TryFindResource(key)?.ToString() ?? "missing"),
+            Dictionaries = window.Resources.MergedDictionaries.Select(dictionary => dictionary.Source?.ToString()).ToArray(),
+            ResolvedControlAccents = new[] { "AccentButtonBackground", "TextControlFocusedBorderBrush", "ComboBoxBorderBrushFocused", "ComboBoxItemPillFillBrush", "CheckBoxCheckBackgroundFillChecked", "TextControlSelectionHighlightColor" }
+                .ToDictionary(key => key, key => window.TryFindResource(key)?.ToString()),
+            ColorfulNativeBrushes = window.Resources.MergedDictionaries[0].Keys.OfType<string>()
+                .Where(key => window.Resources.MergedDictionaries[0][key] is SolidColorBrush brush
+                    && Math.Max(brush.Color.R, Math.Max(brush.Color.G, brush.Color.B)) - Math.Min(brush.Color.R, Math.Min(brush.Color.G, brush.Color.B)) > 45)
+                .ToDictionary(key => key, key => window.Resources.MergedDictionaries[0][key].ToString()),
+        }));
+        if (!SystemParameters.HighContrast)
+        {
+            foreach (var key in new[] { "AccentButtonBackground", "TextControlFocusedBorderBrush", "ComboBoxBorderBrushFocused", "ComboBoxItemPillFillBrush", "CheckBoxCheckBackgroundFillChecked", "TextControlSelectionHighlightColor", "ListBoxItemSelectedBackgroundThemeBrush", "ListBoxItemSelectedBackgroundPointerOverThemeBrush", "ListBoxItemSelectedBackgroundPressedThemeBrush", "ListBoxItemBackgroundSelectedPressedThemeBrush" })
+                if (window.TryFindResource(key) is not SolidColorBrush brush
+                    || Math.Max(brush.Color.R, Math.Max(brush.Color.G, brush.Color.B)) - Math.Min(brush.Color.R, Math.Min(brush.Color.G, brush.Color.B)) > 32)
+                    throw new Exception("A utility control leaked the system accent: " + key);
+        }
+        var badge = (Border)window.FindName("SignatureBadge");
+        var signature = badge.BorderBrush as LinearGradientBrush;
+        var signatureColors = new[] { "#FFFF4D6D", "#FFFFB347", "#FFFFE66D", "#FF45D6A0", "#FF4D8DFF", "#FFB26DFF" };
+        if (signature is null || signature.Opacity != 0.82 || !signature.GradientStops.Select(stop => stop.Color.ToString()).SequenceEqual(signatureColors)
+            || !signature.GradientStops.Select(stop => stop.Offset).SequenceEqual(new[] { 0d, .2, .4, .6, .8, 1d })
+            || badge.RenderTransform is not ScaleTransform || badge.Padding != new Thickness(10, 7, 10, 7)
+            || badge.CornerRadius != new CornerRadius(8) || badge.BorderThickness != new Thickness(1)
+            || badge.Child is not TextBlock { FontSize: 12, Text: "by Fallen-Flower ❀O.o？" })
+            throw new Exception("Original rainbow signature colors or hover transform changed.");
+        try
+        {
+            folder.Text = original + "-draft";
+            foreach (var page in new[] { "OutputSection", "RecordingSection", "TranslationSection",
+                "HotkeysSection", "MaintenanceSection", "HelpSection", "StartupSection" })
+            {
+                window.ShowSettingsPage(page);
+                if (window.ActiveSettingsPage != page || ((FrameworkElement)window.FindName(page)).Visibility != Visibility.Visible)
+                    throw new Exception("Settings navigation did not show the selected page.");
+                foreach (var other in new[] { "OutputSection", "RecordingSection", "TranslationSection",
+                    "HotkeysSection", "MaintenanceSection", "HelpSection", "StartupSection" }.Where(other => other != page))
+                    if (((FrameworkElement)window.FindName(other)).Visibility != Visibility.Collapsed)
+                        throw new Exception("Unrelated settings pages remained in the long scrolling form.");
+                if (folder.Text != original + "-draft" || !window.HasPendingSettingsDraft || !ReferenceEquals(store.Saved, committed))
+                    throw new Exception("Switching settings pages changed or committed a draft.");
+                var content = (FrameworkElement)window.Content;
+                content.Measure(new System.Windows.Size(800, 600)); content.Arrange(new Rect(0, 0, 800, 600)); content.UpdateLayout();
+                ((ScrollViewer)window.FindName("SettingsScroll")).ScrollToTop(); content.UpdateLayout();
+                var image = new RenderTargetBitmap(800, 600, 96, 96, PixelFormats.Pbgra32); image.Render(content);
+                var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(image));
+                using var stream = File.Create(Path.Combine(output, "settings-page-" + page + ".png")); encoder.Save(stream);
+            }
+            if (((Button)window.FindName("RefreshSettingsButton")).IsEnabled)
+                throw new Exception("Status refresh could overwrite an unsaved settings draft.");
+        }
+        finally { folder.Text = original; window.ShowSettingsPage("StartupSection"); }
     }
 
     private sealed class MemoryStore : ISettingsStore

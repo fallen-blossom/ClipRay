@@ -123,9 +123,9 @@ internal sealed class PpOcrRuntime : IOcrRuntime, IOcrWarmup, IDisposable
     {
         var root = WorkspaceLocator.Find(AppContext.BaseDirectory);
         return (
-            Path.Combine(root, "artifacts", "runtimes", "paddleocr", "Scripts", "python.exe"),
-            Path.Combine(AppContext.BaseDirectory, "Ocr", "ppocr_sidecar.py"),
-            Path.Combine(root, "artifacts", "models", "paddleocr"));
+            ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(Path.Combine(root, "artifacts", "runtimes", "paddleocr", "Scripts", "python.exe")),
+            ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(Path.Combine(AppContext.BaseDirectory, "Ocr", "ppocr_sidecar.py")),
+            ClipRay.App.Infrastructure.LocalPathPolicy.RequireLocal(Path.Combine(root, "artifacts", "models", "paddleocr")));
     }
 
     private void EnsureProcess(string python, string script, string models)
@@ -145,6 +145,7 @@ internal sealed class PpOcrRuntime : IOcrRuntime, IOcrWarmup, IDisposable
         startInfo.ArgumentList.Add("--models");
         startInfo.ArgumentList.Add(models);
         var process = new Process { StartInfo = startInfo };
+        ClipRay.App.Infrastructure.NativeRuntimePrivacy.ConfigureLocalChild(startInfo);
         if (!process.Start())
         {
             process.Dispose();

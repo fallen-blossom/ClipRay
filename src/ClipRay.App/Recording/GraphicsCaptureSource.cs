@@ -5,6 +5,7 @@ using SharpGen.Runtime;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
+using Vortice.Mathematics;
 using Windows.Graphics.Capture;
 using Windows.Graphics.DirectX;
 using Windows.Graphics.DirectX.Direct3D11;
@@ -20,13 +21,21 @@ public sealed record VideoRecordingSample(
     long Duration100Nanoseconds) : IDisposable
 {
     private Action? _release;
+    private int _disposed;
+    public ID3D11Texture2D? GpuTexture { get; init; }
     internal VideoRecordingSample Own(Action release) { _release = release; return this; }
-    public void Dispose() => Interlocked.Exchange(ref _release,null)?.Invoke();
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        try { Interlocked.Exchange(ref _release, null)?.Invoke(); }
+        finally { GpuTexture?.Dispose(); }
+    }
 }
 
 public interface IGraphicsCaptureSource : IAsyncDisposable
 {
     void RequestStop() { }
+    Task PrepareAsync(CancellationToken cancellationToken) => Task.CompletedTask;
     Task StartAsync(Func<VideoRecordingSample, ValueTask> onSample, CancellationToken cancellationToken);
 
     Task StopAsync();
@@ -50,20 +59,32 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
     private Direct3D11CaptureFramePool? _framePool;
     private GraphicsCaptureSession? _captureSession;
     private RecordingVideoPump? _videoPump;
-    private readonly RecordingFramePacer _pacer = new(RecordingFrameRatePolicy.FramesPerSecond, Stopwatch.Frequency);
+    private readonly RecordingFramePacer _pacer;
+    private readonly long _sampleDuration;
+    private readonly Func<ID3D11Device?>? _sharedDevice;
+    private bool _gpuFrames;
     private readonly object _lifetime = new();
-    private Task? _stopTask, _disposeTask;
+    private Task? _prepareTask, _stopTask, _disposeTask;
     private readonly List<Exception> _releaseErrors = [];
     private readonly RecordingFaultSignal _faults = new();
     private RecordingPixelBuffers? _buffers;
     private int _frameBusy;
     private int _started;
     private int _stopped;
+    public CaptureBorderAccessResult? BorderAccess { get; private set; }
+    public bool SystemBorderRequired { get; private set; } = true;
+    private long _arrivals, _busySkips, _pacingSkips, _captured, _readbackTicks, _readbackMaxTicks, _copyTicks;
+    public RecordingCaptureStatistics Statistics => new(Interlocked.Read(ref _arrivals), Interlocked.Read(ref _busySkips),
+        Interlocked.Read(ref _pacingSkips), Interlocked.Read(ref _captured),
+        Interlocked.Read(ref _readbackTicks) * 1000d / Stopwatch.Frequency / Math.Max(1, Interlocked.Read(ref _captured)),
+        Interlocked.Read(ref _readbackMaxTicks) * 1000d / Stopwatch.Frequency,
+        Interlocked.Read(ref _copyTicks) * 1000d / Stopwatch.Frequency / Math.Max(1, Interlocked.Read(ref _captured)));
 
     public GraphicsCaptureSource(
         RecordingMonitorMapping mapping,
         RecordingTimeline timeline,
-        bool normalizeForEncoder = true, Action<Exception>? onFault = null, bool reuseBuffers = false)
+        bool normalizeForEncoder = true, Action<Exception>? onFault = null, bool reuseBuffers = false,
+        RecordingVideoOptions? options = null, Func<ID3D11Device?>? sharedDevice = null)
         : this(
             mapping.MonitorBounds,
             normalizeForEncoder
@@ -71,10 +92,11 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
                 : mapping.CropInMonitor,
             timeline,
             () => GraphicsCaptureInterop.CreateForMonitor(MonitorFromRectangle(mapping.MonitorBounds)),
-            RecordingCapturePolicy.IncludeCursor,
+            options?.IncludeCursor ?? RecordingCapturePolicy.IncludeCursor,
             enforceSourceSize: true,
-            onFault)
+            onFault, options)
     {
+        _sharedDevice = sharedDevice;
         if (reuseBuffers) _buffers = new RecordingPixelBuffers(checked(_crop.Width * _crop.Height * 4));
     }
 
@@ -85,7 +107,7 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
         Func<GraphicsCaptureItem> createItem,
         bool includeCursor,
         bool enforceSourceSize,
-        Action<Exception>? onFault)
+        Action<Exception>? onFault, RecordingVideoOptions? options = null)
     {
         _sourceBounds = sourceBounds;
         _crop = crop;
@@ -96,6 +118,10 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
         _timeline = timeline;
         _createItem = createItem;
         _includeCursor = includeCursor;
+        options ??= new();
+        options.Validate();
+        _pacer = new(options.FramesPerSecond, Stopwatch.Frequency);
+        _sampleDuration = options.SampleDuration100Nanoseconds;
         _enforceSourceSize = enforceSourceSize;
         _onFault = onFault;
         _faults.Raised += fault => ReportFault(fault.Error);
@@ -120,16 +146,21 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
             onFault);
     }
 
-    public Task StartAsync(Func<VideoRecordingSample, ValueTask> onSample, CancellationToken cancellationToken)
+    public Task PrepareAsync(CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(onSample);
+        lock (_lifetime) return _prepareTask ??= PrepareCoreAsync(cancellationToken);
+    }
+
+    private async Task PrepareCoreAsync(CancellationToken cancellationToken)
+    {
         cancellationToken.ThrowIfCancellationRequested();
-        if (Interlocked.Exchange(ref _started, 1) != 0) throw new InvalidOperationException("Graphics capture already started.");
+        if (Volatile.Read(ref _stopped) != 0) throw new OperationCanceledException();
         if (!GraphicsCaptureSession.IsSupported()) throw new PlatformNotSupportedException("Windows.Graphics.Capture is unavailable.");
+        BorderAccess = await CaptureBorderAccess.GetAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
         lock (_lifetime)
         {
+        cancellationToken.ThrowIfCancellationRequested();
         if (_stopped != 0) throw new OperationCanceledException();
-        _onSample = onSample;
         CreateDevices();
         _item = _createItem();
         _item.Closed += OnItemClosed;
@@ -145,9 +176,27 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
         _framePool.FrameArrived += OnFrameArrived;
         _captureSession = _framePool.CreateCaptureSession(_item);
         _captureSession.IsCursorCaptureEnabled = _includeCursor;
-        _videoPump = new RecordingVideoPump(onSample, _faults);
-        _captureSession.StartCapture();
-        return Task.CompletedTask;
+        if (BorderAccess?.Allowed == true)
+        {
+            try { _captureSession.IsBorderRequired = false; SystemBorderRequired = _captureSession.IsBorderRequired; }
+            catch (Exception error) { BorderAccess = new("ApplyFailed", false, error.HResult); }
+        }
+        }
+    }
+
+    public async Task StartAsync(Func<VideoRecordingSample, ValueTask> onSample, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(onSample);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (Interlocked.Exchange(ref _started, 1) != 0) throw new InvalidOperationException("Graphics capture already started.");
+        await PrepareAsync(cancellationToken).ConfigureAwait(false);
+        lock (_lifetime)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_stopped != 0) throw new OperationCanceledException();
+            _onSample = onSample;
+            _videoPump = new RecordingVideoPump(onSample, _faults);
+            _captureSession!.StartCapture();
         }
     }
 
@@ -185,7 +234,10 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
 
     private void CreateDevices()
     {
-        _nativeDevice = D3D11.D3D11CreateDevice(DriverType.Hardware, DeviceCreationFlags.BgraSupport);
+        var shared = _sharedDevice?.Invoke();
+        _gpuFrames = shared is not null;
+        _nativeDevice = shared?.QueryInterface<ID3D11Device>()
+            ?? D3D11.D3D11CreateDevice(DriverType.Hardware, DeviceCreationFlags.BgraSupport);
         _context = _nativeDevice.ImmediateContext;
         using var dxgiDevice = _nativeDevice.QueryInterface<IDXGIDevice>();
         var result = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.NativePointer, out var winrtPointer);
@@ -198,10 +250,11 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
         {
             Marshal.Release(winrtPointer);
         }
+        if (_gpuFrames) return;
         _staging = _nativeDevice.CreateTexture2D(new Texture2DDescription(
             Format.B8G8R8A8_UNorm,
-            (uint)_sourceBounds.Width,
-            (uint)_sourceBounds.Height,
+            (uint)_crop.Width,
+            (uint)_crop.Height,
             1,
             1,
             BindFlags.None,
@@ -214,14 +267,17 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
 
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
     {
-        if (Volatile.Read(ref _stopped) != 0 || Interlocked.Exchange(ref _frameBusy, 1) != 0) return;
+        if (Volatile.Read(ref _stopped) != 0) return;
+        Interlocked.Increment(ref _arrivals);
+        if (Interlocked.Exchange(ref _frameBusy, 1) != 0) { Interlocked.Increment(ref _busySkips); return; }
         byte[]? leased = null;
         try
         {
             if (Volatile.Read(ref _stopped) != 0) return;
             using var frame = sender.TryGetNextFrame();
             var qpc = Stopwatch.GetTimestamp();
-            if (frame is null || !_pacer.ShouldCapture(qpc)) return;
+            if (frame is null) return;
+            if (!_pacer.ShouldCapture(qpc)) { Interlocked.Increment(ref _pacingSkips); return; }
             if (_enforceSourceSize &&
                 (frame.ContentSize.Width != _sourceBounds.Width || frame.ContentSize.Height != _sourceBounds.Height))
             {
@@ -231,8 +287,44 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
             var access = WinRT.CastExtensions.As<IDirect3DDxgiInterfaceAccess>(frame.Surface);
             var texturePointer = access.GetInterface(typeof(ID3D11Texture2D).GUID);
             using var texture = new ID3D11Texture2D(texturePointer);
-            _context!.CopyResource(_staging!, texture);
+            if (_gpuFrames)
+            {
+                var cropped = _nativeDevice!.CreateTexture2D(new Texture2DDescription(Format.B8G8R8A8_UNorm,
+                    (uint)_crop.Width, (uint)_crop.Height, 1, 1, BindFlags.RenderTarget | BindFlags.ShaderResource,
+                    ResourceUsage.Default, CpuAccessFlags.None, 1, 0, ResourceOptionFlags.None));
+                VideoRecordingSample? gpuSample = null;
+                var transferred = false;
+                try
+                {
+                    _context!.CopySubresourceRegion(cropped, 0, 0, 0, 0, texture, 0,
+                        new Box(_crop.Left, _crop.Top, 0, _crop.Right, _crop.Bottom, 1));
+                    var gpuTimestamp = _timeline.GetTimestamp100Nanoseconds(RecordingStream.Video, qpc);
+                    gpuSample = new([], _crop.Width, _crop.Height, gpuTimestamp, _sampleDuration) { GpuTexture = cropped };
+                    if (!_videoPump!.TryPost(gpuSample) && Volatile.Read(ref _stopped) == 0)
+                        ReportFault(new InvalidOperationException("capture-video-admission-closed"));
+                    transferred = true;
+                    gpuSample = null;
+                    Interlocked.Increment(ref _captured);
+                }
+                finally
+                {
+                    if (!transferred)
+                    {
+                        if (gpuSample is not null) gpuSample.Dispose();
+                        else cropped.Dispose();
+                    }
+                }
+                return;
+            }
+            // Read back only the selected pixels, rather than the full monitor for every frame.
+            var readbackStart = Stopwatch.GetTimestamp();
+            _context!.CopySubresourceRegion(_staging!, 0, 0, 0, 0, texture, 0,
+                new Box(_crop.Left, _crop.Top, 0, _crop.Right, _crop.Bottom, 1));
             _context.Map(_staging!, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None, out var mapped).CheckError();
+            var readbackTicks = Stopwatch.GetTimestamp() - readbackStart;
+            Interlocked.Add(ref _readbackTicks, readbackTicks);
+            if (readbackTicks > _readbackMaxTicks) Interlocked.Exchange(ref _readbackMaxTicks, readbackTicks);
+            var copyStart = Stopwatch.GetTimestamp();
             byte[] pixels;
             try
             {
@@ -242,7 +334,7 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
                 if (_buffers is not null) leased = pixels;
                 for (var row = 0; row < _crop.Height; row++)
                 {
-                    var source = IntPtr.Add(mapped.DataPointer, checked((_crop.Y + row) * (int)mapped.RowPitch + _crop.X * 4));
+                    var source = IntPtr.Add(mapped.DataPointer, checked(row * (int)mapped.RowPitch));
                     Marshal.Copy(source, pixels, row * destinationStride, destinationStride);
                 }
             }
@@ -250,9 +342,11 @@ public sealed class GraphicsCaptureSource : IGraphicsCaptureSource
             {
                 _context.Unmap(_staging!, 0);
             }
+            Interlocked.Add(ref _copyTicks, Stopwatch.GetTimestamp() - copyStart);
+            Interlocked.Increment(ref _captured);
 
             var timestamp = _timeline.GetTimestamp100Nanoseconds(RecordingStream.Video, qpc);
-            var sample = new VideoRecordingSample(pixels, _crop.Width, _crop.Height, timestamp, RecordingFrameRatePolicy.SampleDuration100Nanoseconds);
+            var sample = new VideoRecordingSample(pixels, _crop.Width, _crop.Height, timestamp, _sampleDuration);
             if (leased is not null) { var owned = leased; sample.Own(() => _buffers!.Return(owned)); leased = null; }
             if (!_videoPump!.TryPost(sample) && Volatile.Read(ref _stopped) == 0)
                 ReportFault(new InvalidOperationException("capture-video-admission-closed"));

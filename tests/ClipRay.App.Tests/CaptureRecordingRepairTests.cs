@@ -294,11 +294,7 @@ internal static class CaptureRecordingRepairTests
     {
         if (BackgroundTask5Tests.Run(["--background-task-5-tests","daily-policy","clock-pacer"]) != 0)
             throw new Exception("Daily frame-rate/bitrate/timeline contract failed.");
-        var root = WorkspaceLocator.Find(AppContext.BaseDirectory);
-        var capture = File.ReadAllText(Path.Combine(root,"src","ClipRay.App","Recording","GraphicsCaptureSource.cs"));
-        var encoder = File.ReadAllText(Path.Combine(root,"src","ClipRay.App","Recording","MediaFoundationRecorder.cs"));
-        if (!capture.Contains("RecordingFrameRatePolicy.FramesPerSecond") || !capture.Contains("RecordingFrameRatePolicy.SampleDuration100Nanoseconds")
-            || !encoder.Contains("RecordingFrameRatePolicy.FramesPerSecond")) throw new Exception("Capture or encoder bypassed shared daily clock.");
+        RecordingSettingsTests.TimingAndPersistence();
     }
 
     public static void StopShowsPreviewBeforeFinalizeFinishes()

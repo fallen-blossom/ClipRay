@@ -73,9 +73,20 @@ public static class ScriptSupplementalOcr
             .ToArray();
         if (scriptWords.Length == 0) return primary.ToArray();
 
-        return primary
-            .Where(word => !scriptWords.Any(script => SubstantiallyOverlaps(word.Bounds, script.Bounds)))
-            .Concat(scriptWords)
+        var retained = primary.ToList();
+        var accepted = new List<OcrWord>();
+        foreach (var script in scriptWords)
+        {
+            var overlaps = primary.Where(word => SubstantiallyOverlaps(word.Bounds, script.Bounds)).ToArray();
+            if (overlaps.Length == 0) { accepted.Add(script); continue; }
+            // A supplemental detector can see just a syllable inside an entire main
+            // line. Neither delete that line nor add duplicate text over its pixels.
+            if (overlaps.Any(word => !CanReplaceCompleteLine(word, script))) continue;
+            foreach (var word in overlaps) retained.Remove(word);
+            var bounds = overlaps.Select(word => word.Bounds).Append(script.Bounds).Aggregate(Union);
+            accepted.Add(script with { Bounds = bounds });
+        }
+        return retained.Concat(accepted)
             .OrderBy(static word => word.Bounds.Top)
             .ThenBy(static word => word.Bounds.Left)
             .ToArray();
@@ -96,4 +107,26 @@ public static class ScriptSupplementalOcr
         var smallerArea = Math.Min(first.Width * first.Height, second.Width * second.Height);
         return smallerArea > 0 && intersectionArea / smallerArea >= 0.25;
     }
+
+    private static bool CanReplaceCompleteLine(OcrWord primary, OcrWord supplemental)
+    {
+        var intersectionWidth = Math.Max(0, Math.Min(primary.Bounds.Right, supplemental.Bounds.Right)
+            - Math.Max(primary.Bounds.Left, supplemental.Bounds.Left));
+        var intersectionHeight = Math.Max(0, Math.Min(primary.Bounds.Bottom, supplemental.Bounds.Bottom)
+            - Math.Max(primary.Bounds.Top, supplemental.Bounds.Top));
+        var intersection = intersectionWidth * intersectionHeight;
+        if (intersection / Math.Max(1, primary.Bounds.Width * primary.Bounds.Height) < .8
+            || intersection / Math.Max(1, supplemental.Bounds.Width * supplemental.Bounds.Height) < .6) return false;
+        var originalLength = primary.Text.Count(c => !char.IsWhiteSpace(c));
+        var replacementLength = supplemental.Text.Count(c => !char.IsWhiteSpace(c));
+        if (replacementLength < originalLength * .4) return false;
+        // Reject known-poor supplemental output; model scores are not comparable
+        // correctness probabilities and do not override the completeness checks.
+        return supplemental.Evidence?.RawScore is not { } score || double.IsFinite(score) && score >= .65;
+    }
+
+    private static PixelRect Union(PixelRect first, PixelRect second) => new(
+        Math.Min(first.Left, second.Left), Math.Min(first.Top, second.Top),
+        Math.Max(first.Right, second.Right) - Math.Min(first.Left, second.Left),
+        Math.Max(first.Bottom, second.Bottom) - Math.Min(first.Top, second.Top));
 }

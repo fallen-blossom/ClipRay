@@ -12,7 +12,7 @@ public sealed class LiveTranslationRequestCache(
     Action<LiveTranslationCacheDiagnostic>? diagnostic = null,
     TimeProvider? clock = null)
 {
-    private readonly Dictionary<CacheKey,TranslationResult> _results = [];
+    private readonly Dictionary<CacheKey,CachedValue> _results = [];
     private readonly Queue<CacheKey> _order = [];
     private readonly Dictionary<CacheKey,FailureEntry> _failures = [];
     private readonly TimeProvider _clock = clock ?? TimeProvider.System;
@@ -22,12 +22,12 @@ public sealed class LiveTranslationRequestCache(
     {
         token.ThrowIfCancellationRequested();
         var requestKeys=requests.Select(request=>CacheKey.Create(route,request)).ToArray();
-        var cached = new Dictionary<CacheKey,TranslationResult>();
+        var cached = new Dictionary<CacheKey,CachedValue>();
         foreach (var key in requestKeys.Distinct())
             if (_results.TryGetValue(key, out var completed)) cached.Add(key, completed);
             else if (_failures.TryGetValue(key, out var failure)
                 && _clock.GetElapsedTime(failure.RecordedAt) < FailureDelay(failure.Count))
-                cached.Add(key, failure.Result);
+                cached.Add(key, failure.Value);
         var hitIndices = requestKeys.Select((key,index)=>(key,index))
             .Where(pair=>cached.ContainsKey(pair.key)).Select(pair=>pair.index).ToArray();
         var missing=requests.Zip(requestKeys)
@@ -54,14 +54,15 @@ public sealed class LiveTranslationRequestCache(
             if(retry.Results.Count!=failed.Length) throw new InvalidOperationException("translation-count-mismatch");
             for(var i=0;i<failed.Length;i++) translated[failed[i]]=retry.Results[i];
         }
-        var current=new Dictionary<CacheKey,TranslationResult>();
+        var current=new Dictionary<CacheKey,CachedValue>();
         for(var i=0;i<missing.Length;i++)
         {
             var key=missing[i].Second;
-            current.Add(key,translated[i]);
+            var value=new CachedValue(translated[i],missingRequests[i].OcrText);
+            current.Add(key,value);
             if(translated[i].IsSuccess)
             {
-                _results[key]=translated[i]; _order.Enqueue(key);
+                _results[key]=value; _order.Enqueue(key);
                 _failures.Remove(key);
             }
             else if (translated[i].Status is "machine-content-integrity-failed" or "machine-protected-content-failed")
@@ -72,12 +73,12 @@ public sealed class LiveTranslationRequestCache(
                     ? Math.Min(previous.Count + 1, 6) : 1;
                 if (!_failures.ContainsKey(key) && _failures.Count >= 512)
                     _failures.Remove(_failures.MinBy(pair => pair.Value.RecordedAt).Key);
-                _failures[key] = new(translated[i], _clock.GetTimestamp(), count);
+                _failures[key] = new(value, _clock.GetTimestamp(), count);
             }
         }
         // Gather before eviction: one large input batch may exceed cache capacity.
-        var results=requestKeys.Select(key=>current.TryGetValue(key,out var result)
-            ? result : cached[key]).ToArray();
+        var results=requestKeys.Select((key,index)=>(current.TryGetValue(key,out var value)
+            ? value : cached[key]).ForSource(requests[index].OcrText)).ToArray();
         while(_order.Count>512) _results.Remove(_order.Dequeue());
         Report(new("cache_complete", requests.Count, hitIndices, missing.Length, retryCount));
         return new(results,outcome.Trace with { FailedCount=results.Count(result=>!result.IsSuccess) });
@@ -92,7 +93,12 @@ public sealed class LiveTranslationRequestCache(
     private static TimeSpan FailureDelay(int count) => TimeSpan.FromSeconds(
         Math.Min(30, 3 * (1 << Math.Min(count - 1, 4))));
 
-    private sealed record FailureEntry(TranslationResult Result, long RecordedAt, int Count);
+    private sealed record CachedValue(TranslationResult Result,string ExactSourceText)
+    {
+        internal TranslationResult ForSource(string source)=>ExactSourceText==source || Result.TextAlignments.Count==0
+            ? Result : Result with { TextAlignments=[] };
+    }
+    private sealed record FailureEntry(CachedValue Value, long RecordedAt, int Count);
 
     private sealed record CacheKey(
         TranslationRouteKind Route,
@@ -102,16 +108,21 @@ public sealed class LiveTranslationRequestCache(
         string Model,
         TranslationTextKind TextKind,
         string Scene,
-        string TranslationHint)
+        string TranslationHint,
+        string SourceSpanIdentity)
     {
         internal static CacheKey Create(TranslationRouteKind route,TranslationRequest request)=>new(
             route,
             request.SourceLanguage.Trim().ToLowerInvariant(),
             request.TargetLanguage.Trim().ToLowerInvariant(),
-            string.Join(' ',request.OcrText.Split((char[]?)null,StringSplitOptions.RemoveEmptyEntries)),
+            // Alignment coordinates refer to this exact UTF-16 input and this
+            // requested span structure. A semantic hit alone cannot certify them.
+            request.SourceSpans.Count>0 ? request.OcrText
+                : string.Join(' ',request.OcrText.Split((char[]?)null,StringSplitOptions.RemoveEmptyEntries)),
             request.Model,
             request.TextKind,
             request.Scene,
-            request.TranslationHint);
+            request.TranslationHint,
+            request.SourceSpans.Count==0 ? string.Empty : System.Text.Json.JsonSerializer.Serialize(request.SourceSpans));
     }
 }

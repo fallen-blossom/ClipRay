@@ -42,6 +42,9 @@ internal static class WorkbenchWindowTests
         var window = new TranslationWorkbenchWindow(document, text => copied = text);
         try
         {
+            if (window.FindName("WorkbenchActions") is not System.Windows.Controls.ToolBar actions
+                || System.Windows.Input.KeyboardNavigation.GetTabNavigation(actions) != System.Windows.Input.KeyboardNavigationMode.Continue)
+                throw new Exception("Tab must continue from workbench actions into the editors.");
             var beforeOcr = (System.Windows.Controls.ComboBox)window.FindName("OcrLanguageBox");
             if (!beforeOcr.IsEnabled || document.Session is not null) throw new Exception("OCR language must be selectable before recognition.");
             if (beforeOcr.Items.Count > 1)

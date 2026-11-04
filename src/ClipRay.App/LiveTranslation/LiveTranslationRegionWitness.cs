@@ -124,15 +124,30 @@ internal sealed class LiveTranslationRegionWitness
             if (sourceRegions is null || sourceRegions.Count == 0) return null;
             if (refreshedPlan is not null) return refreshedPlan;
             using var bitmap = current.ToBitmap();
+            // Geometry/text have semantic evidence, but the color/weight of an
+            // individual source word may have changed with the backing. Reuse
+            // the existing lines without OCR and measure their current spans.
+            var observedStyles = VisualTextRegionBuilder.Build(sourceRegions.SelectMany(region => region.Lines)
+                    .Distinct().ToArray(), bitmap).SelectMany(region => region.SourceStyleSpans).ToArray();
+            var refreshedRegions = sourceRegions.Select(region => region with
+            {
+                SourceStyleSpans = region.SourceStyleSpans.Select(span => span with
+                {
+                    Style = observedStyles.FirstOrDefault(observed => observed.Text == span.Text
+                        && observed.Bounds == span.Bounds)?.Style
+                        ?? span.Style with { Confidence = VisualStyleConfidence.Low },
+                }).ToArray(),
+            }).ToArray();
             var results = sourceRegions.Select(region =>
             {
                 var translated = _entries.Select(static entry => entry.Item)
                     .FirstOrDefault(item => matches(region, item));
                 return translated is null
                     ? new TranslationResult(false, region.SourceText, "source-preserved")
-                    : new TranslationResult(true, translated.Text, "machine-completed");
+                    : new TranslationResult(true, translated.Text, "machine-completed")
+                        { TextAlignments = translated.TextAlignments };
             }).ToArray();
-            refreshedPlan = InPlaceLayoutService.BuildRegionPlan(bitmap, sourceRegions, results);
+            refreshedPlan = InPlaceLayoutService.BuildRegionPlan(bitmap, refreshedRegions, results);
             return refreshedPlan;
         }
         foreach (var entry in _entries)
@@ -167,16 +182,10 @@ internal sealed class LiveTranslationRegionWitness
                     item.SourceRegion is { } region && matches(region, entry.Item));
                 if (repaired?.MaskedPatchPng is { Length: > 0 })
                 {
-                    var item = entry.Item with
-                    {
-                        BackgroundColor = repaired.BackgroundColor,
-                        ForegroundColor = repaired.ForegroundColor,
-                        BackgroundMode = repaired.BackgroundMode,
-                        SourceStyle = repaired.SourceStyle,
-                        TextLayout = repaired.TextLayout,
-                        MaskedPatchPng = repaired.MaskedPatchPng,
-                    };
-                    retained.Add(new(item, entry.Bounds, hash, current));
+                    // Available blank space is frame-specific. Adopt the complete
+                    // refreshed layout and rebuild its source/display union hash;
+                    // a new patch must never stretch into an older text container.
+                    retained.AddRange(Create(current, [repaired])._entries);
                 }
                 continue;
             }

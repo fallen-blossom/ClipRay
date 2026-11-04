@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <ProjectReference Include="..\ClipRay.Acceptance\ClipRay.Acceptance.csproj" />
+    <ProjectReference Include="..\..\src\ClipRay.App\ClipRay.App.csproj" />
   </ItemGroup>
   <PropertyGroup>
     <OutputType>WinExe</OutputType>

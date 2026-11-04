@@ -26,14 +26,17 @@ public static class VisualTranslationExecutionPolicy
         ArgumentNullException.ThrowIfNull(requests);
         ArgumentNullException.ThrowIfNull(vault);
         ArgumentNullException.ThrowIfNull(provider);
+        cancellationToken.ThrowIfCancellationRequested();
         credentialName ??= CredentialVault.FixedDeepSeekSlot;
-        if (vault.GetForUse(credentialName) is null)
+        if (provider is DeepSeekTranslationProvider real && !real.IsNetworkEnabled)
+            return requests.Select(static _ => new TranslationResult(false, string.Empty, "local-mode-network-disabled")).ToArray();
+        if (provider is not DeepSeekTranslationProvider && vault.GetForUse(credentialName) is null)
         {
             return requests.Select(static _ =>
                 new TranslationResult(false, string.Empty, "credential-missing")).ToArray();
         }
 
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var deadline = new CancellationTokenSource();
         deadline.CancelAfter(budget ?? CloudBudget);
         try
         {
@@ -44,7 +47,9 @@ public static class VisualTranslationExecutionPolicy
             var results = await provider.TranslateBlocksAsync(
                 requests,
                 credentialName,
+                cancellationToken,
                 deadline.Token).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
             TranslationCostRecording.TryRecord(results.Select(static result => result.CostEstimate)
                 .FirstOrDefault(static estimate => estimate is not null), recordCost);
             return results;

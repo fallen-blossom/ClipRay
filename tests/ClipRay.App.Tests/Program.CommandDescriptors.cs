@@ -158,7 +158,7 @@ internal static partial class Program
         // Frozen Main line 56; original body retained once.
         Func<string[], int> branch0056 = args => { return OcrProfileEvidence.Run(args); };
         commands.Add(new CommandDescriptor("--ocr-profile-evidence", StringComparison.Ordinal,
-            new ArgumentGrammar(GrammarKind.Positional, new Cardinality(4, 4, new int[] { 4 }), new PositionRule[] { new PositionRule(1, new ValueRule("root", ValueKind.NonEmptyString, AllowedValues: null, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")), new PositionRule(2, new ValueRule("output", ValueKind.NonEmptyString, AllowedValues: null, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")), new PositionRule(3, new ValueRule("case-id", ValueKind.NonEmptyString, AllowedValues: null, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")), new PositionRule(4, new ValueRule("profile", ValueKind.Enum, AllowedValues: new string[] { "common", "windows-en", "common-korean", "multilingual", "multilingual4", "multilingual-no-spin", "traced", "traced-no-spin", "traced4-no-spin", "primary-only" }, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")) }, Repeated: null),
+            new ArgumentGrammar(GrammarKind.Positional, new Cardinality(4, 4, new int[] { 4 }), new PositionRule[] { new PositionRule(1, new ValueRule("root", ValueKind.NonEmptyString, AllowedValues: null, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")), new PositionRule(2, new ValueRule("output", ValueKind.NonEmptyString, AllowedValues: null, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")), new PositionRule(3, new ValueRule("case-id", ValueKind.NonEmptyString, AllowedValues: null, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")), new PositionRule(4, new ValueRule("profile", ValueKind.Enum, AllowedValues: new string[] { "production", "common", "windows-en", "common-korean", "multilingual", "multilingual4", "multilingual-no-spin", "traced", "traced-no-spin", "traced4-no-spin", "primary-only" }, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")) }, Repeated: null),
             invocation => branch0056(invocation.CanonicalArgs), "main-line-0056"));
 
         // Frozen Main line 57; original body retained once.
@@ -220,6 +220,12 @@ internal static partial class Program
         commands.Add(new CommandDescriptor("--interface-language-tests", StringComparison.Ordinal,
             ArgumentGrammar.NoArguments(),
             invocation => branch0077(invocation.CanonicalArgs), "main-line-0077"));
+        commands.Add(new CommandDescriptor("--settings-experience-tests", StringComparison.Ordinal,
+            ArgumentGrammar.NoArguments(), _ => {
+                RecentCaptureTrayTests.Run();
+                foreach (var item in SettingsCleanupReasonTests.CreateCases()) item.Test();
+                Console.WriteLine("SETTINGS_EXPERIENCE_COMPONENTS_PASSED"); return 0;
+            }, "settings-experience-20261026"));
 
         // Frozen Main line 78; original body retained once.
         Func<string[], int> branch0078 = args => { EnsureWpfResources(); CaptureLocalizationTests.Run(); return 0; };
@@ -951,6 +957,73 @@ internal static partial class Program
             ArgumentGrammar.NoArguments(),
             invocation => branch0228(invocation.CanonicalArgs), "main-line-0228"));
 
+        commands.Add(new CommandDescriptor("--delivery-phase-tests", StringComparison.Ordinal,
+            ArgumentGrammar.NoArguments(), _ => DeliveryPhaseTests.Run(), "delivery-phases"));
+        commands.Add(new CommandDescriptor("--live-regional-scheduler-tests", StringComparison.Ordinal,
+            ArgumentGrammar.NoArguments(), _ => {
+                LiveRegionalSchedulerTests.SharedOcrGateUnknownCannotCancelStableBody();
+                LiveRegionalSchedulerTests.RegionalRefreshKeepsSiblingAndUsesCropCoordinates();
+                LiveRegionalSchedulerTests.UnknownPixelChangeAndRealScrollCannotReuseOldBody();
+                LiveRegionalSchedulerTests.RegionalExitRemovesOnlyDepartedBody();
+                LiveRegionalSchedulerTests.CropMovesOriginalOcrEvidenceAndKeepsRegionIdsUnique();
+                LiveRegionalSchedulerTests.SourceStyleVersionCommitsCurrentTypography();
+                LiveRegionalSchedulerTests.UnprocessedWindowsRetainTheirSourceVersion();
+                LiveRegionalSchedulerTests.SemanticCancellationDoesNotPoisonAppExit();
+                LiveRegionalSchedulerTests.CleanupObserverSeparatesBusinessAndReleaseFailures();
+                LiveRegionalSchedulerTests.SourceSpanVersionAndFontTierKeepTargetRunsCoherent();
+                LiveRegionalSchedulerTests.SemanticBackingRefreshKeepsWordAlignmentsAndReestimatesStyles();
+                return 0; }, "live-regional-20261018"));
+        commands.Add(new CommandDescriptor("--live-alignment-cache-tests", StringComparison.Ordinal,
+            ArgumentGrammar.NoArguments(), _ => {
+                LiveTranslationAlignmentCacheTests.UniformSourceGainingMeasuredStyleRequestsFreshAlignment();
+                LiveTranslationAlignmentCacheTests.StyledWhitespaceUsesExactUtf16SourceVersion();
+                LiveTranslationAlignmentCacheTests.SpanIdsRangesTextAndStructureDefineAlignmentIdentity();
+                LiveTranslationAlignmentCacheTests.PlainSemanticHitsNeverReturnAnotherSourcesAlignments();
+                LiveTranslationAlignmentCacheTests.CropRetainsPrimaryRecognitionEvidenceCoordinates();
+                return 0; }, "live-alignment-cache-20261018"));
+        commands.Add(new CommandDescriptor("--translation-batch-tests", StringComparison.Ordinal,
+            new ArgumentGrammar(GrammarKind.Positional, new Cardinality(1, 1, new int[] { 1 }), new PositionRule[] { new PositionRule(1, new ValueRule("output-directory", ValueKind.NonEmptyString, AllowedValues: null, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")) }, Repeated: null),
+            invocation => TranslationBatchTests.Run(invocation.CanonicalArgs), "translation-batch-20261018"));
+        commands.Add(new CommandDescriptor("--readable-paragraph-layout-tests", StringComparison.Ordinal,
+            new ArgumentGrammar(GrammarKind.Positional, new Cardinality(0, 1, new[] { 0, 1 }), new[] {
+                new PositionRule(1, new ValueRule("output-directory", ValueKind.NonEmptyString, null,
+                    StringComparison.Ordinal, null, null, "")) }, Repeated: null),
+            invocation => { ReadableParagraphLayoutTests.Run(invocation.CanonicalArgs.Length > 1
+                ? invocation.CanonicalArgs[1] : null); return 0; }, "readable-paragraph-layout-20261025"));
+        commands.Add(new CommandDescriptor("--live-recognition-cache-tests", StringComparison.Ordinal,
+            ArgumentGrammar.NoArguments(), _ => {
+                LiveTranslationRecognitionCacheTests.SemanticAndPipelineShareCompletedRecognition();
+                LiveTranslationRecognitionCacheTests.ExactPixelsDimensionsAndCropsStaySeparate();
+                LiveTranslationRecognitionCacheTests.FailuresAndExceptionsAreRetried();
+                LiveTranslationRecognitionCacheTests.CanceledCallersCannotReadOrPopulateTheCache();
+                LiveTranslationRecognitionCacheTests.CancelingAWaiterPreservesTheRealOwner();
+                LiveTranslationRecognitionCacheTests.SessionsProfilesAndCapacityAreBounded();
+                LiveTranslationRecognitionCacheTests.CachedDataCannotBeChangedThroughNativeResultLists();
+                Console.WriteLine("LIVE_RECOGNITION_CACHE_PASSED 7/7"); return 0;
+            }, "live-recognition-cache-20261025"));
+        commands.Add(new CommandDescriptor("--native-live-translation-acceptance", StringComparison.Ordinal,
+            new ArgumentGrammar(GrammarKind.Positional, new Cardinality(2, 2, new[] { 2 }), new[] {
+                new PositionRule(1, new ValueRule("output-directory", ValueKind.NonEmptyString, null, StringComparison.Ordinal, null, null, "")),
+                new PositionRule(2, new ValueRule("install-root", ValueKind.NonEmptyString, null, StringComparison.Ordinal, null, null, "")) }, Repeated: null),
+            invocation => NativeLiveTranslationAcceptance.Run(invocation.CanonicalArgs), "native-live-translation-20261025"));
+        commands.Add(new CommandDescriptor("--translation-production-fixture", StringComparison.Ordinal,
+            new ArgumentGrammar(GrammarKind.Positional, new Cardinality(3, 4, new int[] { 3, 4 }), new PositionRule[] {
+                new PositionRule(1, new ValueRule("output-directory", ValueKind.NonEmptyString, AllowedValues:null,Comparison:StringComparison.Ordinal,Minimum:null,Maximum:null,ForbiddenCharacters:"")),
+                new PositionRule(2, new ValueRule("install-root", ValueKind.NonEmptyString, AllowedValues:null,Comparison:StringComparison.Ordinal,Minimum:null,Maximum:null,ForbiddenCharacters:"")),
+                new PositionRule(3, new ValueRule("route", ValueKind.Enum, AllowedValues:new[]{"machine","deepseek"},Comparison:StringComparison.Ordinal,Minimum:null,Maximum:null,ForbiddenCharacters:"")),
+                new PositionRule(4, new ValueRule("fixture", ValueKind.Enum, AllowedValues:new[]{"controls","colored","mixed-font","daily-layout"},Comparison:StringComparison.Ordinal,Minimum:null,Maximum:null,ForbiddenCharacters:"")) }, Repeated:null),
+            invocation => TranslationBatchTests.RunProduction(invocation.CanonicalArgs), "translation-production-20261018"));
+        commands.Add(new CommandDescriptor("--machine-startup-budget-tests", StringComparison.Ordinal,
+            new ArgumentGrammar(GrammarKind.Positional,new Cardinality(1,1,new[]{1}),new[] {
+                new PositionRule(1,new ValueRule("python-runtime",ValueKind.NonEmptyString,null,StringComparison.Ordinal,null,null,"")) },Repeated:null),
+            invocation=>MachineStartupBudgetTests.Run(invocation.CanonicalArgs),"machine-startup-budget-20261018"));
+        commands.Add(new CommandDescriptor("--ocr-reliability-tests", StringComparison.Ordinal,
+            ArgumentGrammar.NoArguments(), invocation => { OcrReliabilityTests.Run(); return 0; }, "ocr-reliability-20261018"));
+        commands.Add(new CommandDescriptor("--native-ocr-word-geometry-tests", StringComparison.Ordinal,
+            ArgumentGrammar.NoArguments(), _ => { NativeOcrWordGeometryTests.Run(); return 0; }, "native-ocr-word-geometry-20261018"));
+        commands.Add(new CommandDescriptor("--ocr-benchmark-fixtures", StringComparison.Ordinal,
+            new ArgumentGrammar(GrammarKind.Positional, new Cardinality(1, 1, new int[] { 1 }), new PositionRule[] { new PositionRule(1, new ValueRule("output-directory", ValueKind.NonEmptyString, AllowedValues: null, Comparison: StringComparison.Ordinal, Minimum: null, Maximum: null, ForbiddenCharacters: "")) }, Repeated: null),
+            invocation => OcrBenchmarkFixtures.Run(invocation.CanonicalArgs), "ocr-fixtures-20261018"));
         // The legacy runner is injected from the real Main array/execution loop, never a duplicate name list.
         commands.Add(new CommandDescriptor("--filter", StringComparison.OrdinalIgnoreCase,
             ArgumentGrammar.LegacyFilter(RequirePreparedRegistry(actualCases, "legacy-main-tests-array")),

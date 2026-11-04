@@ -22,7 +22,11 @@ public sealed record InPlaceLayoutItem(
     SourceVisualStyle? SourceStyle = null,
     TranslationTextLayout? TextLayout = null,
     byte[]? MaskedPatchPng = null,
-    VisualTextRegion? SourceRegion = null);
+    VisualTextRegion? SourceRegion = null)
+{
+    public int UnresolvedSourceStyleSpanCount { get; init; }
+    public IReadOnlyList<TranslationTextAlignment> TextAlignments { get; init; } = [];
+}
 
 public sealed record InPlaceLayoutRejection(int Region, string Reason);
 
@@ -120,6 +124,7 @@ public static class InPlaceLayoutService
 
         var siblingLines = regions.SelectMany(static region => region.Lines).ToArray();
         var kinds = VisualTranslationRequestFactory.ClassifyRegions(regions);
+        var styleRequests = VisualTranslationRequestFactory.Create(regions, "auto", DeepSeekModels.Flash);
         var candidates = new List<RegionLayoutCandidate>();
         var rejections = new List<InPlaceLayoutRejection>();
         for (var index = 0; index < regions.Count; index++)
@@ -161,12 +166,12 @@ public static class InPlaceLayoutService
                 continue;
             }
 
-            if (region.Role == VisualTextRole.Control
-                && style.Confidence == VisualStyleConfidence.Low)
+            if (style.Confidence == VisualStyleConfidence.Low)
             {
-                // Compact controls can have sparse pixels whether OCR supplies word boxes or not.
-                // The full control mask was already accepted above, so retain a conservative
-                // layout instead of silently discarding a deterministic local translation.
+                // Sparse or multicolored ink is uncertainty about typography, not
+                // permission to drop a translated paragraph. Pixel replacement
+                // has independently passed the strict background/mask check above;
+                // retain the conservative OCR-derived font and dominant ink color.
                 style = style with { Confidence = VisualStyleConfidence.Medium };
             }
             var foreground = ResolveSourceForeground(style, backing);
@@ -175,10 +180,23 @@ public static class InPlaceLayoutService
         }
 
         NormalizePeerTypography(candidates);
+        for (var index = 0; index < candidates.Count; index++)
+        {
+            var candidate = candidates[index];
+            var styleResolution = TranslationStyleResolver.Resolve(candidate.Region,
+                styleRequests[candidate.RegionIndex - 1], results[candidate.RegionIndex - 1]);
+            candidate = candidate with { StyleResolution = styleResolution };
+            candidates[index] = candidate;
+            var expanded = ReadableParagraphLayout.Expand(source, candidate.Region, regions,
+                candidate.Text, candidate.Style, candidate.Repair, styleResolution.Runs);
+            if (expanded is { } available)
+                candidates[index] = candidate with { LayoutBounds = available.Bounds,
+                    Repair = candidate.Repair with { PatchPng = available.Patch } };
+        }
         var layouts = candidates
             .Select(static candidate => TranslationTextLayoutPolicy.Fit(
                 candidate.Text,
-                candidate.Region.Bounds,
+                candidate.LayoutBounds,
                 candidate.Style))
             .ToArray();
         for (var index = 0; index < candidates.Count; index++)
@@ -190,7 +208,7 @@ public static class InPlaceLayoutService
             }
             layouts[index] = TranslationTextLayoutPolicy.FitCompact(
                 candidates[index].Text,
-                candidates[index].Region.Bounds,
+                candidates[index].LayoutBounds,
                 candidates[index].Style);
         }
         foreach (var cohort in candidates
@@ -205,7 +223,7 @@ public static class InPlaceLayoutService
             {
                 layouts[item.index] = TranslationTextLayoutPolicy.FitAtMost(
                     item.candidate.Text,
-                    item.candidate.Region.Bounds,
+                    item.candidate.LayoutBounds,
                     item.candidate.Style,
                     sharedFontSize);
             }
@@ -218,6 +236,12 @@ public static class InPlaceLayoutService
             var region = candidate.Region;
             var style = candidate.Style;
             var layout = layouts[index];
+            var styleResolution = candidate.StyleResolution;
+            layout = TranslationTextLayoutPolicy.WithStyleRuns(candidate.Text, candidate.LayoutBounds, style, layout,
+                styleResolution.Runs);
+            var unresolvedStyles = styleResolution.Runs.Count > 0 && layout.StyleRuns.Count == 0
+                ? Math.Max(styleResolution.UnresolvedSourceSpanCount, region.SourceStyleSpans.Count)
+                : styleResolution.UnresolvedSourceSpanCount;
             if (!layout.ShouldRender || layout.FontSizePixels < TranslationTextLayoutPolicy.MinimumReadableFontSizePixels)
             {
                 rejections.Add(new InPlaceLayoutRejection(candidate.RegionIndex,
@@ -226,9 +250,11 @@ public static class InPlaceLayoutService
             }
 
             items.Add(new InPlaceLayoutItem(
-                region.Lines[0], candidate.Text, region.Bounds, candidate.Repair.Mode,
+                region.Lines[0], candidate.Text, candidate.LayoutBounds, candidate.Repair.Mode,
                 candidate.Backing, style.ForegroundColor,
-                null, style, layout, candidate.Repair.PatchPng, region));
+                null, style, layout, candidate.Repair.PatchPng, region)
+                { UnresolvedSourceStyleSpanCount = unresolvedStyles,
+                    TextAlignments = results[candidate.RegionIndex - 1].TextAlignments });
         }
         return new InPlaceLayoutPlan(items, rejections);
     }
@@ -428,6 +454,11 @@ public static class InPlaceLayoutService
         if (boundsRatio < 0.82) return false;
         var glyphRatio = Math.Min(first.Style.GlyphHeightPixels, second.Style.GlyphHeightPixels)
             / Math.Max(1, Math.Max(first.Style.GlyphHeightPixels, second.Style.GlyphHeightPixels));
+        var firstFont = first.Style.EstimatedFontSizePixels;
+        var secondFont = second.Style.EstimatedFontSizePixels;
+        if (boundsRatio < .95 && firstFont is > 0 && secondFont is > 0
+            && Math.Min(firstFont.Value, secondFont.Value) / Math.Max(firstFont.Value, secondFont.Value) < .9)
+            return false;
 
         var maximumHeight = Math.Max(firstBounds.Height, secondBounds.Height);
         var firstCenterY = firstBounds.Top + firstBounds.Height / 2;
@@ -475,7 +506,11 @@ public static class InPlaceLayoutService
         BackgroundRepairResult Repair,
         Color Backing,
         SourceVisualStyle Style,
-        int CohortId = -1);
+        int CohortId = -1)
+    {
+        public PixelRect LayoutBounds { get; init; } = Region.Bounds;
+        public TranslationStyleResolution StyleResolution { get; init; } = new([], 0);
+    }
 
     public static IReadOnlyList<InPlaceLayoutItem> Build(
         Bitmap source,

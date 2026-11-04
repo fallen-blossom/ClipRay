@@ -58,6 +58,15 @@ public static class SourceVisualStyleEstimator
         // unrelated buttons and metadata from the surrounding card here can turn
         // a left-aligned paragraph into a centered one.
         var alignmentPeers = region.Lines.Count > 1 ? region.Lines : siblingBlocks;
+        if (region.Role == VisualTextRole.Body && region.Lines.Count == 1)
+        {
+            var own = region.Bounds;
+            var localLines = siblingBlocks.Where(line => line.Text.Trim().Length >= 12
+                && line.Bounds.Width >= own.Width * .55 && line.Bounds.Width <= own.Width * 1.8
+                && Math.Abs(line.Bounds.Top-own.Top) <= Math.Max(own.Height,line.Bounds.Height)*3
+                && Math.Min(line.Bounds.Right,own.Right)>Math.Max(line.Bounds.Left,own.Left)).ToArray();
+            alignmentPeers = localLines.Length >= 3 ? localLines : region.Lines;
+        }
         var styles = region.Lines
             .Select(line => Estimate(source, line, alignmentPeers, backing))
             .ToArray();
@@ -66,7 +75,10 @@ public static class SourceVisualStyleEstimator
             throw new ArgumentException("A visual text region must contain at least one OCR line.", nameof(region));
         }
 
-        var foreground = Average(styles.Select(static style => style.ForegroundColor));
+        // Do not invent a blended color between distinct source styles. Color
+        // spans already have separate geometry; use their dominant line color.
+        var foreground = styles.GroupBy(static style => style.ForegroundColor.ToArgb())
+            .OrderByDescending(static group => group.Count()).First().First().ForegroundColor;
         var glyphHeight = Median(styles.Select(static style => style.GlyphHeightPixels));
         var lineHeight = region.Lines.Count > 1
             ? Median(region.Lines.Zip(region.Lines.Skip(1), static (first, second) =>
@@ -75,7 +87,8 @@ public static class SourceVisualStyleEstimator
         var weight = styles.GroupBy(static style => style.FontWeight).OrderByDescending(static group => group.Count()).First().Key;
         var category = styles.GroupBy(static style => style.FontCategory).OrderByDescending(static group => group.Count()).First().Key;
         var alignment = styles.GroupBy(static style => style.Alignment).OrderByDescending(static group => group.Count()).First().Key;
-        if(region.Role==VisualTextRole.Body) alignment=SourceTextAlignment.Left;
+        if(region.Role==VisualTextRole.Body && region.Lines.Count == 1 && alignmentPeers.Count < 3)
+            alignment=SourceTextAlignment.Left;
         var confidence = styles.All(static style => style.Confidence == VisualStyleConfidence.Low)
             ? VisualStyleConfidence.Low
             : styles.Any(static style => style.Confidence == VisualStyleConfidence.High)
@@ -102,7 +115,9 @@ public static class SourceVisualStyleEstimator
         ArgumentNullException.ThrowIfNull(block);
         ArgumentNullException.ThrowIfNull(siblingBlocks);
 
-        var candidates = ReadCandidates(source, block.Bounds, backing);
+        var matureColors = MortSourceColorAdapter.Analyze(source, block);
+        var localBacking = matureColors.Success ? matureColors.Background : backing;
+        var candidates = ReadCandidates(source, block.Bounds, localBacking);
         var alignment = EstimateAlignment(block, siblingBlocks);
         var fontCategory = EstimateFontCategory(block);
         if (candidates.Count == 0)
@@ -119,8 +134,19 @@ public static class SourceVisualStyleEstimator
                 VisualStyleConfidence.Low);
         }
 
-        var foregroundSeed = SelectDominantForeground(candidates, backing, out var ambiguousForeground);
-        var foreground = Average(foregroundSeed.Select(static pixel => pixel.Color));
+        var foregroundSeed = SelectDominantForeground(candidates, localBacking, out var ambiguousForeground);
+        // Flat glyph interiors carry the source color. Averaging their antialiased
+        // edge pixels shifts the color even on a clean, uniform background.
+        var foreground = foregroundSeed.GroupBy(static pixel => pixel.Color.ToArgb())
+            .OrderByDescending(static group => group.Count())
+            .ThenByDescending(static group => group.Average(static pixel => pixel.Distance))
+            .First().First().Color;
+        // Use the retained upstream clustering result only when it observed real
+        // supported source ink. A black/white readability fallback is not a color
+        // sample and must not overwrite a low-contrast or multicolor source.
+        if (matureColors.Success && !matureColors.UsedFontFallback
+            && matureColors.ForegroundWordSupport > 0 && !ambiguousForeground)
+            foreground = matureColors.Font;
         var stable = candidates
             .Where(pixel => ColorDistance(pixel.Color, foreground) <= 56)
             .ToArray();
@@ -159,7 +185,8 @@ public static class SourceVisualStyleEstimator
             isItalic,
             alignment,
             rotation,
-            confidence);
+            confidence,
+            glyphHeight / TranslationTextLayoutPolicy.MeasureSourceInkRatio(block.Text, fontCategory));
     }
 
     private static List<InkPixel> ReadCandidates(Bitmap source, ClipRay.Core.Geometry.PixelRect bounds, Color backing)

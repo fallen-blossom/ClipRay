@@ -14,7 +14,11 @@ public sealed record TranslationTextLayout(
     bool IsItalic,
     SourceTextAlignment Alignment,
     double RotationDegrees,
-    string FontFamilyName);
+    string FontFamilyName)
+{
+    public IReadOnlyList<TranslatedVisualStyleRun> StyleRuns { get; init; } = [];
+    public double SourceFontSizePixels { get; init; }
+}
 
 public static class TranslationTextLayoutPolicy
 {
@@ -102,9 +106,10 @@ public static class TranslationTextLayoutPolicy
         {
             var lineHeight = CalculateLineHeight(size, initialFontSize, style.LineHeightPixels);
             var measured = Measure(text, bounds.Width, size, lineHeight, style, fontFamily);
-            var unwrappedWidth = Measure(text, 100_000, size, lineHeight, style, fontFamily).Width;
-            var conservativeLineCount = Math.Max(1, Math.Ceiling(unwrappedWidth / Math.Max(1, bounds.Width)));
-            var measuredHeight = Math.Max(measured.Height, conservativeLineCount * lineHeight);
+            // Use the same wrapping geometry as the renderer. Measuring an entire
+            // multiline paragraph as one unwrapped line double-counts explicit
+            // line breaks and rejects or shrinks text that physically fits.
+            var measuredHeight = Math.Max(measured.Height, lineHeight);
             var angle = Math.Abs(style.RotationDegrees) * Math.PI / 180;
             var rotatedWidth = Math.Abs(measured.Width * Math.Cos(angle)) + Math.Abs(measuredHeight * Math.Sin(angle));
             var rotatedHeight = Math.Abs(measured.Width * Math.Sin(angle)) + Math.Abs(measuredHeight * Math.Cos(angle));
@@ -169,11 +174,56 @@ public static class TranslationTextLayoutPolicy
         return (formatted.WidthIncludingTrailingWhitespace, formatted.Height);
     }
 
-    internal static FormattedText Format(string text, double width, TranslationTextLayout layout, System.Windows.Media.Brush foreground) =>
-        Format(text, width, layout.FontSizePixels, layout.LineHeightPixels,
+    internal static FormattedText Format(string text, double width, TranslationTextLayout layout, System.Windows.Media.Brush foreground)
+    {
+        var formatted = Format(text, width, layout.FontSizePixels, layout.LineHeightPixels,
             new SourceVisualStyle(System.Drawing.Color.White, layout.FontSizePixels, layout.LineHeightPixels,
                 layout.FontWeight, layout.FontCategory, layout.IsItalic, layout.Alignment,
                 layout.RotationDegrees, VisualStyleConfidence.High), layout.FontFamilyName, foreground);
+        foreach (var run in layout.StyleRuns)
+        {
+            if (!TranslationStyleResolver.ValidRange(run.Start, run.Length, text.Length)) continue;
+            var color = run.Style.ForegroundColor;
+            formatted.SetForegroundBrush(new SolidColorBrush(System.Windows.Media.Color.FromArgb(color.A,color.R,color.G,color.B)), run.Start,run.Length);
+            formatted.SetFontWeight(ToWpfWeight(run.Style.FontWeight),run.Start,run.Length);
+            if (layout.SourceFontSizePixels > 0 && run.Style.EstimatedFontSizePixels is > 0)
+                formatted.SetFontSize(Math.Max(MinimumReadableFontSizePixels,
+                    run.Style.EstimatedFontSizePixels.Value * layout.FontSizePixels / layout.SourceFontSizePixels),run.Start,run.Length);
+        }
+        return formatted;
+    }
+
+    public static TranslationTextLayout WithStyleRuns(string text, PixelRect bounds, SourceVisualStyle source,
+        TranslationTextLayout layout, IReadOnlyList<TranslatedVisualStyleRun> runs)
+    {
+        if (runs.Count == 0 || !layout.ShouldRender) return layout;
+        var baseSize = source.EstimatedFontSizePixels ?? source.GlyphHeightPixels / VisibleGlyphRatio;
+        var minimum = Math.Min(layout.FontSizePixels,Math.Max(MinimumReadableFontSizePixels,baseSize*MinimumRelativeScale));
+        for (var size = layout.FontSizePixels; size + .001 >= minimum; size -= FontStepPixels)
+        {
+            var lineHeight = layout.LineHeightPixels * size / layout.FontSizePixels;
+            foreach (var run in runs)
+            {
+                if (!TranslationStyleResolver.ValidRange(run.Start, run.Length, text.Length)
+                    || run.Style.EstimatedFontSizePixels is not > 0) continue;
+                var runSize = Math.Max(MinimumReadableFontSizePixels,
+                    run.Style.EstimatedFontSizePixels.Value * size / baseSize);
+                var runLeading = Math.Clamp(run.Style.LineHeightPixels / run.Style.EstimatedFontSizePixels.Value, .95, 1.5);
+                lineHeight = Math.Max(lineHeight, runSize * runLeading);
+            }
+            var candidate = layout with { FontSizePixels = size,
+                LineHeightPixels = lineHeight,
+                SourceFontSizePixels = baseSize, StyleRuns = runs };
+            var measured = Format(text,bounds.Width,candidate,System.Windows.Media.Brushes.Black);
+            var ink = measured.BuildGeometry(new System.Windows.Point()).Bounds;
+            if (measured.WidthIncludingTrailingWhitespace <= bounds.Width+.5 && measured.Height <= bounds.Height+.5
+                && ink.Top >= -.5 && ink.Bottom <= bounds.Height + .5)
+                return candidate;
+        }
+        // Optional style restoration must never hide a translation that already
+        // fits. The caller records unresolved styles and keeps the readable base.
+        return layout;
+    }
 
     private static FormattedText Format(string text, double width, double fontSize, double lineHeight,
         SourceVisualStyle style, string fontFamily, System.Windows.Media.Brush foreground)

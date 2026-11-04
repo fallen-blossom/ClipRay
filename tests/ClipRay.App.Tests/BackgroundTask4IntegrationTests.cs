@@ -44,7 +44,7 @@ internal static partial class BackgroundTask4Tests
                 && File.ReadAllText(path) == json, "Startup rewrote the recovered original or touched credentials.");
             Check(SettingsLoadWarningText.ForInterface(final.Warning!, "en").Contains("original", StringComparison.OrdinalIgnoreCase), "Recovery lost English guidance.");
         }
-        var valid = AppSettings.CreateDefault(root) with { CredentialName = "selected-B" };
+        var valid = AppSettings.CreateDefault(root) with { CredentialName = "selected-B", Provider = "DeepSeek", HasExplicitProviderChoice = true };
         File.WriteAllText(path, JsonSerializer.Serialize(valid)); var original = File.ReadAllText(path);
         var failed = StartupSettingsReconciliation.Apply(new(valid, null, true), false, _ => throw new IOException("synthetic migration"), _ => throw new IOException("synthetic save"));
         Check(failed.Settings.CredentialName == "selected-B" && failed.Warning!.Contains("原选择保留") && File.ReadAllText(path) == original,

@@ -81,9 +81,13 @@ public partial class App
         var message = AppInterfaceLanguage.Text(settings.InterfaceLanguage,
             delivery.ClipboardRequested && !delivery.ClipboardCopied ? "PNG 已保存；未复制到剪贴板，可从最近截取重试。" : "PNG 已保存。",
             delivery.ClipboardRequested && !delivery.ClipboardCopied ? "PNG saved; not copied. Retry from Recent captures." : "PNG saved.");
+        if (delivery.ClipboardState == ClipboardPublicationState.Published)
+            message = AppInterfaceLanguage.Text(settings.InterfaceLanguage,
+                "PNG 已保存并复制；退出后的剪贴板保留未确认，可从最近截取再次复制。",
+                "PNG saved and copied; clipboard persistence after exit is unconfirmed. Copy again from Recent captures if needed.");
         if (delivery.DiagnosticFailure is not null)
             message += AppInterfaceLanguage.Text(settings.InterfaceLanguage, " 诊断回读未完成。", " Diagnostic readback unavailable.");
-        if ((delivery.ClipboardRequested && !delivery.ClipboardCopied) || delivery.DiagnosticFailure is not null) OutputWarning(message);
+        if ((delivery.ClipboardRequested && (!delivery.ClipboardCopied || !delivery.ClipboardPersistenceConfirmed)) || delivery.DiagnosticFailure is not null) OutputWarning(message);
     }
 
     private void OutputWarning(string message)

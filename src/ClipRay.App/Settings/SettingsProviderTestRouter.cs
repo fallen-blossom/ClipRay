@@ -2,6 +2,8 @@ using ClipRay.App.Translation;
 
 namespace ClipRay.App.Settings;
 
+public sealed record SettingsTranslationTestRequest(string Provider, string TargetLanguage, string? LocalModelPath, string Text);
+
 public static class SettingsProviderTestRouter
 {
     public static Task<TranslationResult> TestAsync(

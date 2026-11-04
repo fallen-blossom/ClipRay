@@ -85,13 +85,12 @@ internal static partial class BackgroundTask6Tests
     {
         using var temp=new Temp();var app=NewOutputApp(temp.Root);var paths=BackgroundTask3LifetimeTests.Field<ApplicationPathSet>(app,"_paths");
         var presentation=new FakeRecoveryPresentation {Confirm=false};app.RecoveryPresentationOverride=presentation;
-        using var menu=app.CreateTrayMenu();var item=menu.Items.OfType<System.Windows.Forms.ToolStripMenuItem>().Single(i=>i.Text=="恢复长截图");
-        OpenRecovery(item,app);Check(item.DropDownItems.Count==1&&!item.DropDownItems[0].Enabled,"Recovery empty state absent.");
-        RunPieces(paths.LongCaptureTempRoot);OpenRecovery(item,app);
-        var choice=item.DropDownItems.OfType<System.Windows.Forms.ToolStripMenuItem>().Single(i=>i.Enabled);
-        Check(choice.Text!.Contains("24×48")&&choice.Text.Contains("3 帧"),"Tray recovery omitted dimensions/frame count.");
-        choice.PerformClick();Complete(app.LastRecoveryOperation!);
-        Check(presentation.ConfirmCalls==1&&presentation.Shows==0&&new ScrollCaptureRecovery(paths.LongCaptureTempRoot).List().Count==1,"Actual tray click did not reach cancellable recovery or close lost materials.");
+        RunPieces(paths.LongCaptureTempRoot);
+        using var menu=app.CreateTrayMenu();
+        Check(!menu.Items.OfType<System.Windows.Forms.ToolStripMenuItem>().Any(i=>i.Text=="恢复长截图"),
+            "Removed recovery command remained in the tray.");
+        Check(presentation.ConfirmCalls==0&&presentation.Shows==0&&new ScrollCaptureRecovery(paths.LongCaptureTempRoot).List().Count==1,
+            "Removing the tray command changed or deleted existing recovery data.");
     }
     private static void OpenRecovery(System.Windows.Forms.ToolStripMenuItem item,ClipRay.App.App app)
     {
@@ -139,7 +138,7 @@ internal static partial class BackgroundTask6Tests
     {
         var application=System.Windows.Application.Current??new System.Windows.Application {ShutdownMode=ShutdownMode.OnExplicitShutdown};
         application.Resources["AppFont"]=new System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI");
-        foreach(var mode in new[]{"failure","revision","closed"})
+        foreach(var mode in new[]{"failure","revision","revision-before-yield","selection-before-yield","closed"})
         {
             using var temp=new Temp();using var frame=new CapturedFrame(Pattern(24,24,0),new(0,0,24,24));var windows=new FakeCandidates();
             var overlay=new SelectionOverlayWindow(frame,new PixelRect(0,0,24,24),clipboardTextSink:new FakeText(),windowCandidateSource:windows,uiElementCandidateSource:new FakeElements());
@@ -148,7 +147,11 @@ internal static partial class BackgroundTask6Tests
             try
             {
                 InvokeOverlay(overlay,"ConfirmSelection");InvokeOverlay(overlay,"ConfirmSelection");
-                Check(windows.Calls==1&&calls==1&&owned!.GetPixel(4,9)==PatternPixel(4,9),"Overlay duplicate save or disposed async bitmap.");
+                if(mode=="revision-before-yield") InvokeOverlay(overlay,"InvalidateInputResults");
+                if(mode=="selection-before-yield") BackgroundTask3LifetimeTests.Invoke(overlay,"SetSelection",new PixelRect(0,0,12,12));
+                PumpUntil(()=>calls==1);
+                var snapshot = owned ?? throw new Exception("Overlay did not deliver its snapshot.");
+                Check(windows.Calls==1&&calls==1&&snapshot.Width==24&&snapshot.Height==24&&snapshot.GetPixel(4,9)==PatternPixel(4,9),"Overlay duplicate save or disposed async bitmap.");
                 if(mode=="revision")InvokeOverlay(overlay,"InvalidateInputResults");
                 if(mode=="closed")overlay.Close();
                 held.SetResult(mode!="failure");PumpUntil(()=>!BackgroundTask3LifetimeTests.Field<bool>(overlay,"_captureDeliveryPending"));
@@ -171,7 +174,7 @@ internal static partial class BackgroundTask6Tests
             BackgroundTask3LifetimeTests.Set(app,"_outputService",new ImageOutputService(root,true,clipboard:_=>{OnFixtureUiThread();copies++;throw new IOException("copy");}));
             var overlay=new SelectionOverlayWindow(new CapturedFrame(Pattern(24,24,0),new(0,0,24,24)),new PixelRect(0,0,24,24),clipboardTextSink:new FakeText(),windowCandidateSource:new FakeCandidates(),uiElementCandidateSource:new FakeElements());
             var closed=false;overlay.Closed+=(_,_)=>closed=true;
-            overlay.CaptureDeliveryAsync=bitmap=>(Task<bool>)BackgroundTask3LifetimeTests.Invoke(app,"HandleConfirmedCaptureAsync",bitmap,overlay)!;
+            overlay.CaptureDeliverySnapshotFactory=() => (Func<Bitmap,Task<bool>>)BackgroundTask3LifetimeTests.Invoke(app,"CreateConfirmedCaptureDeliverySnapshot",overlay)!;
             try
             {
                 InvokeOverlay(overlay,"ConfirmSelection");

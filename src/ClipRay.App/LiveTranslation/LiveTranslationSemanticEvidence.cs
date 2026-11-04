@@ -12,8 +12,13 @@ namespace ClipRay.App.LiveTranslation;
 internal sealed class LiveTranslationSemanticEvidence
 {
     private readonly VisualTextRegion[] _regions;
+    internal IReadOnlyList<VisualTextRegion> CurrentRegions { get; }
 
-    private LiveTranslationSemanticEvidence(VisualTextRegion[] regions) => _regions = regions;
+    private LiveTranslationSemanticEvidence(VisualTextRegion[] regions)
+    {
+        _regions = regions;
+        CurrentRegions = Array.AsReadOnly(regions);
+    }
 
     public static LiveTranslationSemanticEvidence? FromRecognition(
         OcrRecognitionResult result, Bitmap bitmap)
@@ -65,6 +70,19 @@ internal sealed class LiveTranslationSemanticEvidence
     public bool SameSourceStableGeometry(LiveTranslationSemanticEvidence expected,
         LiveTranslationPixelSnapshot? source = null, LiveTranslationPixelSnapshot? current = null) =>
         SameSourceStableGeometry(expected._regions, source, current);
+
+    public bool ConfirmsViewportReplacement(LiveTranslationSemanticEvidence expected)
+    {
+        // Extra/missing candidates and a changed word are local observations.
+        // Require recognizable source paragraphs to have actually moved. Stable
+        // fixed headers do not veto a scrolling body, but one video subtitle does
+        // not get to cancel all other regions either.
+        var moved = expected._regions.Where(region => region.Role is VisualTextRole.Body or VisualTextRole.Heading)
+            .Count(region => !_regions.Any(candidate => EquivalentStable(region, candidate))
+                && _regions.Any(candidate => TextEquals(region.SourceText, candidate.SourceText)
+                    && !SamePlace(region.Bounds, candidate.Bounds)));
+        return moved >= 2;
+    }
 
     public bool Matches(InPlaceLayoutItem item)
     {

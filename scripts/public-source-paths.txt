@@ -24,5 +24,7 @@ licenses
 docs/ClipRay-使用教程.html
 docs/model-supply-chain.md
 docs/BUILD.zh-CN.md
+docs/CLI.zh-CN.md
 docs/prototypes/translation-workbench.html
 docs/release/RELEASE-NOTES.zh-CN.md
+docs/release/1.0.6-preview.3.zh-CN.md

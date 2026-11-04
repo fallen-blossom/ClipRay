@@ -1,6 +1,7 @@
 using System.Drawing;
 using System.Windows;
 using ClipRay.App.Recording;
+using ClipRay.App.Capture;
 using Forms = System.Windows.Forms;
 
 namespace ClipRay.App;
@@ -20,7 +21,8 @@ public partial class App
         try
         {
             var settings = _settings!;
-            return await RecordingController.StartAsync(request,new(settings.RecordingDirectory,settings.CopyToClipboard,settings.InterfaceLanguage),
+            return await RecordingController.StartAsync(request,new(settings.RecordingDirectory,settings.CopyToClipboard,settings.InterfaceLanguage,
+                    settings.CreateRecordingVideoOptions()),
                 message => { if (CanDeliver()) restoreFailure(message); },
                 () => { if (CanDeliver()) started(); },CanDeliver);
         }
@@ -48,11 +50,18 @@ public partial class App
         public IReadOnlyList<Rectangle> Monitors() => Forms.Screen.AllScreens.Select(s => s.Bounds).ToArray();
         public RecordingOutputPaths Paths(string root) => RecordingOutputPaths.Create(root,DateTime.Now);
         public IRecordingFeedback PrepareFeedback(Rectangle region,Action stop)
+            => PrepareFeedback(region,stop,interactive:true);
+        public IRecordingFeedback PrepareFeedback(Rectangle region,Action stop,bool interactive)
         {
             RecordingBorderWindow? border = null; RecordingControlWindow? control = null;
             try
             {
                 border = new(region); border.Show();
+                if (!interactive)
+                {
+                    if (app._stopRecordingMenuItem is not null) app._stopRecordingMenuItem.Enabled = border.IsCaptureSafe;
+                    return new Feedback(app,border,null,border.IsCaptureSafe);
+                }
                 control = new(region,app._settings?.InterfaceLanguage ?? "zh-CN");
                 control.StopRequested += (_,_) => stop(); control.Show();
                 var outside = control.PlaceOutside(region);
@@ -67,12 +76,17 @@ public partial class App
             }
         }
         public IRecordingRuntime CreateRuntime(RecordingMonitorMapping mapping,RecordingOutputPaths paths,bool silent,RecordingFaultSignal faults)
+            => CreateRuntime(mapping, paths, silent, faults, new());
+        public IRecordingRuntime CreateRuntime(RecordingMonitorMapping mapping,RecordingOutputPaths paths,bool silent,
+            RecordingFaultSignal faults,RecordingVideoOptions options)
         {
-            var timeline = RecordingTimeline.StartNow();
+            var timeline = RecordingTimeline.CreatePending();
+            NativeRecordingEncoderBackend? encoderBackend = null;
             return new RecordingRuntimeFactory(
                 () => silent ? null : new WasapiSystemAudioCapture(timeline,faults),
-                format => new MediaFoundationRecorder(paths,new NativeRecordingEncoderBackend(paths,mapping.CropInMonitor.Width,mapping.CropInMonitor.Height,format),faults),
-                () => new GraphicsCaptureSource(mapping,timeline,onFault:error => faults.TrySet("graphics-capture",error),reuseBuffers:true),faults);
+                format => new MediaFoundationRecorder(paths,encoderBackend = new NativeRecordingEncoderBackend(paths,mapping.CropInMonitor.Width,mapping.CropInMonitor.Height,format,options,preferGpuInput:true),faults),
+                () => new GraphicsCaptureSource(mapping,timeline,onFault:error => faults.TrySet("graphics-capture",error),reuseBuffers:true,options:options,
+                    sharedDevice:() => encoderBackend?.AcceptsGpuFrames == true ? encoderBackend.SharedDevice : null),faults,timeline.BeginCapture);
         }
         public Task<bool> ConfirmSilentAsync(string message) => Task.FromResult(System.Windows.MessageBox.Show(message,
             app.AppUi("录屏声音不可用","Recording audio unavailable"),MessageBoxButton.YesNo,MessageBoxImage.Warning) == MessageBoxResult.Yes);
@@ -84,12 +98,13 @@ public partial class App
             preview.Closed += (_,_) => { if (ReferenceEquals(app._recordingPreview,preview)) app._recordingPreview=null; };
             preview.Show(); preview.Activate(); return new Preview(preview);
         }
-        public bool CopyFile(string path) => RecordingResultDelivery.TryCopyFile(path,new WindowsRecordingFileClipboard());
+        public bool CopyFile(string path) => CopyFileWithOutcome(path).Copied;
+        public MediaCopyOutcome CopyFileWithOutcome(string path) => RecordingResultDelivery.CopyFileWithOutcome(path,new WindowsRecordingFileClipboard());
         public void Notify(string message) => app.SetTrayTooltip("ClipRay | " + message);
         public Task DispatchAsync(Action action) => app.Dispatcher.CheckAccess() ? Invoke(action) : app.Dispatcher.InvokeAsync(action).Task;
         private static Task Invoke(Action action) { action(); return Task.CompletedTask; }
     }
-    private sealed class Feedback(App app,RecordingBorderWindow border,RecordingControlWindow control,bool ready) : IRecordingFeedback
+    private sealed class Feedback(App app,RecordingBorderWindow border,RecordingControlWindow? control,bool ready) : IRecordingFeedback
     {
         private int _disposed;
         public bool IsReady => ready;
@@ -97,7 +112,7 @@ public partial class App
         {
             if (Interlocked.Exchange(ref _disposed,1)!=0) return;
             try { border.Close(); }
-            finally { try { control.Close(); } finally { if (app._stopRecordingMenuItem is not null) app._stopRecordingMenuItem.Enabled=false; } }
+            finally { try { control?.Close(); } finally { if (app._stopRecordingMenuItem is not null) app._stopRecordingMenuItem.Enabled=false; } }
         }
     }
     private sealed class Preview(RecordingPreviewWindow window) : IRecordingPendingPreview
@@ -105,6 +120,7 @@ public partial class App
         public bool IsClosed => window.ClosedForDelivery;
         public void Pending(string message) => window.MarkRetiring(message);
         public void Attach(bool copied) => window.AttachMedia(copied);
+        public void Attach(MediaCopyOutcome outcome) => window.AttachMedia(outcome);
         public void Fail(string message) => window.Fail(message);
     }
 }

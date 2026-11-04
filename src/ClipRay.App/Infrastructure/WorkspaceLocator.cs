@@ -6,6 +6,7 @@ public static class WorkspaceLocator
 {
     public static string? TryFind(string startDirectory)
     {
+        startDirectory = LocalPathPolicy.RequireLocal(startDirectory);
         for (var directory = new DirectoryInfo(startDirectory); directory is not null; directory = directory.Parent)
         {
             if (File.Exists(Path.Combine(directory.FullName, "ClipRay.sln")))

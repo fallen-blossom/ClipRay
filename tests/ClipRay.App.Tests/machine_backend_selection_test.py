@@ -6,8 +6,8 @@ import sys
 
 worker = Path(sys.argv[1])
 tree = ast.parse(worker.read_text(encoding="utf-8-sig"))
-selected = [node for node in tree.body if isinstance(node, ast.ClassDef)
-            and node.name == "MachineTranslationBackend"]
+selected = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+            and node.name in {"MachineTranslationBackend", "select_machine_device"}]
 
 class FakeTranslator:
     def __init__(self, owner, device):
@@ -31,6 +31,17 @@ class FakeRuntime:
 namespace = {}
 exec(compile(ast.Module(body=selected, type_ignores=[]), str(worker), "exec"), namespace)
 backend_type = namespace["MachineTranslationBackend"]
+select_device = namespace["select_machine_device"]
+assert select_device(False, "auto") == "cpu", "Legacy EN auto did not select lightweight CPU"
+assert select_device(True, "auto") == "auto", "Common model lost its auto policy"
+for common in [False, True]:
+    for explicit in ["cpu", "cuda"]:
+        assert select_device(common, explicit) == explicit, "Explicit device request was overridden"
+runtime = FakeRuntime(True)
+legacy = backend_type("legacy", runtime, select_device(False, "auto"))
+legacy.translate_batch([["hello"]])
+assert [item["device"] for item in runtime.starts] == ["cpu"]
+assert legacy.status["fallbackReason"] is None, "Automatic CPU policy invented a CUDA failure"
 runtime = FakeRuntime(True)
 backend = backend_type("model", runtime, "auto")
 assert backend.translate_batch([["hello"]]) == [["hello"]]

@@ -32,6 +32,14 @@ public sealed class PreparedMediaCopy
         : MediaClipboardDataFactory.CreateFile(Path);
 }
 
+public enum ClipboardPublicationState { NotPublished, Published, Persisted }
+
+public sealed record MediaCopyOutcome(ClipboardPublicationState State, string? Failure = null)
+{
+    public bool Copied => State != ClipboardPublicationState.NotPublished;
+    public bool PersistenceConfirmed => State == ClipboardPublicationState.Persisted;
+}
+
 public static class SavedMediaClipboard
 {
     public static bool TryCopyPng(string path, Action<System.Windows.DataObject>? publish = null) =>
@@ -64,17 +72,33 @@ public static class SavedMediaClipboard
 
     public static bool TryPublish(PreparedMediaCopy prepared, Action<System.Windows.DataObject>? publish = null)
     {
+        return PublishWithOutcome(prepared, publish).Copied;
+    }
+
+    public static async Task<MediaCopyOutcome> CopyPngWithOutcomeAsync(string path, Func<bool> canPublish,
+        Action<System.Windows.DataObject>? publish = null)
+    {
+        ArgumentNullException.ThrowIfNull(canPublish);
+        var prepared = await Task.Run(() => TryPreparePng(path, out var copy) ? copy : null);
+        if (prepared is null) return new(ClipboardPublicationState.NotPublished, "clipboard-preparation-unavailable");
+        if (!canPublish()) return new(ClipboardPublicationState.NotPublished, "clipboard-admission-closed");
+        return PublishWithOutcome(prepared, publish);
+    }
+
+    public static MediaCopyOutcome PublishWithOutcome(PreparedMediaCopy prepared, Action<System.Windows.DataObject>? publish = null)
+    {
         ArgumentNullException.ThrowIfNull(prepared);
         try
         {
             // Recheck the local file/version without reading or decoding media again.
-            if (!prepared.MatchesCurrentFile()) return false;
+            if (!prepared.MatchesCurrentFile()) return new(ClipboardPublicationState.NotPublished, "saved-file-changed");
             var data = prepared.CreateData();
-            if (!prepared.MatchesCurrentFile()) return false;
+            if (!prepared.MatchesCurrentFile()) return new(ClipboardPublicationState.NotPublished, "saved-file-changed");
             (publish ?? MediaClipboardPublisher.Publish)(data);
-            return true;
+            return new(ClipboardPublicationState.Persisted);
         }
-        catch { return false; }
+        catch (ClipboardPersistenceException) { return new(ClipboardPublicationState.Published, "clipboard-persistence-unconfirmed"); }
+        catch { return new(ClipboardPublicationState.NotPublished, "clipboard-unavailable"); }
     }
 }
 

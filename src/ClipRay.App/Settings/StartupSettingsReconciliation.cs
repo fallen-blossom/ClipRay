@@ -10,7 +10,8 @@ internal static class StartupSettingsReconciliation
         var result = loaded;
         // Recovery defaults are usable for maintenance, but must not be mistaken
         // for a successful read and automatically overwrite the original file.
-        if (!loaded.PreserveOriginalFile)
+        if (!loaded.PreserveOriginalFile && result.Settings.Provider == "DeepSeek"
+            && result.Settings.HasExplicitProviderChoice)
         {
             try
             {

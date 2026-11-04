@@ -30,6 +30,12 @@ def register_cuda_libraries():
     return handles
 
 
+def select_machine_device(common, requested):
+    # The small legacy EN model is faster and avoids optional CUDA cold failures
+    # on the ordinary lightweight route. Explicit device requests remain binding.
+    return "cpu" if not common and requested == "auto" else requested
+
+
 class MachineTranslationBackend:
     def __init__(self, model, runtime, requested="auto"):
         if requested not in ("auto", "cpu", "cuda"):
@@ -156,6 +162,123 @@ def normalize_model_input(text):
     return "".join(parts)
 
 
+def text_style_alignments(text, chunks, results, decoded, tokenizer):
+    """Conservative model evidence, never a claim of exact semantic alignment.
+
+    Reject unstable tokenizer prefix decoding, literal-restoration edits, repeated
+    source chunks and diffuse attention. Offsets on the wire are UTF-16 for .NET.
+    """
+    source = normalize_model_input(text)
+    full_target = "".join(decoded)
+    alignments = []
+    target_offset = 0
+
+    def utf16_length(value):
+        return len(value.encode("utf-16-le")) // 2
+
+    def geometry(tokens, full):
+        prefixes = [tokenizer.decode(tokens[:index]).replace("\u2581", " ") for index in range(len(tokens) + 1)]
+        if any(not full.startswith(prefix) for prefix in prefixes):
+            return None
+        return [(len(before), len(after)) for before, after in zip(prefixes, prefixes[1:])]
+
+    def subject_pronoun_anchor(row, source_geometry, target_range, chunk_source, begin, target, target_offset):
+        # Closed subject-pronoun anchors only. This is model attention evidence,
+        # never a dictionary-based alignment of arbitrary translated words.
+        pronouns = {"i": ("我",), "you": ("你",), "he": ("他",), "she": ("她",),
+                    "we": ("我们",), "they": ("他们", "她们")}
+        if not row or any(not isinstance(value, (int, float)) or not 0 <= value <= 1 for value in row):
+            return None
+        strongest = max(range(len(row)), key=row.__getitem__)
+        weight, total = row[strongest], sum(row)
+        runner_up = max((value for index, value in enumerate(row) if index != strongest), default=0)
+        start, end = source_geometry[strongest]
+        while start < end and chunk_source[start].isspace():
+            start += 1
+        while end > start and chunk_source[end - 1].isspace():
+            end -= 1
+        word = chunk_source[start:end]
+        variants = pronouns.get(word.casefold())
+        if variants is None:
+            return None
+        if weight < .30 or total <= 0 or weight / total < .90 or weight < runner_up * 5:
+            return False
+        matches = list(re.finditer(r"(?<!\w)" + re.escape(word) + r"(?!\w)", source, re.IGNORECASE))
+        if len(matches) != 1 or matches[0].span() != (begin + start, begin + end):
+            return False
+        occurrences = [(match.start(), variant) for variant in variants
+                       for match in re.finditer(re.escape(variant), full_target)]
+        if len(occurrences) != 1:
+            return False
+        target_start, variant = occurrences[0]
+        target_end = target_start + len(variant)
+        # Only a clause-initial subject, not 我方/自我/其他/我们的 or a
+        # singular substring of a plural. Unrecognized grammar stays unresolved.
+        if target_start > 0 and (full_target[target_start - 1].isalnum() or full_target[target_start - 1] == "_"):
+            return False
+        following = full_target[target_end:]
+        predicates = ("能", "会", "要", "想", "应", "可", "是", "在", "有", "没", "不", "已",
+                      "也", "都", "还", "正", "将", "就", "很", "曾", "仍", "才", "愿")
+        if following and (following[0].isalnum() or following[0] == "_") and not following.startswith(predicates):
+            return False
+        target_prefix = utf16_length(full_target[:target_start])
+        target_length = utf16_length(variant)
+        row_start = target_offset + utf16_length(target[:target_range[0]])
+        row_end = target_offset + utf16_length(target[:target_range[1]])
+        if target_prefix < row_start or target_prefix + target_length > row_end:
+            return False
+        return {"sourceStart": utf16_length(source[:begin + start]),
+                "sourceLength": utf16_length(word), "targetStart": target_prefix,
+                "targetLength": target_length, "confidence": weight / total, "evidence": 3}
+
+    for tokens, result, target in zip(chunks, results, decoded):
+        if result is None or not result.attention:
+            target_offset += utf16_length(target)
+            continue
+        chunk_source = tokenizer.decode(tokens).replace("\u2581", " ")
+        begin = source.find(chunk_source)
+        target_tokens = list(result.hypotheses[0])
+        raw_target = tokenizer.decode(target_tokens).replace("\u2581", " ")
+        source_geometry = geometry(tokens, chunk_source)
+        target_geometry = geometry(target_tokens, raw_target)
+        if begin < 0 or not chunk_source or source.find(chunk_source, begin + 1) >= 0 or raw_target != target \
+                or source_geometry is None or target_geometry is None:
+            target_offset += utf16_length(target)
+            continue
+        for index, row in enumerate(result.attention[0][:len(target_tokens)]):
+            if len(row) != len(tokens) or not row:
+                continue
+            anchor = subject_pronoun_anchor(row, source_geometry, target_geometry[index], chunk_source, begin, target, target_offset)
+            if anchor is False:
+                # A recognized subject pronoun with ambiguous/weak/compound
+                # evidence must not regain a wider generic token alignment.
+                continue
+            if anchor is not None:
+                alignments.append(anchor)
+                continue
+            if max(row) < .45:
+                continue
+            indices = [position for position, value in enumerate(row) if value >= .10]
+            mass = sum(row[position] for position in indices)
+            if not indices or mass < .80 or indices != list(range(min(indices), max(indices) + 1)):
+                continue
+            start, end = source_geometry[min(indices)][0], source_geometry[max(indices)][1]
+            target_start, target_end = target_geometry[index]
+            # Leading SentencePiece spaces are separators, not source styles.
+            while start < end and chunk_source[start].isspace():
+                start += 1
+            while end > start and chunk_source[end - 1].isspace():
+                end -= 1
+            if end <= start or target_end <= target_start:
+                continue
+            alignments.append({"sourceStart": utf16_length(source[:begin + start]),
+                "sourceLength": utf16_length(chunk_source[start:end]),
+                "targetStart": target_offset + utf16_length(target[:target_start]),
+                "targetLength": utf16_length(target[target_start:target_end]), "confidence": min(1, mass), "evidence": 1})
+        target_offset += utf16_length(target)
+    return alignments
+
+
 def sentence_token_chunks(text, tokenizer):
     text = normalize_model_input(text)
     tokens = tokenizer.encode(text, out_type=str)
@@ -193,7 +316,7 @@ def main() -> int:
     )
     cuda_handles = register_cuda_libraries()
     translator = MachineTranslationBackend(model_root if common else f"{model_root}/model",
-                                            ctranslate2, os.environ.get("CLIPRAY_MT_DEVICE", "auto").lower())
+        ctranslate2, select_machine_device(common, os.environ.get("CLIPRAY_MT_DEVICE", "auto").lower()))
 
     cache = OrderedDict()
     cache_language = None
@@ -213,7 +336,9 @@ def main() -> int:
         if not isinstance(texts, list) or not all(isinstance(text, str) for text in texts):
             return 5
 
-        missing = list(dict.fromkeys(text for text in texts if text not in cache))
+        return_alignments = request.get("returnAlignments", False) is True
+        missing = list(dict.fromkeys(text for text in texts if text not in cache
+            or return_alignments and cache[text][2] is None))
         original_texts = texts
         texts = missing
         token_batches = []
@@ -233,7 +358,7 @@ def main() -> int:
         unique_translations = (
             translator.translate_batch([(["__zh__"] + list(tokens) + ["</s>"]) if common else list(tokens)
                 for tokens in unique_batches], beam_size=1 if common else 4, max_input_length=0,
-                return_attention=any(LITERAL_PATTERN.search(tokenizer.decode(tokens)) for tokens in token_batches),
+                return_attention=return_alignments or any(LITERAL_PATTERN.search(tokenizer.decode(tokens)) for tokens in token_batches),
                 max_decoding_length=min(4096,max(256,max(map(len,token_batches))*3)))
             if unique_batches
             else []
@@ -255,26 +380,32 @@ def main() -> int:
         ]
         output = []
         output_backends = []
+        output_alignments = []
         chunk_index = 0
         for text, chunk_count in zip(texts, chunk_counts):
             if chunk_count == 0:
                 output.append(text)
                 output_backends.append(None)
+                output_alignments.append([] if return_alignments else None)
                 continue
             output.append("".join(decoded_chunks[chunk_index : chunk_index + chunk_count]))
             output_backends.append(dict(translator.status) if any(
                 item is not None for item in translations[chunk_index : chunk_index + chunk_count]) else None)
+            output_alignments.append(text_style_alignments(text, token_batches[chunk_index : chunk_index + chunk_count],
+                translations[chunk_index : chunk_index + chunk_count], decoded_chunks[chunk_index : chunk_index + chunk_count],
+                tokenizer) if return_alignments else None)
             chunk_index += chunk_count
-        for text, translated, backend in zip(texts, output, output_backends):
-            cache[text] = (translated, backend)
+        for text, translated, backend, alignment in zip(texts, output, output_backends, output_alignments):
+            cache[text] = (translated, backend, alignment)
         result = [cache[text][0] for text in original_texts]
         result_backends = [cache[text][1] for text in original_texts]
+        result_alignments = [cache[text][2] or [] for text in original_texts]
         for text in original_texts:
             cache.move_to_end(text)
         while len(cache) > 512:
             cache.popitem(last=False)
         sys.stdout.write(json.dumps({"texts": result, "backend": translator.status,
-                                    "textBackends": result_backends}, ensure_ascii=False) + "\n")
+                                    "textBackends": result_backends, "textAlignments": result_alignments}, ensure_ascii=False) + "\n")
         sys.stdout.flush()
         if len(sys.argv) == 2:
             break

@@ -4,6 +4,8 @@ ClipRay 是一个 Windows x64 截图和原位翻译工具。遇到看不懂的�
 
 目前是预览版。截图翻译和实时翻译可以试用，但复杂页面的排版、小字识别和漏译还有问题，正在根据实际使用情况继续修。
 
+使用与构建见 [构建说明](docs/BUILD.zh-CN.md)，后台操作见 [本地命令行](docs/CLI.zh-CN.md)，本轮变更、验收范围和已知问题见 [预览版 3 说明](docs/release/1.0.6-preview.3.zh-CN.md)。
+
 ## 下载与开始使用
 
 安装包放在 GitHub 的 Releases 页面。一般先选 **Lite 轻量版**；需要额外本地模型再选 **Full 完全版**。
@@ -24,7 +26,7 @@ ClipRay 是一个 Windows x64 截图和原位翻译工具。遇到看不懂的�
 - 区域截图：窗口/控件边界吸附、拖选与八向调整，双击 `Esc` 退出（第一次只提示）。
 - 编辑工具：实时画笔、直线、由细到粗的箭头、矩形、圆形、椭圆、文字框，共用颜色与撤回；另有马赛克和取色。
 - 静默截图：当前屏幕与完整虚拟桌面，完成后仅显示不进入截图的屏幕边缘光效。
-- 长截图：手动滚动或自动滚动；停止后可缩放、拖拽查看并保存结果，关闭、取消、保存完成或异常退出后清理不再使用的临时分帧。
+- 长截图：手动滚动或自动滚动；自动模式按已确认的实际位移提速，暂时无法拼接时等待重采。完成后可缩放、拖拽查看并保存结果；尚未成功保存的分帧保留供恢复。
 - 区域翻译：OCR 识别框内文字，再通过基础离线机翻、DeepSeek 或 Full 版的 Local LMT 翻译，译文显示在原来的区域。
 - 实时翻译：持续翻译框选区域，支持基础离线机翻和 DeepSeek。当前先以英文转简中网页内容为主要测试场景。
 - 录屏：`Ctrl+Win+Z` 进入录屏选区，Enter 确认、Esc 取消；输出 H.264/AAC MP4，只录默认系统输出，不访问麦克风；`F8` 或托盘菜单停止。
@@ -55,12 +57,13 @@ ClipRay 是一个 Windows x64 截图和原位翻译工具。遇到看不懂的�
 Set-Location '<你的 ClipRay 克隆目录>'
 dotnet restore ClipRay.sln --configfile NuGet.Config --source https://api.nuget.org/v3/index.json
 dotnet build ClipRay.sln -c Release --no-restore
-dotnet run --project tests\ClipRay.Core.Tests\ClipRay.Core.Tests.csproj -c Release --no-build --no-restore
-dotnet run --project tests\ClipRay.App.Tests\ClipRay.App.Tests.csproj -c Release --no-build --no-restore
+.\tests\Run-BackgroundTests.ps1 -SkipBuild
 .\scripts\Publish-Local.ps1
 ```
 
 发布目录为 `artifacts/app/`，脚本会创建或更新桌面快捷方式 `ClipRay 截光.lnk`，不会覆盖属于其他程序的同名快捷方式。
+
+`App.Tests` 无参数启动会返回 2。完整后台检查使用上面的脚本；只查看用例而不执行时，加上 `-CollectOnly`。构建、发布和桌面验收的区别见 [构建说明](docs/BUILD.zh-CN.md)。
 
 ## 构建安装包
 

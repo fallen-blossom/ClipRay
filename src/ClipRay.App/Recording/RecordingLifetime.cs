@@ -107,12 +107,14 @@ public sealed class RegionRecordingRuntime : IRecordingRuntime
     private readonly IGraphicsCaptureSource _video;
     private readonly ISystemAudioCapture? _audio;
     private readonly IMediaFoundationRecorder _recorder;
+    private readonly Action? _beforeCapture;
     private Task? _startTask, _stopTask, _disposeTask;
     private int _stopping;
     public RegionRecordingRuntime(IGraphicsCaptureSource video, ISystemAudioCapture? audio,
-        IMediaFoundationRecorder recorder, RecordingFaultSignal? faults = null)
+        IMediaFoundationRecorder recorder, RecordingFaultSignal? faults = null, Action? beforeCapture = null)
     {
         _video = video; _audio = audio; _recorder = recorder;
+        _beforeCapture = beforeCapture;
         Faults = faults ?? new RecordingFaultSignal();
         Faults.Raised += OnFault;
     }
@@ -129,6 +131,11 @@ public sealed class RegionRecordingRuntime : IRecordingRuntime
                 CheckStart(cancellationToken);
                 await _recorder.StartAsync(cancellationToken).ConfigureAwait(false);
                 CheckStart(cancellationToken);
+                await RecordingStartupGuard.ExecuteAsync(RecordingStartupStage.GraphicsCapture,
+                    () => _video.PrepareAsync(cancellationToken)).ConfigureAwait(false);
+                CheckStart(cancellationToken);
+                // Device/encoder initialization is not part of the shared A/V presentation clock.
+                _beforeCapture?.Invoke();
                 // Audio availability is resolved before any desktop frame is admitted.
                 if (_audio is not null) await RecordingStartupGuard.ExecuteAsync(RecordingStartupStage.SystemAudio,
                     () => _audio.StartAsync(_recorder.WriteAudioAsync, cancellationToken)).ConfigureAwait(false);

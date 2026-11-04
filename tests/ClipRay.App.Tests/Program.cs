@@ -35,6 +35,9 @@ internal static partial class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // Test transport seams have explicit cloud permission. The application
+        // and every fresh policy still start with networking denied.
+        ModelNetworkAccessPolicy.Shared.EnableDeepSeek();
         if (args.Length == 0)
         {
             Console.Error.WriteLine("Specify one explicit command; use --collect to inspect registered metadata.");
@@ -1608,8 +1611,10 @@ internal static partial class Program
         Equal(true, machineOption >= 0 && deepSeekOption > machineOption);
         var appSource = File.ReadAllText(Path.Combine(workspace, "src", "ClipRay.App", "App.xaml.cs"));
         Equal(true, appSource.Contains("_ = EnsureMachineTranslationWarmup();", StringComparison.Ordinal));
-        Equal(true, appSource.Contains("var warmup = EnsureMachineTranslationWarmup();", StringComparison.Ordinal));
-        Equal(true, appSource.Contains("await warmup.ConfigureAwait(true);", StringComparison.Ordinal));
+        Equal(true, appSource.Contains("LiveWarmupFactory ?? WarmLiveRouteAsync", StringComparison.Ordinal));
+        Equal(true, appSource.Contains("? EnsureMachineTranslationWarmup() : WarmOcrAsync", StringComparison.Ordinal));
+        MachineStartupBudgetTests.CoordinatorWaitsForWarmup();
+        MachineLiveStartupEntryTests.Run();
     }
 
     private static void SeparatesRegionAndLiveProviderSettings()
@@ -3116,11 +3121,15 @@ internal static partial class Program
 
         Equal(true, xaml.Contains("Text=\"by Fallen-Flower ❀O.o？\"", StringComparison.Ordinal));
         Equal(true, xaml.Contains("x:Name=\"SignatureBadge\"", StringComparison.Ordinal));
-        Equal(true, xaml.Contains("Padding=\"22.4,11.2\"", StringComparison.Ordinal));
-        Equal(true, xaml.Contains("CornerRadius=\"20.8\"", StringComparison.Ordinal));
-        Equal(true, xaml.Contains("BorderThickness=\"1.6\"", StringComparison.Ordinal));
-        Equal(true, xaml.Contains("FontSize=\"19.2\"", StringComparison.Ordinal));
-        Equal(true, xaml.Contains("Width=\"57\" Height=\"57\" Margin=\"18,6,0,-6\"", StringComparison.Ordinal));
+        // Preserve the signature shipped in the accepted daily build (5b1cee1).
+        // The earlier oversized header was replaced before this UI revision.
+        var document = System.Xml.Linq.XDocument.Parse(xaml);
+        var name = System.Xml.Linq.XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml");
+        var badge = document.Descendants().Single(element => (string?)element.Attribute(name) == "SignatureBadge");
+        Equal("10,7", (string?)badge.Attribute("Padding"));
+        Equal("8", (string?)badge.Attribute("CornerRadius"));
+        Equal("1", (string?)badge.Attribute("BorderThickness"));
+        Equal("12", (string?)badge.Descendants().Single(element => element.Name.LocalName == "TextBlock").Attribute("FontSize"));
         var source = File.ReadAllText(Path.Combine(workspace, "src", "ClipRay.App", "Settings", "SettingsWindow.xaml.cs"));
         Equal(true, source.Contains("TimeSpan.FromSeconds(10)", StringComparison.Ordinal));
         Equal(false, source.Contains("TimeSpan.FromSeconds(18)", StringComparison.Ordinal));
@@ -3139,9 +3148,8 @@ internal static partial class Program
         Equal(true, project.Contains("Link=\"docs\\ClipRay-使用教程.html\"", StringComparison.Ordinal));
         Equal(true, project.Contains("CopyToPublishDirectory=\"PreserveNewest\"", StringComparison.Ordinal));
         Equal(true, xaml.Contains("x:Name=\"TutorialButton\"", StringComparison.Ordinal));
-        Equal(true, xaml.Contains("Content=\"查看使用教程 ↗\"", StringComparison.Ordinal));
-        Equal(true, xaml.Contains("Margin=\"0,0,28,0\" Padding=\"14,8\" FontSize=\"13\"", StringComparison.Ordinal));
-        Equal(true, xaml.Contains("Background=\"#4FA9DC\" BorderBrush=\"#A8DDF5\"", StringComparison.Ordinal));
+        Equal(true, xaml.Contains("Content=\"打开使用帮助\"", StringComparison.Ordinal));
+        Equal(true, xaml.Contains("x:Name=\"HelpSection\"", StringComparison.Ordinal));
         Equal(true, source.Contains("OpenTutorial_Click", StringComparison.Ordinal));
         Equal(true, source.Contains("AppContext.BaseDirectory, \"docs\", \"ClipRay-使用教程.html\"", StringComparison.Ordinal));
         Equal(true, source.Contains("UseShellExecute = true", StringComparison.Ordinal));
@@ -3211,7 +3219,7 @@ internal static partial class Program
         {
             Equal(true, xaml.Contains($"x:Name=\"{name}\"", StringComparison.Ordinal));
         }
-        Equal(true, xaml.Contains("删除不进入回收站", StringComparison.Ordinal));
+        Equal(true, xaml.Contains("移入回收站", StringComparison.Ordinal));
         Equal(true, xaml.Contains("settings:SettingsText.Chinese=\"截图\" settings:SettingsText.English=\"Screenshots\"", StringComparison.Ordinal));
         Equal(false, xaml.Contains("settings:SettingsText.Chinese=\"截图和长截图\"", StringComparison.Ordinal));
         Equal(true, source.Contains("RecordingDirectory = Path.GetFullPath(RecordingDirectoryBox.Text)", StringComparison.Ordinal));
@@ -6443,21 +6451,20 @@ internal static partial class Program
         var block = new OcrTextBlock(
             "Translated from Japanese Show original",
             new PixelRect(10, 12, 302, 20),
-            [new OcrWord("Translated from Japanese Show original", new PixelRect(10, 12, 302, 20))]);
+            words);
 
         var regions = VisualTextRegionBuilder.Build([block], source);
 
-        Equal(2, regions.Count);
-        Equal("Translated from Japanese", regions[0].SourceText);
-        Equal("Show original", regions[1].SourceText);
+        Equal(1, regions.Count);
+        Equal(block.Text, regions[0].SourceText);
+        Equal(true, regions[0].SourceStyleSpans.Count >= 2);
         var items = InPlaceLayoutService.BuildRegions(
             source,
             regions,
             [
-                new TranslationResult(true, "First", "ok"),
-                new TranslationResult(true, "Second", "ok"),
+                new TranslationResult(true, "翻译自日语，显示原文", "ok"),
             ]);
-        Equal(2, items.Count);
+        Equal(1, items.Count);
 
         using var hashtagSource = CreateBitmap(590, 48, Color.Black);
         PaintSyntheticText(hashtagSource, new PixelRect(10, 12, 76, 20), Color.FromArgb(255, 29, 155, 240), 14);
@@ -6469,22 +6476,16 @@ internal static partial class Program
 
         var hashtagRegions = VisualTextRegionBuilder.Build([hashtag], hashtagSource);
 
-        Equal(2, hashtagRegions.Count);
-        Equal("#Want", hashtagRegions[0].SourceText);
-        Equal("to be followed by people who like art", hashtagRegions[1].SourceText);
-        Equal(true, hashtagRegions[0].Bounds.Right is >= 82 and <= 90);
-        Equal(hashtagRegions[0].Bounds.Right, hashtagRegions[1].Bounds.Left);
+        Equal(1, hashtagRegions.Count);
+        Equal(hashtag.Text, hashtagRegions[0].SourceText);
         var hashtagItems = InPlaceLayoutService.BuildRegions(
             hashtagSource,
             hashtagRegions,
             [
-                new TranslationResult(true, "Wanted", "ok"),
-                new TranslationResult(true, "Art fans", "ok"),
+                new TranslationResult(true, "#希望被喜欢艺术的人关注", "ok"),
             ]);
-        Equal(2, hashtagItems.Count);
-        Equal(
-            true,
-            Math.Abs(hashtagItems[0].TextLayout!.FontSizePixels - hashtagItems[1].TextLayout!.FontSizePixels) <= 0.5);
+        Equal(1, hashtagItems.Count);
+        Equal(true, hashtagItems[0].UnresolvedSourceStyleSpanCount > 0);
     }
 
     private static void SplitsAdjacentUiWordsAcrossBackingSurfaces()
@@ -10519,16 +10520,15 @@ internal static partial class Program
         Equal(false, owner.IsCurrent(third.Version));
     }
 
-    private static void KeepsShutdownCleanupRunningAfterRecordingStopFailure()
+    private static void KeepsManagedShutdownGatedOnResourceRetirement()
     {
-        var continued = false;
-        Equal(false, ShutdownSafety.Try(() => throw new IOException("injected stop failure")));
-        continued = true;
-        Equal(true, continued);
-
         var workspace = WorkspaceLocator.Find(AppContext.BaseDirectory);
         var app = File.ReadAllText(Path.Combine(workspace, "src", "ClipRay.App", "App.xaml.cs"));
-        Equal(true, app.Contains("ShutdownSafety.Try(() => _recordingSession?.StopAsync().GetAwaiter().GetResult())", StringComparison.Ordinal));
+        Equal(true, app.Contains("RequestImageOutputRetirement();", StringComparison.Ordinal));
+        Equal(true, app.Contains("RequestRecordingRetirement();", StringComparison.Ordinal));
+        Equal(true, app.Contains("RequestTranslationRetirement();", StringComparison.Ordinal));
+        Equal(true, app.Contains("if (!result.Completed)", StringComparison.Ordinal));
+        Equal(true, app.Contains("PrepareSettingsForCommittedShutdown();", StringComparison.Ordinal));
     }
 
     private static void KeepsOverlayTranslationOutOfStandaloneWindow()
@@ -11387,7 +11387,9 @@ internal static partial class Program
         Equal(true, installer.Contains("if CurUninstallStep = usUninstall then", StringComparison.Ordinal));
         Equal(true, installer.Contains("CleanupArguments := '--uninstall-cleanup';", StringComparison.Ordinal));
         Equal(true, installer.Contains("CleanupArguments := CleanupArguments + ' --recycle-outputs';", StringComparison.Ordinal));
-        Equal(true, installer.Contains("ExpandConstant('{sys}\\taskkill.exe')", StringComparison.Ordinal));
+        Equal(true, installer.Contains("'--request-install-exit'", StringComparison.Ordinal));
+        Equal(true, installer.IndexOf("'--request-install-exit'", StringComparison.Ordinal)
+            < installer.IndexOf("CleanupArguments := '--uninstall-cleanup';", StringComparison.Ordinal));
         Equal(true, installer.Contains("ExpandConstant('{app}\\app\\{#AppExeName}')", StringComparison.Ordinal));
         Equal(true, installer.Contains("CleanupExitCode <> 0", StringComparison.Ordinal));
         Equal(true, installer.Contains("Abort;", StringComparison.Ordinal));
@@ -11395,7 +11397,7 @@ internal static partial class Program
         Equal(true, installer.Contains("点击“是”卸载 ClipRay；点击“否”取消。", StringComparison.Ordinal));
         Equal(true, installer.Contains("将 ClipRay 默认 Outputs 文件夹整体移到回收站", StringComparison.Ordinal));
         Equal(true, File.ReadAllText(Path.Combine(workspace, "src", "ClipRay.App", "Infrastructure", "UninstallCleanupService.cs"))
-            .Contains("FileSystem.DeleteDirectory", StringComparison.Ordinal));
+            .Contains("new WindowsCleanupRecycleBackend().RecycleDirectory(path)", StringComparison.Ordinal));
     }
 
     private static void BuildsVersionGatedRecordingDiagnosticPatchWithoutBundledModels()
@@ -12728,8 +12730,9 @@ internal static partial class Program
             "RecordingBorderWindow.cs"));
 
         Equal("recording-border-probe.json", Path.GetFileName(path));
-        Equal(true, json.Contains("\"AffinityErrorCode\": 87", StringComparison.Ordinal));
-        Equal(true, json.Contains("\"DwmCompositionEnabled\": true", StringComparison.Ordinal));
+        using var probe = JsonDocument.Parse(json);
+        Equal(87, probe.RootElement.GetProperty("AffinityErrorCode").GetInt32());
+        Equal(true, probe.RootElement.GetProperty("DwmCompositionEnabled").GetBoolean());
         Equal(false, json.Contains(Environment.UserName, StringComparison.OrdinalIgnoreCase));
         Equal(true, appSource.Contains("--recording-border-probe", StringComparison.Ordinal));
         Equal(true, appSource.Contains("RecordingBorderProbeStore.Write", StringComparison.Ordinal));

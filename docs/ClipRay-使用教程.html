@@ -3,126 +3,229 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="ClipRay 1.0.6 离线使用教程：安装、截图、长截图、录屏、OCR、区域翻译与实时翻译。">
-  <title>ClipRay 1.0.6 使用教程</title>
+  <meta name="description" content="ClipRay 离线使用帮助：截图、长截图、录屏、文字提取、翻译，以及查找和重新复制保存的成果。">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>ClipRay 使用帮助</title>
   <style>
-    :root { color-scheme: dark; --bg:#0a0f17; --panel:#111a27; --panel-2:#172233; --line:#2a3950; --text:#eef4ff; --muted:#acbbcf; --blue:#73c7ff; --green:#70dfaa; --yellow:#ffd27a; --radius:16px; --shadow:0 18px 50px rgba(0,0,0,.26); }
+    :root { color-scheme:dark; --bg:#11151c; --text:#e7eaf0; --muted:#a8b1c0; --line:#303846; --link:#9acbfa; --surface:#1a212c; }
     * { box-sizing:border-box; }
-    html { scroll-behavior:smooth; }
-    body { margin:0; color:var(--text); background:radial-gradient(circle at 80% -10%,rgba(48,127,196,.18),transparent 35rem),var(--bg); font:16px/1.72 "Segoe UI","Microsoft YaHei UI",sans-serif; }
-    a { color:var(--blue); }
-    code,kbd { font-family:Consolas,monospace; }
-    kbd { display:inline-block; padding:.08rem .42rem; border:1px solid #51657f; border-bottom-width:2px; border-radius:6px; background:#202d40; color:#fff; }
-    .layout { display:grid; grid-template-columns:250px minmax(0,860px); gap:32px; width:min(1180px,calc(100% - 36px)); margin:0 auto; padding:34px 0 80px; }
-    nav { position:sticky; top:20px; align-self:start; padding:18px; background:rgba(17,26,39,.93); border:1px solid var(--line); border-radius:var(--radius); }
-    nav strong { display:block; margin:0 0 10px; font-size:18px; }
-    nav a { display:block; padding:6px 8px; color:var(--muted); text-decoration:none; border-radius:7px; }
-    nav a:hover { color:#fff; background:var(--panel-2); }
+    html { scroll-padding-top:24px; }
+    body { margin:0; background:var(--bg); color:var(--text); font:16px/1.8 "Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif; }
+    a { color:var(--link); text-underline-offset:4px; }
+    a:hover { color:#d4e9ff; }
+    a:focus-visible,summary:focus-visible { outline:2px solid var(--link); outline-offset:4px; border-radius:2px; }
+    .layout { display:grid; grid-template-columns:196px minmax(0,760px); gap:64px; max-width:1100px; margin:auto; padding:48px 28px 72px; }
+    nav { position:sticky; top:32px; align-self:start; font-size:14px; }
+    .brand { display:block; margin-bottom:18px; font-size:19px; color:var(--text); }
+    nav a { display:block; margin:2px 0; padding:6px 0; color:var(--muted); text-decoration:none; }
+    nav a:hover { color:var(--text); }
+    nav .secondary { margin-top:18px; padding-top:16px; border-top:1px solid var(--line); }
     main { min-width:0; }
-    .hero,section { border:1px solid var(--line); border-radius:var(--radius); background:rgba(17,26,39,.94); box-shadow:var(--shadow); }
-    .hero { padding:38px; margin-bottom:24px; }
-    .eyebrow { margin:0 0 8px; color:var(--green); font-weight:700; letter-spacing:.08em; }
-    h1 { margin:0; font-size:clamp(32px,6vw,54px); line-height:1.12; }
-    .lead { max-width:700px; margin:18px 0 0; color:var(--muted); font-size:18px; }
-    section { padding:30px; margin:0 0 22px; scroll-margin-top:20px; }
-    h2 { margin:0 0 18px; font-size:28px; }
-    h3 { margin:24px 0 8px; font-size:19px; }
+    header { margin-bottom:40px; }
+    .eyebrow { margin:0 0 6px; color:var(--muted); font-size:14px; }
+    h1 { margin:0 0 12px; font-size:32px; line-height:1.3; font-weight:650; letter-spacing:-.02em; }
+    .intro { color:var(--muted); max-width:42em; }
+    h2 { margin:0 0 16px; font-size:24px; line-height:1.45; font-weight:650; }
+    h3 { margin:24px 0 8px; font-size:17px; font-weight:650; }
+    section { margin-top:38px; padding-top:30px; border-top:1px solid var(--line); }
     p { margin:10px 0; }
-    ul,ol { padding-left:1.35rem; }
-    li+li { margin-top:8px; }
-    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
-    .card { padding:18px; border:1px solid var(--line); border-radius:12px; background:var(--panel-2); }
-    .card h3 { margin-top:0; }
-    .tag { display:inline-block; margin-left:7px; padding:2px 8px; border-radius:999px; background:rgba(112,223,170,.13); color:var(--green); font-size:13px; vertical-align:middle; }
-    .note { margin:16px 0; padding:14px 16px; border-left:4px solid var(--blue); border-radius:8px; background:rgba(115,199,255,.08); }
-    .warn { border-left-color:var(--yellow); background:rgba(255,210,122,.08); }
-    table { width:100%; border-collapse:collapse; margin:12px 0; }
-    th,td { padding:11px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
-    th { color:var(--muted); font-weight:600; }
-    footer { color:var(--muted); text-align:center; padding-top:18px; }
-    @media (max-width:840px) { .layout{display:block;width:min(100% - 24px,860px);padding-top:12px} nav{position:static;margin-bottom:18px} nav a{display:inline-block} .hero,section{padding:22px} .grid{grid-template-columns:1fr} table{display:block;overflow-x:auto} }
+    ol,ul { padding-left:1.5em; margin:12px 0; }
+    li { padding-left:3px; }
+    li+li { margin-top:10px; }
+    kbd { display:inline-block; padding:0 .36em; border:1px solid #4b5668; border-bottom-width:2px; border-radius:4px; background:var(--surface); font: .88em/1.7 "Segoe UI",sans-serif; white-space:nowrap; }
+    code { font: .9em/1.6 Consolas,monospace; overflow-wrap:anywhere; }
+    .aside { padding:1px 0 1px 16px; margin:18px 0; border-left:2px solid #65788f; color:var(--muted); }
+    .table-wrap { overflow-x:auto; margin:16px 0; }
+    table { width:100%; border-collapse:collapse; font-size:14px; line-height:1.65; }
+    th,td { padding:12px 12px 12px 0; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { font-weight:600; color:var(--muted); }
+    td:first-child { min-width:110px; }
+    details { border-bottom:1px solid var(--line); padding:14px 0; }
+    summary { cursor:pointer; font-weight:600; }
+    details p { padding-left:20px; color:var(--muted); }
+    footer { margin-top:40px; color:var(--muted); font-size:13px; }
+    @media(max-width:850px) { .layout { gap:32px; grid-template-columns:160px minmax(0,1fr); padding:32px 22px 56px; } }
+    @media(max-width:640px) { .layout { display:block; padding:24px 20px 48px; } nav { position:static; padding-bottom:20px; margin-bottom:28px; border-bottom:1px solid var(--line); } .brand { margin-bottom:8px; } nav a { display:inline-block; margin:0 16px 0 0; } nav .secondary { margin-top:6px; padding-top:0; border:0; } h1 { font-size:28px; } h2 { font-size:22px; } section { margin-top:30px; padding-top:24px; } }
+    @media print { body { background:white; color:black; } .layout { display:block; max-width:none; padding:0; } nav { display:none; } .intro,.aside,footer,details p,th { color:#333; } a { color:inherit; } kbd { background:white; border-color:#777; } details { break-inside:avoid; } section { break-inside:auto; } }
   </style>
 </head>
 <body>
   <div class="layout">
-    <nav aria-label="教程目录">
-      <strong>ClipRay 1.0.6</strong>
-      <a href="#install">1. 选择安装版本</a>
-      <a href="#start">2. 五分钟上手</a>
-      <a href="#capture">3. 截图、长截图和录屏</a>
-      <a href="#translate">4. OCR 与区域翻译</a>
-      <a href="#live">5. 实时翻译</a>
-      <a href="#settings">6. 设置与快捷键</a>
-      <a href="#privacy">7. 密钥与隐私</a>
-      <a href="#help">8. 故障处理与卸载</a>
+    <nav aria-label="使用帮助目录">
+      <strong class="brand">ClipRay</strong>
+      <a href="#capture">截一张图</a>
+      <a href="#scroll">截取长页面</a>
+      <a href="#record">录一段屏幕</a>
+      <a href="#text">提取文字与翻译</a>
+      <a href="#results">找成果、重新复制</a>
+      <a href="#questions">常见问题</a>
+      <div class="secondary">
+        <a href="#settings">设置在哪里</a>
+        <a href="#shortcuts">默认快捷键</a>
+        <a href="#installation">安装版本与卸载</a>
+        <a href="#privacy">模型与隐私说明</a>
+      </div>
     </nav>
     <main>
-      <header class="hero">
-        <p class="eyebrow">离线使用教程 · Windows</p>
-        <h1>从截取画面，到读懂内容</h1>
-        <p class="lead">ClipRay 把截图、长截图、录屏、OCR 和翻译放在同一套框选流程里。本页先告诉你该选哪个版本，再按实际任务说明怎么用。</p>
+      <header>
+        <p class="eyebrow">Windows · 离线使用帮助</p>
+        <h1>今天想用 ClipRay 做什么？</h1>
+        <p class="intro">从下面的任务开始。ClipRay 启动后会留在系统托盘；右键托盘图标可以打开设置、开始截取或查看最近保存的成果。</p>
       </header>
-      <section id="install">
-        <h2>1. 选择安装版本</h2>
-        <div class="grid">
-          <article class="card"><h3>轻量版 <span class="tag">推荐多数用户</span></h3><p>包含截图、长截图、录屏、OCR、机翻和 DeepSeek。安装包较小，不包含 Local LMT 大模型。</p></article>
-          <article class="card"><h3>完整版</h3><p>在轻量版功能之上加入 Local LMT 本地模型。适合需要完全离线的本地大模型翻译，并且能接受更大的下载和磁盘占用。</p></article>
-        </div>
-        <div class="note">拿不准时安装轻量版。机翻属于本地快速兜底，两种安装版本都会保留；以后需要 Local LMT，再改装完整版即可。</div>
-        <ol><li>运行安装程序，选择安装目录。</li><li>安装完成后启动 ClipRay。程序会驻留系统托盘，主要功能可从托盘菜单或快捷键打开。</li><li>第一次使用先打开“设置”，确认保存目录、截图格式和翻译路线。</li></ol>
-      </section>
-      <section id="start">
-        <h2>2. 五分钟上手</h2>
-        <ol><li>按 <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>A</kbd>，拖动鼠标框选内容。</li><li>在固定工具栏中选择截图、OCR、翻译、长截图或录屏。状态提示可以变化，操作按钮不会跟着提示移动。</li><li>普通截图按 <kbd>Enter</kbd> 确认；连续按两次 <kbd>Esc</kbd> 退出。</li><li>保存成功后，如果开启“保存后复制文件”，可切到文件管理器按 <kbd>Ctrl</kbd> + <kbd>V</kbd> 直接粘贴文件。</li></ol>
-        <p>截图、长截图和录屏都支持这套文件复制方式，也就是保存后可直接 Ctrl+V 粘贴文件。剪贴板中放的是已经保存好的文件，因此关掉预览不会让结果消失。</p>
-      </section>
+
       <section id="capture">
-        <h2>3. 截图、长截图和录屏</h2>
-        <h3>普通截图</h3><p>框选后可调整边界、做简单标注，再按 <kbd>Enter</kbd> 保存。根据设置，图片会写入保存目录，并作为文件放入剪贴板。</p>
-        <h3>长截图</h3>
-        <ol><li>框选要保留的竖向内容区域，点击“长截图”。区域应覆盖正文的完整宽度，并给滚动内容留出足够高度。</li><li>ClipRay 会逐段滚动并拼接。滚动完成等必要信息会显示在状态栏，工具栏位置保持固定。</li><li>按 <kbd>Enter</kbd> 完成长截图。程序先保存文件并复制到剪贴板，再展开结果预览。</li><li>预览只用于检查结果；直接关闭预览不会撤销已经完成的保存。</li></ol>
-        <div class="note warn">动态页面如果仍在播放动画、加载图片或悬浮栏持续变化，拼接边缘可能不稳定。先让页面静止，再开始长截图。</div>
-        <h3>录屏</h3><p>框选区域后开始录制，按 <kbd>F8</kbd> 停止。停止后会先出现处理中的预览，文件完成封装后自动接入预览；启用“保存后复制文件”时，最终视频文件也会进入剪贴板，可在文件管理器中直接粘贴。</p>
+        <h2>截一张图</h2>
+        <ol>
+          <li>按 <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>A</kbd>，拖动鼠标框选要保留的画面。</li>
+          <li>需要时调整边界，或用工具栏添加标注。</li>
+          <li>按 <kbd>Enter</kbd> 或点击确认，保存截图。</li>
+        </ol>
+        <p>默认开启“完成后自动复制到剪贴板”。截图和长截图会提供可粘贴的图片；切到聊天框或图片编辑器，按 <kbd>Ctrl</kbd> + <kbd>V</kbd> 即可粘贴，也可粘贴到文件管理器。</p>
+        <p class="aside">普通框选界面中，连续按两次 <kbd>Esc</kbd> 可退出。修改过快捷键时，以设置中的组合键为准。</p>
       </section>
-      <section id="translate">
-        <h2>4. OCR 与区域翻译</h2>
-        <p>OCR 只识别框选区域。请让边框贴合目标文字，不要把下一行的一部分留在框内。区域翻译先读取框内文字，再按设置页选择的路线翻译。</p>
-        <table><thead><tr><th>路线</th><th>适合场景</th><th>特点</th></tr></thead><tbody>
-          <tr><td>机翻</td><td>英文转简中、无网络环境</td><td>本地运行，是默认翻译路线，也可用于失败块兜底。</td></tr>
-          <tr><td>DeepSeek</td><td>长句、上下文或表达质量优先</td><td>需要联网和 API Key；只发送识别后的文字与必要上下文。</td></tr>
-          <tr><td>Local LMT</td><td>完全离线且希望使用本地模型</td><td>仅完整版提供；首次加载和翻译会更慢、占用更多磁盘与内存。</td></tr>
-        </tbody></table>
-        <p>设置中的“区域翻译”只影响单次框选翻译。它与实时翻译分别配置，所以可以让区域翻译使用 DeepSeek，同时让实时翻译保持机翻。</p>
+
+      <section id="scroll">
+        <h2>截取长页面</h2>
+        <ol>
+          <li>先打开要截取的页面，按 <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>A</kbd>，框选页面的滚动内容区域。</li>
+          <li>点击工具栏中的“长截图”，等待程序滚动并收集画面。</li>
+          <li>收集到所需内容后，点击“停止并生成”，或按 <kbd>Esc</kbd> 停止收集并生成结果。</li>
+          <li>在预览中检查拼接位置。结果会先保存，再显示预览；关掉预览不会撤销保存。</li>
+        </ol>
+        <p>框选时尽量避开固定导航栏和侧边栏。动画、图片加载、悬浮元素或页面滚动方式都可能影响拼接；出现重复或缺口时，让页面静止后重新截取，必要时改截较短的范围。</p>
       </section>
-      <section id="live">
-        <h2>5. 实时翻译</h2>
-        <p>实时翻译会持续观察一个应用窗口内的固定区域。开始前必须让框选区域完整落在同一个应用窗口中，不能跨越桌面或其他窗口。</p>
-        <ol><li>在设置中选择“实时翻译”路线。默认是机翻；也可改为 DeepSeek。</li><li>按 <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>T</kbd>，在目标应用窗口内框选较大的正文区域。</li><li>保持目标窗口和内容区域可见。页面滚动后，新进入区域的文字应继续被识别和翻译。</li><li>按 <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>Y</kbd> 停止。</li></ol>
-        <div class="grid"><article class="card"><h3>机翻 <span class="tag">默认</span></h3><p>当前主要以英文转简中的网页内容进行测试。复杂滚动页面仍可能漏译或排版错位；视频、游戏和长时间连续使用尚未充分验证。</p></article><article class="card"><h3>DeepSeek</h3><p>适合画面变化较慢、希望句意更自然的内容。网络往返会增加延迟，不等同于即时字幕。</p></article></div>
-        <p>Local LMT 当前不用于实时翻译。若录屏需要录到翻译文字，可在设置中开启“在录屏中显示实时译文”；该选项会在下次启动实时翻译时生效。</p>
+
+      <section id="record">
+        <h2>录一段屏幕</h2>
+        <ol>
+          <li>按 <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>Z</kbd>，框选录制区域。</li>
+          <li>按 <kbd>Enter</kbd> 或点击确认，开始录制。</li>
+          <li>按 <kbd>F8</kbd> 停止，等待视频处理完成。</li>
+        </ol>
+        <p>停止后预览可能先显示“处理中”。视频封装完成后才是可用文件；开启“完成后自动复制到剪贴板”时，完成的视频文件会自动放入剪贴板。</p>
+        <p>需要调整清晰度、帧率、鼠标指针或系统声音时，打开“设置 → 录屏”，修改后点击“保存设置”，用于下一次录制。</p>
       </section>
+
+      <section id="text">
+        <h2>提取文字与翻译</h2>
+        <h3>复制图片里的文字</h3>
+        <ol>
+          <li>按 <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>A</kbd>，框选目标文字。</li>
+          <li>点击“文字提取”，等待识别结果。</li>
+          <li>检查结果，需要时修改文字，再点“一键复制”。</li>
+        </ol>
+        <p>尽量完整框住一段文字，避免边框切断字形。OCR 是文字识别，细小、模糊或复杂排版的文字可能需要手动校对。</p>
+        <h3>翻译一块画面</h3>
+        <p>框选后点击“翻译”。程序先识别文字，再使用“设置 → 翻译与模型”里选择的区域翻译路线。目标语言也在这里修改；工具栏中的翻译按钮支持右键临时切换模型。</p>
+        <h3>持续翻译一个窗口区域</h3>
+        <ol>
+          <li>按 <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>T</kbd>，在目标应用窗口内框选文字区域。</li>
+          <li>保持目标窗口和该区域可见，等待译文更新。</li>
+          <li>按 <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>Y</kbd> 停止。</li>
+        </ol>
+        <p>选区应完整落在同一个应用窗口内。区域翻译与实时翻译分别配置，默认路线都是机翻；实时翻译也可选择 DeepSeek，当前不使用 Local LMT。</p>
+        <p class="aside">复杂滚动页面仍可能漏译或排版错位；视频、游戏和长时间连续使用尚未充分验证。DeepSeek 还会受网络等待影响。若录屏需要录到译文，在设置中开启“在录屏中显示实时译文”，再重新启动实时翻译。</p>
+      </section>
+
+      <section id="results">
+        <h2>找成果、重新复制</h2>
+        <p>截图、长截图和录屏保存后，都可以从托盘菜单的“最近截取”找回。</p>
+        <ul>
+          <li><strong>找文件：</strong>右键托盘图标，打开“最近截取”，点击对应条目，在文件管理器中定位文件。</li>
+          <li><strong>重新复制：</strong>在“最近截取 → 重新复制”子菜单中点击对应条目，再到目标位置按 <kbd>Ctrl</kbd> + <kbd>V</kbd>。</li>
+          <li><strong>打开保存目录：</strong>进入“设置 → 保存与复制”，打开对应的截图、长截图或录屏目录。</li>
+        </ul>
+        <p>截图和长截图提供图片及文件两种粘贴格式，视频提供文件格式。不同程序对视频文件的接收方式可能不同。</p>
+      </section>
+
+      <section id="questions">
+        <h2>常见问题</h2>
+        <details>
+          <summary>粘贴没有反应，或 Win+V 里找不到结果</summary>
+          <p>先从“最近截取”定位文件，确认它已保存完成。截图可用“重新复制”后到聊天框试一次 Ctrl+V，视频可到支持文件粘贴的位置尝试。直接粘贴与 Windows 剪贴板历史需要分别确认；若仍不能粘贴，可以先从保存目录使用文件。</p>
+        </details>
+        <details>
+          <summary>快捷键没有反应</summary>
+          <p>先确认托盘中 ClipRay 正在运行，再打开“设置 → 快捷键”查看组合键和冲突提示。选中快捷键输入框，按下新组合键并保存，再试一次。</p>
+        </details>
+        <details>
+          <summary>实时翻译没有启动，或滚动后漏译</summary>
+          <p>重新框选，确保矩形完整位于同一个应用窗口内。滚动后先让内容停稳，确认目标窗口和选区可见；仍有漏译时，可以停止实时翻译，改用单次区域翻译处理当前内容。</p>
+        </details>
+        <details>
+          <summary>长截图有重复、缺口或拼接不齐</summary>
+          <p>先避开固定导航栏、播放中的动画和正在加载的内容，再缩短截取范围重试。预览适合检查结果，复杂页面仍需逐段核对，不能只看文件生成成功。</p>
+        </details>
+        <details>
+          <summary>录屏周围有 Windows 黄色边框</summary>
+          <p>进入“设置 → 录屏”，打开 Windows 截图边框设置。Windows 允许修改时，按系统提示允许后重启 ClipRay；最终显示方式受 Windows 的捕获权限影响。</p>
+        </details>
+        <details>
+          <summary>找不到 Local LMT，或本地模型尚未就绪</summary>
+          <p>轻量版不含 Local LMT 模型。可以继续使用机翻，或安装完整版后在“翻译与模型”查看模型状态。首次加载本地模型需要等待，也会占用更多磁盘和内存。</p>
+        </details>
+        <details>
+          <summary>自动清理会处理哪些文件</summary>
+          <p>在“设置 → 维护与清理”启用后，Windows 会按设定时间，将超过保留天数且有保存完成记录的 ClipRay 成果移入回收站。旧文件、未完成录屏、恢复数据和其他文件会保留；回收失败会记录并保留原文件。需要长期保存的成果请另存到清理范围之外。</p>
+        </details>
+      </section>
+
       <section id="settings">
-        <h2>6. 设置与快捷键</h2><p>以下是默认快捷键。若与其他程序冲突，以 ClipRay 设置页当前显示为准。</p>
-        <table><thead><tr><th>功能</th><th>默认快捷键</th></tr></thead><tbody>
-          <tr><td>区域框选</td><td><kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>A</kbd></td></tr><tr><td>当前屏幕截图（不含任务栏）</td><td><kbd>Insert</kbd></td></tr><tr><td>当前屏幕截图（含任务栏）</td><td><kbd>Ctrl</kbd> + <kbd>Insert</kbd></td></tr><tr><td>虚拟桌面截图</td><td><kbd>Alt</kbd> + <kbd>/</kbd>（键盘布局可能显示不同名称）</td></tr><tr><td>开始录屏</td><td><kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>Z</kbd></td></tr><tr><td>停止录屏</td><td><kbd>F8</kbd></td></tr><tr><td>开始实时翻译</td><td><kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>T</kbd></td></tr><tr><td>停止实时翻译</td><td><kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>Y</kbd></td></tr>
-        </tbody></table>
-        <p>保存设置中可分别指定截图、长截图和录屏的目录。打开“保存后复制文件”，保存完成后即可在文件管理器、聊天窗口或其他支持文件粘贴的位置按 <kbd>Ctrl</kbd> + <kbd>V</kbd>。</p>
+        <h2>设置在哪里</h2>
+        <p>右键托盘图标打开“设置”，从左侧选择要修改的项目。改好后点击底部“保存设置”；关闭窗口前留意是否还有未保存的修改。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">页面</th><th scope="col">可以调整什么</th></tr></thead>
+            <tbody>
+              <tr><td>常规</td><td>界面语言与开机启动。</td></tr>
+              <tr><td>保存与复制</td><td>截图、长截图、录屏的保存目录、自动复制与屏幕边框反馈。</td></tr>
+              <tr><td>录屏</td><td>录制预设、帧率、画质、指针与系统声音。</td></tr>
+              <tr><td>翻译与模型</td><td>区域翻译和实时翻译路线、目标语言、本地模型与 DeepSeek 密钥。</td></tr>
+              <tr><td>快捷键</td><td>开始、确认、停止和取消等操作的按键组合。</td></tr>
+              <tr><td>维护与清理</td><td>自动清理计划、保留天数和执行状态。</td></tr>
+              <tr><td>使用帮助</td><td>打开本教程，查看应用相关信息。</td></tr>
+            </tbody>
+          </table>
+        </div>
       </section>
+
+      <section id="shortcuts">
+        <h2>默认快捷键</h2>
+        <p>以下是初始设置；改过后以“设置 → 快捷键”显示的内容为准。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">操作</th><th scope="col">快捷键</th></tr></thead>
+            <tbody>
+              <tr><td>区域框选</td><td><kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>A</kbd></td></tr>
+              <tr><td>当前屏幕截图，不含任务栏</td><td><kbd>Insert</kbd></td></tr>
+              <tr><td>当前屏幕截图，含任务栏</td><td><kbd>Ctrl</kbd> + <kbd>Insert</kbd></td></tr>
+              <tr><td>全部屏幕的虚拟桌面截图</td><td><kbd>Alt</kbd> + <kbd>/</kbd>（按键名称随键盘布局而异）</td></tr>
+              <tr><td>开始 / 停止录屏</td><td><kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>Z</kbd> / <kbd>F8</kbd></td></tr>
+              <tr><td>开始 / 停止实时翻译</td><td><kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>T</kbd> / <kbd>Ctrl</kbd> + <kbd>Win</kbd> + <kbd>Y</kbd></td></tr>
+              <tr><td>确认普通截图</td><td><kbd>Enter</kbd></td></tr>
+              <tr><td>退出普通框选</td><td>连续按两次 <kbd>Esc</kbd></td></tr>
+              <tr><td>停止长截图并生成</td><td><kbd>Esc</kbd></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="installation">
+        <h2>安装版本与卸载</h2>
+        <p><strong>轻量版</strong>包含截图、长截图、录屏、OCR、机翻与 DeepSeek 接入，不带 Local LMT 大模型。<strong>完整版</strong>另含 Local LMT，下载和磁盘占用更大。只想截图或用默认机翻时，轻量版即可。</p>
+        <p>运行安装程序并启动 ClipRay 后，可以直接从本页前面的任务开始。需要自定义保存位置时，再打开“设置 → 保存与复制”。</p>
+        <h3>如何卸载 ClipRay</h3>
+        <p>打开 Windows 设置 → 应用 → 已安装的应用，找到 ClipRay 并选择卸载。安装版本也可从设置中的“卸载 ClipRay”入口进入卸载程序。已保存成果默认保留；如果在卸载确认页选择回收成果，默认 Outputs 文件夹会移入回收站。</p>
+      </section>
+
       <section id="privacy">
-        <h2>7. DeepSeek 密钥与隐私</h2>
-        <h3>添加 API Key</h3><ol><li>登录 <a href="https://platform.deepseek.com/">DeepSeek 开放平台</a>，创建 API Key。</li><li>在 ClipRay 设置中填入密钥并保存。</li><li>密钥写入当前 Windows 用户的 <strong>Windows Credential Manager</strong>，固定凭据槽为 <code>ClipRay.DeepSeek</code>，不会写入普通设置 JSON。</li></ol>
-        <p>打包后的 ClipRay 也使用同一机制。每台电脑、每个 Windows 用户都应保存自己的密钥；安装包不会携带开发者或其他用户的密钥。</p>
-        <h3>哪些内容会离开电脑</h3><ul><li>截图、录屏、OCR、机翻和 Local LMT 都在本机处理。</li><li>选择 DeepSeek 时，会把 OCR 得到的文字和翻译所需的结构化上下文发到 DeepSeek 官方 API；不会上传截图像素或视频文件。</li><li>价格和额度可能变化，请查看 <a href="https://api-docs.deepseek.com/zh-cn/quick_start/pricing/">DeepSeek 官方价格页</a>。接口使用方法见 <a href="https://api-docs.deepseek.com/zh-cn/">官方文档</a>。</li></ul>
+        <h2>模型与隐私说明</h2>
+        <p><strong>机翻</strong>在本机运行，默认用于区域翻译和实时翻译。<strong>Local LMT</strong>也在本机运行，仅完整版提供，当前用于区域翻译。OCR、截图和录屏均在本机处理。</p>
+        <p><strong>DeepSeek</strong>需要联网和你自己的 API Key。选择这条路线时，识别出的文字与翻译所需的结构化上下文会发送到 DeepSeek 官方 API；不会发送截图像素或视频文件。涉及私密内容时，先确认所选路线。</p>
+        <p>在 DeepSeek 开放平台创建密钥后，进入“设置 → 翻译与模型”填写并保存。密钥保存在当前 Windows 用户的 Windows Credential Manager，凭据名称为 <code>ClipRay.DeepSeek</code>，不会写入普通设置 JSON。每台电脑、每个 Windows 用户分别保存自己的密钥。</p>
+        <p>API 的费用和额度以服务方当前规则为准。此教程可离线阅读，但使用 DeepSeek 仍需网络。</p>
       </section>
-      <section id="help">
-        <h2>8. 故障处理与卸载</h2>
-        <h3>框选后提示“实时翻译未启动”</h3><p>重新框选，并确保整个矩形都在同一个应用窗口内。不要从应用内容区跨到桌面、任务栏或另一个窗口。</p>
-        <h3>滚动后不再翻译</h3><p>先确认实时翻译仍在运行，并把框选区域扩展到正文完整宽度和足够高度。页面变化太快时先用默认机翻；DeepSeek 更适合更新较慢的内容。</p>
-        <h3>快捷键没有反应</h3><p>检查托盘中 ClipRay 是否正在运行，再到设置页查看快捷键冲突。修改后保存，按设置页显示的新组合键使用。</p>
-        <h3>找不到 Local LMT</h3><p>轻量版不含 Local LMT 模型。继续使用机翻或 DeepSeek，或者安装完整版。</p>
-        <h3>如何卸载 ClipRay</h3><p>打开 Windows 设置 → 应用 → 已安装的应用，找到 ClipRay，选择“卸载 ClipRay”。卸载不会替你删除已经保存的截图、长截图和录屏。</p>
-      </section>
-      <footer>ClipRay 1.0.6 · 本教程随应用离线提供</footer>
+      <footer>ClipRay 1.0.6 · 本教程随应用提供，阅读时不加载外部资源。</footer>
     </main>
   </div>
 </body>

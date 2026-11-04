@@ -444,6 +444,8 @@ public static class TranslationOutcomeEvidenceProjection
                     confidence = item.SourceStyle.Confidence.ToString()
                 },
                 item.TextLayout,
+                item.UnresolvedSourceStyleSpanCount,
+                item.TextAlignments,
                 masked_patch_sha256 = HashBytes(item.MaskedPatchPng),
                 background_patch_sha256 = HashBytes(item.BackgroundPatchPng)
             }).ToArray(),

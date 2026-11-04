@@ -12,6 +12,11 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        if (args.Length == 3 && args[0] == "--capture-probe")
+        {
+            Environment.ExitCode = ScrollCadenceProbe.Run(args[1], int.Parse(args[2]));
+            return;
+        }
         var root = FindWorkspace(AppContext.BaseDirectory);
         var catalog = AcceptanceCatalog.Load(Path.Combine(root, "tests", "ClipRay.Acceptance", "cases"));
         var scenario = catalog.Cases.Single(static item => item.Id == "scroll-multilingual-40-lines-01");

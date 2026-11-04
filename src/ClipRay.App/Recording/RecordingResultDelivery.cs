@@ -28,19 +28,19 @@ public sealed class WindowsRecordingFileClipboard : IRecordingFileClipboard
 
 public static class RecordingResultDelivery
 {
-    public static bool TryCopyFile(string path, IRecordingFileClipboard clipboard)
+    public static bool TryCopyFile(string path, IRecordingFileClipboard clipboard) => CopyFileWithOutcome(path, clipboard).Copied;
+
+    public static MediaCopyOutcome CopyFileWithOutcome(string path, IRecordingFileClipboard clipboard)
     {
         ArgumentNullException.ThrowIfNull(clipboard);
-        if (!File.Exists(path)) return false;
+        if (!File.Exists(path)) return new(ClipboardPublicationState.NotPublished, "recording-file-unavailable");
         try
         {
             clipboard.SetFile(Path.GetFullPath(path));
-            return true;
+            return new(ClipboardPublicationState.Persisted);
         }
-        catch
-        {
-            return false;
-        }
+        catch (ClipboardPersistenceException) { return new(ClipboardPublicationState.Published, "clipboard-persistence-unconfirmed"); }
+        catch { return new(ClipboardPublicationState.NotPublished, "clipboard-unavailable"); }
     }
 }
 
@@ -80,12 +80,19 @@ public sealed class RecordingPreviewWindow : Window
     private readonly TextBlock _status;
     private readonly System.Windows.Threading.DispatcherTimer _progress;
     private readonly StackPanel _transportActions;
+    private readonly StackPanel _failurePanel;
+    private readonly System.Windows.Controls.TextBox _failureDetails;
+    private readonly System.Windows.Controls.Button _copyFailureFolder;
+    private readonly System.Windows.Controls.Button _openFailureFolder;
+    private readonly string _outputDirectory;
+    private bool _failed;
     private TimeSpan _duration;
     private readonly DateTime _pendingSince;
     private bool _pending;
     private bool _closed;
     private bool _playing;
     private bool _copied;
+    private bool _clipboardPersistenceConfirmed = true;
     private bool _scrubbing;
     private bool _syncingSeek;
     private bool _resumeAfterScrub;
@@ -117,11 +124,14 @@ public sealed class RecordingPreviewWindow : Window
         bool initiallyCopied,
         bool pending,
         string interfaceLanguage,
-        IRecordingPreviewPlayback? playback)
+        IRecordingPreviewPlayback? playback,
+        Action<string>? copyRecoveryPath = null,
+        Action<string>? openRecoveryFolder = null)
     {
         _interfaceLanguage = AppInterfaceLanguage.Normalize(interfaceLanguage);
         _copied = initiallyCopied;
         _path = Path.GetFullPath(path);
+        _outputDirectory = Path.GetDirectoryName(_path) ?? throw new ArgumentException("The recording output directory is unavailable.", nameof(path));
         // 编码收尾还没写完 moov 时成片不可播；先亮出窗口并置为等待态，
         // 由 AttachMedia 在 finalize 结束后接上媒体。
         _pending = pending;
@@ -213,15 +223,23 @@ public sealed class RecordingPreviewWindow : Window
         var copy = CreateButton(T("复制视频文件", "Copy video file"));
         copy.Click += (_, _) =>
         {
-            var copied = RecordingResultDelivery.TryCopyFile(_path, clipboard);
-            _copied |= copied;
-            _status.Text = copied
-                ? T("视频文件已复制到剪贴板", "Video file copied to clipboard")
-                : T("剪贴板正被占用，请稍后重试", "Clipboard is busy. Try copying again shortly.");
+            var outcome = RecordingResultDelivery.CopyFileWithOutcome(_path, clipboard);
+            _copied |= outcome.Copied;
+            _clipboardPersistenceConfirmed = outcome.PersistenceConfirmed;
+            _status.Text = outcome.Copied && !outcome.PersistenceConfirmed
+                ? T("视频文件已复制；退出后的剪贴板保留未确认。", "Video file copied; clipboard persistence after exit is unconfirmed.")
+                : outcome.Copied ? T("视频文件已复制到剪贴板", "Video file copied to clipboard")
+                : T("未能复制视频文件，成片仍保留；请检查文件后重试。", "Video file was not copied. The saved recording is kept; check the file and retry.");
         };
         var folder = CreateButton(T("打开所在位置", "Open file location"));
-        folder.Click += (_, _) => Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_path}\"") { UseShellExecute = true });
+        folder.Click += (_, _) =>
+        {
+            try { Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_path}\"") { UseShellExecute = true }); }
+            catch { _status.Text = T($"视频仍保留，但文件夹未能打开：{_path}", $"Recording kept, but the folder could not be opened: {_path}"); }
+        };
         var close = CreateButton(T("关闭", "Close"));
+        close.IsDefault = true;
+        close.IsCancel = true;
         close.Click += (_, _) => Close();
 
         _transportActions = new StackPanel
@@ -250,19 +268,68 @@ public sealed class RecordingPreviewWindow : Window
         Grid.SetColumn(_time, 1);
         transport.Children.Add(_time);
 
+        _failureDetails = new System.Windows.Controls.TextBox
+        {
+            IsReadOnly = true,
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            MaxHeight = 180,
+            Foreground = MediaBrushes.White,
+            Background = MediaBrushes.Transparent,
+            BorderThickness = new Thickness(0),
+            Margin = new Thickness(0, 0, 0, 8),
+        };
+        System.Windows.Automation.AutomationProperties.SetName(_failureDetails, T("录屏失败详情与输出目录", "Recording failure details and output folder"));
+        _copyFailureFolder = CreateButton(T("复制输出目录", "Copy output folder"));
+        _copyFailureFolder.Click += (_, _) =>
+        {
+            if (!_failed || _closed) return;
+            var copied = TextClipboardPublisher.TryCopy(_outputDirectory, copyRecoveryPath);
+            _status.Text = copied == TextCopyResult.Copied
+                ? T("输出目录已复制；未完成视频不会作为成片复制。", "Output folder copied. The unfinished video was not copied as a completed recording.")
+                : T("输出目录未能复制；完整路径仍在失败详情中，可选择后重试。", "Could not copy the output folder. Select the full path in the failure details and retry.");
+        };
+        _openFailureFolder = CreateButton(T("打开输出目录", "Open output folder"));
+        _openFailureFolder.Click += (_, _) =>
+        {
+            if (!_failed || _closed) return;
+            try
+            {
+                if (!Directory.Exists(_outputDirectory)) throw new DirectoryNotFoundException();
+                if (openRecoveryFolder is { } open) open(_outputDirectory);
+                else Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_outputDirectory}\"") { UseShellExecute = true });
+                _status.Text = T("输出目录已打开；请核对保留文件的状态。", "Output folder opened. Check the status of the remaining files.");
+            }
+            catch
+            {
+                _status.Text = T("输出目录未能打开；完整路径仍在失败详情中。", "Could not open the output folder. The full path remains in the failure details.");
+            }
+        };
+        var recoveryActions = new WrapPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
+        recoveryActions.Children.Add(_copyFailureFolder);
+        recoveryActions.Children.Add(_openFailureFolder);
+        _failurePanel = new StackPanel { Margin = new Thickness(14, 10, 14, 0), Visibility = Visibility.Collapsed };
+        _failurePanel.Children.Add(_failureDetails);
+        _failurePanel.Children.Add(recoveryActions);
+
         var root = new Grid();
         root.RowDefinitions.Add(new RowDefinition());
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         root.Children.Add(_media);
-        Grid.SetRow(transport, 1);
+        Grid.SetRow(_failurePanel, 1);
+        root.Children.Add(_failurePanel);
+        Grid.SetRow(transport, 2);
         root.Children.Add(transport);
-        Grid.SetRow(footer, 2);
+        Grid.SetRow(footer, 3);
         root.Children.Add(footer);
         Content = root;
 
         Loaded += (_, _) =>
         {
+            if (_failed || _closed) return;
             if (_media.Source is not null)
             {
                 _playback.Play();
@@ -279,8 +346,9 @@ public sealed class RecordingPreviewWindow : Window
             _seek.IsEnabled = MediaDuration > TimeSpan.Zero;
             SyncTransport();
             _progress.Start();
-            _status.Text = _copied
-                ? T($"已保存并复制：{Path.GetFileName(_path)}", $"Saved and copied: {Path.GetFileName(_path)}")
+            _status.Text = _copied && !_clipboardPersistenceConfirmed
+                ? T($"已保存并复制；退出后的剪贴板保留未确认：{Path.GetFileName(_path)}", $"Saved and copied; clipboard persistence after exit is unconfirmed: {Path.GetFileName(_path)}")
+                : _copied ? T($"已保存并复制：{Path.GetFileName(_path)}", $"Saved and copied: {Path.GetFileName(_path)}")
                 : T($"已保存：{Path.GetFileName(_path)}", $"Saved: {Path.GetFileName(_path)}");
         };
         _media.MediaEnded += (_, _) =>
@@ -297,6 +365,8 @@ public sealed class RecordingPreviewWindow : Window
                     "Windows could not preview the recording. The file was kept and copied to the clipboard.")
                 : T("系统播放器无法预览；视频文件已保留，可重试复制",
                     "Windows could not preview the recording. The file was kept; you can retry copying it.");
+            if (_copied && !_clipboardPersistenceConfirmed)
+                _status.Text += T("；退出后的剪贴板保留未确认。", "; clipboard persistence after exit is unconfirmed.");
         };
         Closed += (_, _) =>
         {
@@ -307,6 +377,12 @@ public sealed class RecordingPreviewWindow : Window
     }
 
     /// <summary>finalize 结束后把写好的成片接到等待态的预览窗上。</summary>
+    public void AttachMedia(MediaCopyOutcome outcome)
+    {
+        _clipboardPersistenceConfirmed = outcome.PersistenceConfirmed;
+        AttachMedia(outcome.Copied);
+    }
+
     public void AttachMedia(bool copied)
     {
         if (_closed || !_pending) return;
@@ -330,8 +406,16 @@ public sealed class RecordingPreviewWindow : Window
     {
         if (_closed) return;
         _pending = false;
+        _failed = true;
         _progress.Stop();
+        _seek.IsEnabled = false;
+        _transportActions.IsEnabled = false;
+        _transportActions.Visibility = Visibility.Collapsed;
+        _failureDetails.Text = message + "\n\n" + T("输出目录：", "Output folder: ") + _outputDirectory;
+        _failurePanel.Visibility = Visibility.Visible;
+        _openFailureFolder.IsEnabled = Directory.Exists(_outputDirectory);
         _status.Text = message;
+        _status.ToolTip = message;
     }
 
     private string T(string chinese, string english) =>

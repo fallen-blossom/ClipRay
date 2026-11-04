@@ -3,6 +3,9 @@ using System.Drawing;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Reflection;
+using RapidOcrNet;
+using SkiaSharp;
 using ClipRay.App.Ocr;
 using ClipRay.App.Translation;
 using ClipRay.TestLab;
@@ -63,7 +66,7 @@ internal static class OcrProfileEvidence
 
     public static int Run(string[] args)
     {
-        if (args.Length != 5 || args[4] is not ("common" or "windows-en" or "common-korean" or "multilingual" or "multilingual4" or "multilingual-no-spin" or "traced" or "traced-no-spin" or "traced4-no-spin" or "primary-only"))
+        if (args.Length != 5 || args[4] is not ("production" or "common" or "windows-en" or "common-korean" or "multilingual" or "multilingual4" or "multilingual-no-spin" or "traced" or "traced-no-spin" or "traced4-no-spin" or "primary-only"))
             throw new ArgumentException("Expected root output case and a supported OCR profile (including traced, traced-no-spin, traced4-no-spin, primary-only).");
         var root = Path.GetFullPath(args[1]);
         var output = Path.GetFullPath(args[2]);
@@ -74,11 +77,20 @@ internal static class OcrProfileEvidence
         Directory.CreateDirectory(output);
         using var bitmap = new Bitmap(image);
         var stages = new List<object>();
-        using var ocr = args[4] == "common" ? OcrService.CreateForCommonMachine()
+        void Stage(string runtime, OcrRuntimeStageTrace stage) => stages.Add(new { Runtime = runtime, stage.Name, stage.Milliseconds, stage.Count });
+        void Input(string runtime, SKBitmap input, RapidOcrOptions options) => stages.Add(DetectorInput(runtime, input, options));
+        RapidOcrRuntime Rapid(string runtime, bool korean = false, int? threads = null, bool noSpin = true,
+            Action<OcrResult>? native = null) => new(useKoreanSupplement: korean, threadCountOverride: threads,
+                disableSpinning: noSpin, observeResult: native, observeStage: stage => Stage(runtime, stage),
+                observeDetectorInput: (input, options) => Input(runtime, input, options));
+        using var ocr = args[4] == "production" ? new OcrService()
+            : args[4] == "common" ? new OcrService(() => new CommonScriptOcrRuntime(
+                observeStage: stage => Stage("common", stage), observeDetectorInput: (input, options) => Input("common", input, options)))
             : args[4] == "windows-en" ? OcrService.CreateForWindowsLanguage("en-US")
             : args[4] == "common-korean" ? new OcrService(() => new CommonScriptOcrRuntime(includeKorean: true,
-                observeCandidates: (bounds, choices) => stages.Add(new { Name = "script-candidates", Bounds = bounds, Choices = choices })), "Experimental shared detection with Latin, CJK and Korean recognition.")
-            : args[4] == "primary-only" ? new OcrService(() => new TimedRuntime("primary", new RapidOcrRuntime(observeResult: result =>
+                observeCandidates: (bounds, choices) => stages.Add(new { Name = "script-candidates", Bounds = bounds, Choices = choices }),
+                observeStage: stage => Stage("common", stage), observeDetectorInput: (input, options) => Input("common", input, options)), "Experimental shared detection with Latin, CJK and Korean recognition.")
+            : args[4] == "primary-only" ? new OcrService(() => new TimedRuntime("primary", Rapid("primary", native: result =>
                 {
                     stages.Add(new { Name = "native-primary", result.DbNetTime, result.DetectTime,
                         CrnnTimes = result.TextBlocks.Select(block => block.CrnnTime).ToArray(),
@@ -87,13 +99,15 @@ internal static class OcrProfileEvidence
                 }), stages), "Isolated primary OCR experiment; no Korean supplement or Windows fallback.")
             : args[4] is "traced" or "traced-no-spin" or "traced4-no-spin" ? new OcrService(() => new FastFirstOcrRuntime(
                 new ScriptSupplementalOcrRuntime(
-                    new TimedRuntime("primary", new RapidOcrRuntime(threadCountOverride: args[4] == "traced4-no-spin" ? 4 : null, disableSpinning: args[4] != "traced"), stages),
-                    new TimedRuntime("korean", new RapidOcrRuntime(useKoreanSupplement: true, threadCountOverride: args[4] == "traced4-no-spin" ? 4 : null, disableSpinning: args[4] != "traced"), stages),
+                    new TimedRuntime("primary", Rapid("primary", threads: args[4] == "traced4-no-spin" ? 4 : null, noSpin: args[4] != "traced"), stages),
+                    new TimedRuntime("korean", Rapid("korean", korean: true, threads: args[4] == "traced4-no-spin" ? 4 : null, noSpin: args[4] != "traced"), stages),
                     ScriptSupplementalOcr.ContainsHangul), new WindowsOcrRuntime()))
-            : args[4] is "multilingual4" or "multilingual-no-spin" ? new OcrService(() => new FastFirstOcrRuntime(
-                new ScriptSupplementalOcrRuntime(new RapidOcrRuntime(threadCountOverride: args[4] == "multilingual4" ? 4 : null, disableSpinning: args[4] == "multilingual-no-spin"),
-                    new RapidOcrRuntime(useKoreanSupplement: true, threadCountOverride: args[4] == "multilingual4" ? 4 : null, disableSpinning: args[4] == "multilingual-no-spin"), ScriptSupplementalOcr.ContainsHangul),
-                new WindowsOcrRuntime())) : new OcrService();
+            : new OcrService(() => new FastFirstOcrRuntime(
+                new ScriptSupplementalOcrRuntime(Rapid("primary", threads: args[4] == "multilingual4" ? 4 : null,
+                        noSpin: args[4] != "multilingual4"),
+                    Rapid("korean", korean: true, threads: args[4] == "multilingual4" ? 4 : null,
+                        noSpin: args[4] != "multilingual4"), ScriptSupplementalOcr.ContainsHangul),
+                new TimedRuntime("windows-fallback", new WindowsOcrRuntime(), stages)));
         using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var rows = new List<object>();
         var success = true;
@@ -101,21 +115,81 @@ internal static class OcrProfileEvidence
         {
             stages.Clear();
             var watch = Stopwatch.StartNew();
-            var result = ocr.RecognizeAsync(bitmap, timeout.Token).GetAwaiter().GetResult();
+            OcrRecognitionTrace? serviceTrace = null;
+            var result = ocr.RecognizeAsync(bitmap, timeout.Token, trace => serviceTrace = trace).GetAwaiter().GetResult();
             watch.Stop();
             success &= result.IsSuccess;
             rows.Add(new { Index = index, ColdService = index == 0, Milliseconds = watch.ElapsedMilliseconds,
-                result.IsSuccess, result.Status, result.Blocks, Stages = stages.ToArray() });
+                result.IsSuccess, result.Status, result.Blocks, Quality = AssessSyntheticTruth(root, test.Id, result.Blocks),
+                Service = serviceTrace, Stages = stages.ToArray() });
             Console.WriteLine($"{args[4]} iteration {index}: {watch.ElapsedMilliseconds} ms; success={result.IsSuccess}; blocks={result.Blocks.Count}");
         }
         File.WriteAllText(Path.Combine(output, "ocr-profile.json"), JsonSerializer.Serialize(new
         {
             Profile = args[4], Case = test.Id, ImageSha256 = Hash(image),
             AppSha256 = Hash(typeof(OcrService).Assembly.Location), TestSha256 = Hash(typeof(OcrProfileEvidence).Assembly.Location),
+            RapidOcrAssemblySha256 = Hash(typeof(RapidOcr).Assembly.Location),
+            Models = ModelFiles(), CpuLogicalCount = Environment.ProcessorCount,
+            Threads = OcrExecutionPolicy.SelectThreads(Environment.ProcessorCount), SpinningDisabled = args[4] is not ("traced" or "multilingual4"),
             bitmap.Width, bitmap.Height, Rows = rows,
-            Scope = "Local same-image OCR only; first service call is not a machine cold-cache guarantee; no translation or screen capture."
+            Scope = "Local synthetic/supplied image OCR only; first service call is process/service cold, not machine cold-cache. Input tensor shape uses the exact pinned library preparation method, not interception of native ONNX execution. Its extra probe cost is recorded separately. No translation or screen capture; App global gate/foreground commit not measured."
         }, new JsonSerializerOptions { WriteIndented = true }));
+        ocr.DisposeAsync().AsTask().GetAwaiter().GetResult();
         return success ? 0 : 1;
+    }
+
+    private static object? AssessSyntheticTruth(string root, string caseId, IReadOnlyList<OcrTextBlock> blocks)
+    {
+        var truthFile = Path.Combine(root, "truth.json");
+        if (!File.Exists(truthFile)) return null;
+        using var truth = JsonDocument.Parse(File.ReadAllText(truthFile));
+        var item = truth.RootElement.GetProperty("Cases").EnumerateArray().Single(test => test.GetProperty("Id").GetString() == caseId);
+        var words = blocks.SelectMany(block => block.Words).ToArray();
+        var lines = item.GetProperty("Lines").EnumerateArray().Select(line =>
+        {
+            var expected = line.GetProperty("Text").GetString()!;
+            var left = line.GetProperty("X").GetDouble(); var top = line.GetProperty("Y").GetDouble();
+            var right = left + line.GetProperty("Width").GetDouble(); var bottom = top + line.GetProperty("Height").GetDouble();
+            var matching = words.Where(word => word.Bounds.Top + word.Bounds.Height / 2 >= top - 3
+                && word.Bounds.Top + word.Bounds.Height / 2 <= bottom + 3
+                && word.Bounds.Right > left && word.Bounds.Left < right).OrderBy(word => word.Bounds.Left).ToArray();
+            var actual = string.Join(" ", matching.Select(word => word.Text));
+            static string Normalize(string text) => string.Concat(text.Where(char.IsLetterOrDigit)).ToLowerInvariant();
+            return new { Expected = expected, Actual = actual, ExactAlphanumericMatch = Normalize(expected) == Normalize(actual),
+                HasGeometricCoverage = matching.Length > 0, WordCount = matching.Length };
+        }).ToArray();
+        return new { ExpectedLines = lines.Length, CoveredLines = lines.Count(line => line.HasGeometricCoverage),
+            ExactAlphanumericLines = lines.Count(line => line.ExactAlphanumericMatch), Lines = lines,
+            Scope = "Independent generated truth and intended line bands; exact letters/digits ignore punctuation/spacing, so inspect actual strings and fixture image before claiming typography or full character correctness." };
+    }
+
+    private static object[] ModelFiles() => new[] { "v5", "v6" }.SelectMany(version =>
+    {
+        var root = Path.Combine(AppContext.BaseDirectory, "models", version);
+        return Directory.Exists(root) ? Directory.EnumerateFiles(root).Where(path => Path.GetExtension(path) is ".onnx" or ".txt")
+            .OrderBy(path => path).Select(path => (object)new { File = version + "/" + Path.GetFileName(path), Sha256 = Hash(path) }).ToArray() : [];
+    }).ToArray();
+
+    private static object DetectorInput(string runtime, SKBitmap bitmap, RapidOcrOptions options)
+    {
+        // Diagnostic-only inspection of the exact installed 3.0.0 preparation path.
+        // Repeating it produces no inference and avoids a second hand-copied size algorithm.
+        var watch = Stopwatch.StartNew();
+        var prepare = typeof(RapidOcr).GetMethod("PrepareDetectorInput", BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new InvalidOperationException("Pinned RapidOcr detector preparation method changed.");
+        var input = prepare.Invoke(null, [bitmap, options])
+            ?? throw new InvalidOperationException("Pinned detector input probe returned null.");
+        try
+        {
+            var scale = (ScaleParam)(input.GetType().GetField("Scale", BindingFlags.Public | BindingFlags.Instance)?.GetValue(input)
+                ?? throw new InvalidOperationException("Pinned detector scale field changed."));
+            return new { Name = "detector-input", Runtime = runtime, bitmap.Width, bitmap.Height,
+                TensorShape = new[] { 1, 3, scale.DstHeight, scale.DstWidth },
+                TensorFloatElements = 3L * scale.DstHeight * scale.DstWidth,
+                options.Padding, options.ImgResize, options.LimitSideLen, options.UnClipRatio,
+                ProbeMilliseconds = watch.Elapsed.TotalMilliseconds };
+        }
+        finally { ((IDisposable)input).Dispose(); }
     }
 
     private static string Hash(string path)
@@ -124,7 +198,7 @@ internal static class OcrProfileEvidence
         return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
     }
 
-    private sealed class TimedRuntime(string name, IOcrRuntime inner, List<object> stages) : IOcrRuntime, IDisposable
+    private sealed class TimedRuntime(string name, IOcrRuntime inner, List<object> stages) : IOcrRuntime, IDisposable, IAsyncDisposable
     {
         public async Task<IReadOnlyList<OcrWord>> RecognizeAsync(Bitmap bitmap, CancellationToken token)
         {
@@ -140,6 +214,7 @@ internal static class OcrProfileEvidence
                 Console.WriteLine($"  {name}: wall={milliseconds} ms, process CPU={cpuMilliseconds:F0} ms");
             }
         }
-        public void Dispose() { if (inner is IDisposable disposable) disposable.Dispose(); }
+        public void Dispose() => _ = DisposeAsync();
+        public ValueTask DisposeAsync() => new(OcrRuntimeRelease.ReleaseAsync(inner));
     }
 }

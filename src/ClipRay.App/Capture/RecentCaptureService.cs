@@ -79,7 +79,14 @@ public sealed class RecentCaptureService
     public bool TryPublishCopy(PreparedMediaCopy prepared, Action<System.Windows.DataObject>? publish = null)
     {
         ArgumentNullException.ThrowIfNull(prepared);
-        return IsOwnedPath(prepared.Path, prepared.Kind) && SavedMediaClipboard.TryPublish(prepared, publish);
+        return PublishCopyWithOutcome(prepared, publish).Copied;
+    }
+
+    public MediaCopyOutcome PublishCopyWithOutcome(PreparedMediaCopy prepared, Action<System.Windows.DataObject>? publish = null)
+    {
+        ArgumentNullException.ThrowIfNull(prepared);
+        return IsOwnedPath(prepared.Path, prepared.Kind) ? SavedMediaClipboard.PublishWithOutcome(prepared, publish)
+            : new(ClipboardPublicationState.NotPublished, "saved-file-outside-output");
     }
 
     private bool IsOwnedPath(string path, RecentCaptureKind kind)

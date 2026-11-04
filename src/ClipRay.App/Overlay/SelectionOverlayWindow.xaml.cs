@@ -429,7 +429,7 @@ public partial class SelectionOverlayWindow : Window
     private void OnPreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
         // IME owns these processed keys, including Escape used to cancel a candidate.
-        if (_pendingTextBounds is not null && e.Key is Key.ImeProcessed or Key.DeadCharProcessed) return;
+        if (e.Key is Key.ImeProcessed or Key.DeadCharProcessed) return;
         var key = HotkeyCapturePolicy.ResolveEventKey(
             e.Key,
             e.SystemKey,
@@ -469,7 +469,7 @@ public partial class SelectionOverlayWindow : Window
                 key,
                 modifiers))
         {
-            ConfirmSelection();
+            OverlayTool.Confirm.Execute(null, this);
             e.Handled = true;
             return;
         }
@@ -918,97 +918,7 @@ public partial class SelectionOverlayWindow : Window
         Activate();
     }
 
-    private async void ConfirmSelection()
-    {
-        if (_captureDeliveryPending) return;
-        if (_mode == InteractionMode.Edit)
-        {
-            CommitActiveEdit();
-            _mode = InteractionMode.None;
-            ReleaseMouseCapture();
-        }
-        CommitTextEditor();
-        if (_selection.Width < MinimumSelectionPixels || _selection.Height < MinimumSelectionPixels)
-        {
-            return;
-        }
-
-        if (_launchMode == OverlayLaunchMode.Recording)
-        {
-            RequestRecording();
-            return;
-        }
-
-        Bitmap bitmap;
-        if (_translationDisplayState is { } translation)
-        {
-            if (translation.ExportMode == TranslationSelectionExportMode.Original)
-            {
-                bitmap = _editLayer is { } originalEdits && originalEdits.Selection == _selection
-                    ? EditRenderer.Composite(_frame.Bitmap, originalEdits)
-                    : _frame.Bitmap.Clone(
-                        ToCropRectangle(_selection, _frame.Bitmap.Width, _frame.Bitmap.Height),
-                        System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-            }
-            else
-            {
-                try
-                {
-                    var translated = TranslatedSelectionRenderer.Render(_frame.Bitmap, _selection, translation.Items);
-                    if (_editLayer is { } translatedEdits && translatedEdits.Selection == _selection)
-                    {
-                        try
-                        {
-                            bitmap = EditRenderer.CompositeSelection(translated, _frame.Bitmap, translatedEdits);
-                        }
-                        finally
-                        {
-                            translated.Dispose();
-                        }
-                    }
-                    else
-                    {
-                        bitmap = translated;
-                    }
-                }
-                catch
-                {
-                    ShowTranslationStatus("译文截图生成失败，请切换显示原文后重试");
-                    return;
-                }
-            }
-        }
-        else
-        {
-            bitmap = _editLayer is { } layer && layer.Selection == _selection
-                ? EditRenderer.Composite(_frame.Bitmap, layer)
-                : _frame.Bitmap.Clone(
-                    ToCropRectangle(_selection, _frame.Bitmap.Width, _frame.Bitmap.Height),
-                    System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-        }
-        if (CaptureDeliveryAsync is not null || CaptureDelivery is not null)
-        {
-            var revision = _captureInputRevision;
-            var lifetime = _lifetime.Token;
-            _captureDeliveryPending = true;
-            using (bitmap)
-            {
-                try
-                {
-                    var saved = CaptureDeliveryAsync is {} asynchronous ? await asynchronous(bitmap) : CaptureDelivery!(bitmap);
-                    if (!saved || lifetime.IsCancellationRequested || revision != _captureInputRevision) return;
-                }
-                catch
-                {
-                    if (!lifetime.IsCancellationRequested) ShowTranslationStatus("保存失败，编辑内容已保留；请重试保存或调整输出目录。");
-                    return;
-                }
-                finally { _captureDeliveryPending = false; }
-            }
-        }
-        else CaptureConfirmed?.Invoke(this, bitmap);
-        Close();
-    }
+    private async void ConfirmSelection() => await ConfirmSelectionCoreAsync();
 
     private void SelectEditingTool(EditTool tool)
     {

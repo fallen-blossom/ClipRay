@@ -27,6 +27,7 @@ public partial class App : System.Windows.Application
     private readonly ScreenCaptureService _captureService = new();
     private readonly CaptureFeedbackService _feedbackService = new();
     private readonly CredentialVault _credentialVault = new();
+    private readonly ModelNetworkAccessPolicy _modelNetworkPolicy = new();
     private ISettingsStore? _settingsStore;
     private SettingsApplyCoordinator? _settingsApplyCoordinator;
     private AppSettings? _settings;
@@ -89,7 +90,7 @@ public partial class App : System.Windows.Application
     public App()
     {
         _translationServices = new TranslationRuntimeServices(
-            () => new DeepSeekTranslationProvider(_credentialVault),
+            () => new DeepSeekTranslationProvider(_credentialVault, networkPolicy: _modelNetworkPolicy),
             () => VisualOcrFactory?.Invoke() ?? new OcrService());
         _translationOrchestrator = new TranslationApplicationOrchestrator(
             RecognizeVisualAsync,
@@ -120,6 +121,11 @@ public partial class App : System.Windows.Application
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        if (AppCliProtocol.IsRequested(e.Args))
+        {
+            Dispatcher.BeginInvoke(() => RunCliAsync(e.Args));
+            return;
+        }
         if (e.Args.Contains("--request-install-exit", StringComparer.OrdinalIgnoreCase))
         {
             Dispatcher.BeginInvoke(RunInstallExitHelper);
@@ -317,6 +323,7 @@ public partial class App : System.Windows.Application
         CreateTrayIcon();
         RegisterHotkeys();
         _ = WarmStartupOcrAsync();
+        StartCliServer();
 
 #if DEBUG
         if (e.Args.Contains("--settings-preview", StringComparer.OrdinalIgnoreCase))
@@ -541,6 +548,15 @@ public partial class App : System.Windows.Application
                             foregroundMonitor.Stop();
                         };
                         foregroundMonitor.Start();
+                        var liveRecognition = new LiveTranslationRecognitionCache(
+                            command.Route == TranslationRouteKind.Machine
+                                ? LiveTranslationRecognitionCache.CommonMachineProfile
+                                : LiveTranslationRecognitionCache.VisualProfile,
+                            new System.Drawing.Size(command.Region.Width, command.Region.Height),
+                            command.Route == TranslationRouteKind.Machine
+                                ? RecognizeMachineAsync : RecognizeVisualAsync);
+                        var acceptanceOrchestrator = new TranslationApplicationOrchestrator(
+                            liveRecognition.RecognizeAsync, TranslateVisualRequestsAsync);
                         using var session = new LiveTranslationSession(
                             command.Region,
                             region =>
@@ -551,7 +567,8 @@ public partial class App : System.Windows.Application
                             async (bitmap, token) =>
                             {
                                 var translated = await TranslateAcceptanceFrameAsync(
-                                    bitmap, command.Route, token, command.OutputRoot);
+                                    bitmap, command.Route, token, command.OutputRoot,
+                                    orchestratorOverride: acceptanceOrchestrator);
                                 return LiveTranslationFrame.FromOutcome(command.Route, translated);
                             },
                             command.Route,
@@ -566,8 +583,7 @@ public partial class App : System.Windows.Application
                                 await Task.Delay(TimeSpan.FromMilliseconds(350), token);
                             },
                             validateLayoutRegions: true,
-                            verifySource: command.Route == TranslationRouteKind.Machine
-                                ? RecognizeMachineAsync : RecognizeVisualAsync);
+                            verifySource: liveRecognition.RecognizeAsync);
                         session.FrameReady += (_, args) =>
                         {
                             var task = PresentAcceptanceFrameAsync(args);
@@ -689,12 +705,14 @@ public partial class App : System.Windows.Application
         TranslationRouteKind route,
         CancellationToken cancellationToken,
         string? diagnosticsRoot = null,
-        bool requireDisplayable = true)
+        bool requireDisplayable = true,
+        TranslationApplicationOrchestrator? orchestratorOverride = null)
     {
         if (diagnosticsRoot is not null)
             bitmap.Save(Path.Combine(diagnosticsRoot, "acceptance-source.png"), System.Drawing.Imaging.ImageFormat.Png);
         TranslationPipelineTelemetry? timing = null;
-        var orchestrator = route == TranslationRouteKind.Machine ? _machineTranslationOrchestrator : _translationOrchestrator;
+        var orchestrator = orchestratorOverride
+            ?? (route == TranslationRouteKind.Machine ? _machineTranslationOrchestrator : _translationOrchestrator);
         var outcome = await orchestrator.ExecuteAsync(
             bitmap,
             route,
@@ -1003,6 +1021,7 @@ public partial class App : System.Windows.Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _cliServer?.Dispose();
         _singleInstance?.Dispose();
         _overlay?.Close();
         LongCaptureLifetime.Teardown(_longCaptureCancellation, _longCaptureControls);
@@ -1077,12 +1096,14 @@ public partial class App : System.Windows.Application
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add("翻译", null, (_, _) => OpenTranslationWindow());
         menu.Items.Add("实时区域翻译", null, (_, _) => StartLiveTranslationSelection());
-        menu.Items.Add("设置", null, (_, _) => OpenSettings());
+        var settingsIcon = TrayMenuTheme.CreateSettingsIcon();
+        menu.Items.Add("设置", settingsIcon, (_, _) => OpenSettings());
+        menu.Disposed += (_, _) => settingsIcon.Dispose();
         var recentCaptures = new Forms.ToolStripMenuItem("最近截取");
         var recentLoadVersion = 0;
         var recentCopyVersion = 0;
         recentCaptures.DropDownClosed += (_, _) => recentLoadVersion++;
-        recentCaptures.DropDownItems.Add("打开后加载");
+        recentCaptures.DropDownItems.Add(AppUi("打开后加载", "Open to load")).Enabled = false;
         recentCaptures.DropDownOpening += async (_, _) =>
         {
             var loadVersion = ++recentLoadVersion;
@@ -1095,35 +1116,38 @@ public partial class App : System.Windows.Application
                 var items = await Task.Run(() => service.GetRecent());
                 if (recentCaptures.IsDisposed || loadVersion != recentLoadVersion
                     || !ReferenceEquals(settingsForLoad, _settings)) return;
-                recentCaptures.DropDownItems.Clear();
-                if (items.Count == 0)
-                    recentCaptures.DropDownItems.Add(AppUi("暂无可复制的截取", "No saved captures to copy")).Enabled = false;
-                foreach (var item in items)
-                {
-                    var kind = item.Kind switch
+                RecentCaptureTrayMenu.Populate(recentCaptures, items, settingsForLoad.InterfaceLanguage,
+                    async item =>
                     {
-                        RecentCaptureKind.Recording => AppUi("视频", "Video"),
-                        RecentCaptureKind.LongCapture => AppUi("长截图", "Scrolling capture"),
-                        _ => AppUi("截图", "Screenshot"),
-                    };
-                    var entry = new Forms.ToolStripMenuItem($"{item.LastWriteTimeUtc.ToLocalTime():MM-dd HH:mm:ss} · {kind}") { ToolTipText = Path.GetFileName(item.Path) };
-                    entry.Click += async (_, _) =>
+                        if (!CanDeliverImageOutput) return;
+                        var result = await Task.Run(() => SavedCaptureFileLocator.TrySelect(item.Path));
+                        if (_trayIcon is null || !CanDeliverImageOutput) return;
+                        var selected = result == SavedCaptureLocationResult.Selected;
+                        SetTrayTooltip(selected
+                            ? AppUi("ClipRay | 已在文件管理器中定位", "ClipRay | Selected in File Explorer")
+                            : AppUi("ClipRay | 无法定位文件", "ClipRay | Could not locate file"));
+                        if (!selected) _trayIcon.ShowBalloonTip(3000, AppUi("未能定位文件", "Could not locate file"),
+                            result == SavedCaptureLocationResult.FileUnavailable
+                                ? AppUi("文件已移动、清理或暂不可用。", "The file has moved, been cleaned, or is unavailable.")
+                                : AppUi("文件管理器暂未能打开，请重试。", "File Explorer could not open the file location. Try again."),
+                            Forms.ToolTipIcon.Warning);
+                    },
+                    async item =>
                     {
                         var copyVersion = ++recentCopyVersion;
                         SetTrayTooltip(AppUi("ClipRay | 正在准备复制", "ClipRay | Preparing capture copy"));
                         var prepared = await Task.Run(() => service.TryPrepareCopy(item, out var payload) ? payload : null);
-                        if (copyVersion != recentCopyVersion || _trayIcon is null) return;
-                        var copied = prepared is not null && await Dispatcher.InvokeAsync(() => service.TryPublishCopy(prepared));
-                        SetTrayTooltip(AppUi(copied ? "ClipRay | 已重新复制" : "ClipRay | 文件不可用或剪贴板暂忙",
-                            copied ? "ClipRay | Copied again" : "ClipRay | File unavailable or clipboard busy"));
+                        if (copyVersion != recentCopyVersion || _trayIcon is null || !CanDeliverImageOutput) return;
+                        var copyOutcome = prepared is null ? null : await Dispatcher.InvokeAsync(() => service.PublishCopyWithOutcome(prepared));
+                        var copied = copyOutcome?.Copied == true;
+                        var persistenceUnconfirmed = copied && copyOutcome?.PersistenceConfirmed != true;
+                        SetTrayTooltip(persistenceUnconfirmed
+                            ? AppUi("ClipRay | 已复制；退出后的保留未确认", "ClipRay | Copied; persistence unconfirmed")
+                            : AppUi(copied ? "ClipRay | 已重新复制" : "ClipRay | 文件不可用或剪贴板暂忙",
+                                copied ? "ClipRay | Copied again" : "ClipRay | File unavailable or clipboard busy"));
                         if (!copied) _trayIcon?.ShowBalloonTip(3000, AppUi("未能复制", "Copy failed"),
                             AppUi("文件可能已移动或清理，也可能是剪贴板暂忙。", "The file may have moved or been cleaned, or the clipboard is busy."), Forms.ToolTipIcon.Warning);
-                    };
-                    recentCaptures.DropDownItems.Add(entry);
-                }
-                recentCaptures.DropDown.Renderer = menu.Renderer;
-                recentCaptures.DropDown.BackColor = menu.BackColor;
-                recentCaptures.DropDown.ForeColor = menu.ForeColor;
+                    });
             }
             catch
             {
@@ -1133,7 +1157,6 @@ public partial class App : System.Windows.Application
             }
         };
         menu.Items.Add(recentCaptures);
-        menu.Items.Add(CreateLongCaptureRecoveryMenu());
         _stopLiveTranslationMenuItem = new Forms.ToolStripMenuItem("停止实时翻译", null, (_, _) => StopLiveTranslation()) { Enabled = false };
         menu.Items.Add(_stopLiveTranslationMenuItem);
         _stopRecordingMenuItem = new Forms.ToolStripMenuItem("停止录屏", null, (_, _) => StopRecording()) { Enabled = false };
@@ -1208,7 +1231,7 @@ public partial class App : System.Windows.Application
             _overlay = new SelectionOverlayWindow(frame, interactionSettings: _settings, launchMode: launchMode);
             frame = null;
             var captureOverlay = _overlay;
-            captureOverlay.CaptureDeliveryAsync = bitmap => HandleConfirmedCaptureAsync(bitmap, captureOverlay);
+            captureOverlay.CaptureDeliverySnapshotFactory = () => CreateConfirmedCaptureDeliverySnapshot(captureOverlay);
             _overlay.TranslationRequested += HandleOverlayTranslationRequested;
             _overlay.LiveTranslationRequested += (_, request) => Dispatcher.BeginInvoke(() => StartLiveTranslationRequest(request));
             _overlay.TextExtractionRequested += HandleTextExtractionRequested;
@@ -1228,6 +1251,9 @@ public partial class App : System.Windows.Application
             frame?.Dispose();
             _overlay?.Close();
             _overlay = null;
+            if (CanDeliverImageOutput)
+                OutputWarning(AppUi("截图未能启动，请重试；若持续失败，请检查屏幕捕获权限。",
+                    "Capture could not start. Retry; if this continues, check screen capture permissions."));
         }
     }
 
@@ -1286,6 +1312,7 @@ public partial class App : System.Windows.Application
             interfaceLanguage: longCaptureSettings.InterfaceLanguage);
         void CompleteCapture(string origin)
         {
+            _longCaptureControls?.SetEnding(false);
             longCaptureDiagnostics.RecordEvent("completion_trigger", new { Origin = origin });
             session.RequestCompletion();
             TryCancel(cancellation);
@@ -1347,6 +1374,7 @@ public partial class App : System.Windows.Application
         using var result = await Task.Run(() => session.RunAsync(cancellation.Token));
         var status = $"{result.AcceptedFrameCount} 帧";
         string? savedPath = null;
+        ScrollCaptureProcessingWindow? processing = null;
         try
         {
             if (discard || !CanDeliverImageOutput)
@@ -1357,17 +1385,22 @@ public partial class App : System.Windows.Application
             else if (result.AcceptedFrameCount > 0)
             {
                 CloseLongCaptureCaptureUi();
-                if (overlay.IsLoaded) overlay.Close();
+                if (overlay.IsLoaded) overlay.Hide();
                 using var outputOwner=EnterImageOutput();
                 if (outputOwner is null) { result.PreserveForRecovery();return; }
+                processing = new ScrollCaptureProcessingWindow(longCaptureSettings.InterfaceLanguage);
+                processing.Show();
+                processing.SetStage("正在合成长截图…", "Composing scrolling capture…");
                 using var bitmap = await Task.Run(result.CreateComposite);
                 if (!CanDeliverImageOutput) { result.PreserveForRecovery();return; }
+                processing.SetStage("正在保存 PNG 并准备复制…", "Saving PNG and preparing clipboard…");
                 var delivery = await longCaptureOutput.SaveWithDeliveryAsync(bitmap, longCaptureDiagnostics,()=>CanDeliverImageOutput);
                 savedPath = delivery.Path;
                 ReportImageDelivery(delivery,longCaptureSettings);
-                status = ScrollCaptureResultWindow.SavedStatus(longCaptureSettings.InterfaceLanguage, delivery.ClipboardRequested, delivery.ClipboardCopied);
+                status = ScrollCaptureResultWindow.SavedStatus(longCaptureSettings.InterfaceLanguage, delivery.ClipboardRequested, delivery.ClipboardCopied, delivery.ClipboardPersistenceConfirmed);
                 try { result.CleanupAfterSuccessfulOutput(); }
                 catch { OutputWarning(AppUi("PNG 已保存，恢复片段清理未完成。", "PNG saved; recovery-piece cleanup incomplete.")); }
+                processing.SetStage("正在准备结果预览…", "Preparing result preview…");
                 var resultPreview = await Task.Run(() => BitmapSourceFactory.Create(bitmap));
                 outputOwner.Dispose();
                 if (!CanDeliverImageOutput) return;
@@ -1380,13 +1413,16 @@ public partial class App : System.Windows.Application
                     interfaceLanguage: longCaptureSettings.InterfaceLanguage,
                     clipboardRequested: delivery.ClipboardRequested,
                     previewSource: resultPreview,
-                    copyAgainAsync: canPublish => SavedMediaClipboard.TryCopyPngAsync(delivery.Path,
+                    clipboardPersistenceConfirmed: delivery.ClipboardPersistenceConfirmed,
+                    copyAgainWithOutcomeAsync: canPublish => SavedMediaClipboard.CopyPngWithOutcomeAsync(delivery.Path,
                         () => CanDeliverImageOutput && canPublish()));
                 longCaptureDiagnostics.RecordEvent("result_preview_ready", new { delivery.ClipboardRequested, delivery.ClipboardCopied });
                 LongCaptureRunDiagnosticStore.TryWrite(_paths.DiagnosticsRoot, longCaptureDiagnostics);
                 // Capture/output ownership ends before the modal preview. Its later
                 // teardown must not close a new capture's controls or hotkeys.
                 if (ReferenceEquals(_longCaptureCancellation, cancellation)) _longCaptureCancellation = null;
+                processing.Dispose();
+                if (overlay.IsLoaded) overlay.Close();
                 preview.ShowDialog();
             }
             else
@@ -1417,6 +1453,7 @@ public partial class App : System.Windows.Application
         }
         finally
         {
+            processing?.Dispose();
             if (ReferenceEquals(_longCaptureCancellation, cancellation))
             {
                 CloseLongCaptureCaptureUi();
@@ -1677,26 +1714,32 @@ public partial class App : System.Windows.Application
         }
     }
 
-    private async Task<bool> HandleConfirmedCaptureAsync(Bitmap bitmap, SelectionOverlayWindow overlay)
+    private Task<bool> HandleConfirmedCaptureAsync(Bitmap bitmap, SelectionOverlayWindow overlay) =>
+        CreateConfirmedCaptureDeliverySnapshot(overlay)(bitmap);
+
+    private Func<Bitmap, Task<bool>> CreateConfirmedCaptureDeliverySnapshot(SelectionOverlayWindow overlay)
     {
-        using var owner=EnterImageOutput();
-        if (owner is null) return false;
         var output = _outputService!;
         var settings = _settings!;
         var lifetime = overlay.LifetimeToken;
-        try
+        return async bitmap =>
         {
-            var delivery = await output.SaveWithDeliveryAsync(bitmap,canPublish:()=>CanDeliverImageOutput);
-            ReportImageDelivery(delivery, settings);
-            return true;
-        }
-        catch
-        {
-            if (CanDeliverImageOutput && !lifetime.IsCancellationRequested)
-                overlay.ShowTranslationStatus(AppInterfaceLanguage.Text(settings.InterfaceLanguage,"保存失败，编辑内容已保留；请重试保存或调整输出目录。",
-                    "Save failed. Your edits were kept; retry or choose another output folder."));
-            return false;
-        }
+            using var owner = EnterImageOutput();
+            if (owner is null || lifetime.IsCancellationRequested) return false;
+            try
+            {
+                var delivery = await output.SaveWithDeliveryAsync(bitmap, canPublish: () => CanDeliverImageOutput);
+                ReportImageDelivery(delivery, settings);
+                return true;
+            }
+            catch
+            {
+                if (CanDeliverImageOutput && !lifetime.IsCancellationRequested)
+                    overlay.ShowTranslationStatus(AppInterfaceLanguage.Text(settings.InterfaceLanguage,"保存失败，编辑内容已保留；请重试保存或调整输出目录。",
+                        "Save failed. Your edits were kept; retry or choose another output folder."));
+                return false;
+            }
+        };
     }
 
     private async void HandleOverlayTranslationRequested(object? sender, TranslationCapture capture)
@@ -1717,6 +1760,16 @@ public partial class App : System.Windows.Application
             try
             {
                 var translationRoute = ResolveTranslationRoute(capture.Route);
+                if (translationRoute is TranslationRouteKind.DeepSeekFlash or TranslationRouteKind.DeepSeekPro
+                    && !_modelNetworkPolicy.IsCloudEnabled)
+                {
+                    overlay.TryShowTranslationStatus(capture.Version, AppInterfaceLanguage.Text(_settings!.InterfaceLanguage,
+                        "本地模式已禁止云端请求；请先在设置中明确选择 DeepSeek，再使用云端翻译。",
+                        "Local mode blocks cloud requests. Select DeepSeek in settings before using cloud translation."));
+                    screenshotEvidence?.RecordTerminalFailure("local-mode-network-disabled", "preflight");
+                    screenshotEvidence?.RecordOverlayDecision(false, "local-mode-network-disabled", 0);
+                    return;
+                }
                 using var services = CaptureTranslationServices(translationRoute);
                 var translationSettings = services.Settings;
                 var orchestrator = new TranslationApplicationOrchestrator(RecognizeVisualAsync,
@@ -1782,20 +1835,13 @@ public partial class App : System.Windows.Application
                     return;
                 }
 
-                var retainedCount = outcome.Regions.Count - outcome.LayoutItems.Count;
                 var costEstimate = outcome.Results
                     .Select(static result => result.CostEstimate)
                     .FirstOrDefault(static estimate => estimate is not null);
                 var success = new TranslationResult(
                     true,
                     string.Join(Environment.NewLine, outcome.LayoutItems.Select(static block => block.Text)),
-                    TranslationStatusText.FormatOverlayStatus(
-                        translationRoute,
-                        outcome.ExecutionTrace,
-                        outcome.LayoutItems.Count,
-                        retainedCount,
-                        outcome.Results,
-                        costEstimate),
+                    TranslationStatusText.FormatOverlayOutcome(translationRoute, outcome, costEstimate),
                     costEstimate);
                 if (_overlayTranslationOperations.IsCurrent(operation.Version))
                 {
@@ -2127,7 +2173,8 @@ public partial class App : System.Windows.Application
                 token),
             _deepSeekCostLedger?.Load() ?? DeepSeekCostSummary.Empty(DateTimeOffset.UtcNow),
             () => _deepSeekCostLedger!.Load(),
-            () => _deepSeekCostLedger!.Reset(DateTimeOffset.UtcNow));
+            () => _deepSeekCostLedger!.Reset(DateTimeOffset.UtcNow),
+            localProviderDraftTest: TestSettingsTranslationDraftAsync);
         AttachSettingsWindow(_settingsWindow);
         _settingsWindow.Show();
         _settingsWindow.Activate();
@@ -2164,6 +2211,19 @@ public partial class App : System.Windows.Application
             _settingsWindow = null;
             RegisterHotkeys();
         };
+    }
+
+    private async Task<TranslationResult> TestSettingsTranslationDraftAsync(
+        SettingsTranslationTestRequest trial, CancellationToken cancellationToken)
+    {
+        using var admission = _translationRequests.Enter();
+        using var stopped = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _translationRequests.Token);
+        var request = new TranslationRequest("auto", trial.TargetLanguage, trial.Text);
+        if (trial.Provider == "Machine")
+            return (await GetMachineTranslationProvider().TranslateManyAsync([request], stopped.Token))[0];
+        var provider = new LocalTranslationProvider(LocalLmtOptions.Discover(trial.LocalModelPath));
+        try { return await provider.TranslateAsync(request, stopped.Token); }
+        finally { await provider.RetireAsync(); }
     }
 
     private TranslationWindow OpenTranslationWindow()
@@ -2274,7 +2334,20 @@ public partial class App : System.Windows.Application
         LiveTranslationFrameReadyEventArgs args, Func<bool> apply)
     {
         if (!ReferenceEquals(_liveTranslationSession, session) || !_liveStartup.IsCurrent(operation)
-            || !session.CanPresent(args) || !apply()) return false;
+            || !session.CanPresent(args)) return false;
+        try
+        {
+            if (!apply())
+            {
+                session.ReportDisplayNotApplied(args);
+                return false;
+            }
+        }
+        catch
+        {
+            session.ReportDisplayNotApplied(args);
+            throw;
+        }
         session.MarkDisplayApplied(args.Generation);
         return true;
     }
@@ -2323,7 +2396,14 @@ public partial class App : System.Windows.Application
 
     private bool TryResolveLiveRoute(TranslationRouteKind? requestedRoute, out TranslationRouteKind route)
     {
-        if (LiveTranslationRoutePolicy.TryResolve(requestedRoute, _settings?.LiveTranslationProvider ?? "DeepSeek", out route)) return true;
+        if (LiveTranslationRoutePolicy.TryResolve(requestedRoute, _settings?.LiveTranslationProvider ?? "Machine", out route))
+        {
+            if (route is not (TranslationRouteKind.DeepSeekFlash or TranslationRouteKind.DeepSeekPro)
+                || _modelNetworkPolicy.IsCloudEnabled) return true;
+            SetTrayTooltip(LiveUi("ClipRay | 本地模式禁止联网；请在设置中明确选择 DeepSeek 后再使用云端翻译",
+                "ClipRay | Local mode blocks network requests; select DeepSeek in settings to use cloud translation"));
+            return false;
+        }
         SetTrayTooltip(LiveUi("ClipRay | 所选模型不支持实时翻译，请选择本地机翻或 DeepSeek",
             "ClipRay | Select local machine translation or DeepSeek for live translation"));
         return false;
@@ -2383,7 +2463,7 @@ public partial class App : System.Windows.Application
                 ShowInRecordings = liveSettings.ShowLiveTranslationInRecordings
             });
         var liveCloudProvider = _liveCloudProvider ??= new DeepSeekTranslationProvider(_credentialVault,
-            deferVisualPartialRetries: true);
+            deferVisualPartialRetries: true, networkPolicy: _modelNetworkPolicy);
         var semanticCache = new LiveTranslationRequestCache(
             (selectedRoute, requests, token) => TranslateVisualRequestsCoreAsync(
                 selectedRoute, requests, token, liveCloudProvider, services),
@@ -2435,7 +2515,9 @@ public partial class App : System.Windows.Application
                 throw;
             }
         }
-        var liveOrchestrator = new TranslationApplicationOrchestrator(RecognizeMachineAsync,
+        var liveRecognition = new LiveTranslationRecognitionCache(
+            LiveTranslationRecognitionCache.CommonMachineProfile, region.Size, RecognizeMachineAsync);
+        var liveOrchestrator = new TranslationApplicationOrchestrator(liveRecognition.RecognizeAsync,
             TracedTranslate);
         if (stopControl is { CanPlaceOutside: false })
         {
@@ -2577,7 +2659,7 @@ public partial class App : System.Windows.Application
             validateLayoutRegions: true,
             verifySource: async (bitmap, cancellationToken) =>
             {
-                var recognition = await RecognizeMachineAsync(bitmap, cancellationToken).ConfigureAwait(false);
+                var recognition = await liveRecognition.RecognizeAsync(bitmap, cancellationToken).ConfigureAwait(false);
                 if (acceptanceTrace.Enabled)
                     acceptanceTrace.Record("semantic_ocr", identity: LiveTranslationWorkContext.Current,
                         data: new {
@@ -2586,7 +2668,7 @@ public partial class App : System.Windows.Application
                             recognition.Blocks
                         });
                 return recognition;
-            });
+            }, scheduleRegions: true);
 
         void RecordDecisions(ApplicationTranslationOutcome outcome, LiveTranslationWorkIdentity? identity)
         {
@@ -2681,9 +2763,15 @@ public partial class App : System.Windows.Application
             }
             if (acknowledged && ReferenceEquals(_liveTranslationSession, session)
                 && args.Generation == session.AppliedDisplayGeneration)
+            {
+                session.MarkDisplayPresented(args.Generation);
                 acceptanceTrace.Record("render_cycle_observed", args.Generation, args.WorkIdentity,
                     new { Visible = overlay.IsVisible, Layouts = args.Frame.LayoutItems.Count });
+            }
             else
+            {
+                if (ReferenceEquals(_liveTranslationSession, session) && _liveStartup.IsCurrent(operation))
+                    session.ReportDisplayNotApplied(args);
                 acceptanceTrace.Record("render_cycle_not_observed", args.Generation, args.WorkIdentity,
                     new {
                         Reason = acknowledgeError is not null ? "exception"
@@ -2693,6 +2781,7 @@ public partial class App : System.Windows.Application
                         HasRenderedImage = overlay.RenderedImage is not null,
                         Layouts = args.Frame.LayoutItems.Count
                     });
+            }
         }
         session.FrameInvalidated += (_, _) =>
         {
@@ -2871,6 +2960,7 @@ public partial class App : System.Windows.Application
     {
         if (_translationClosing) return;
         _translationClosing = true;
+        _modelNetworkPolicy.UseLocal();
         StopLiveTranslation();
         _overlayTranslationOperations.CancelPending();
         void Retire(string name, Func<Task> request)
@@ -2961,7 +3051,7 @@ public partial class App : System.Windows.Application
                 model,
                 request.TextKind,
                 request.Scene,
-                request.TranslationHint);
+                request.TranslationHint) { SourceSpans = request.SourceSpans };
             result = await services.Cloud!.TranslateAsync(routed, settings.CredentialName, cancellationToken);
             RecordDeepSeekCost(result.CostEstimate);
         }
@@ -3018,7 +3108,8 @@ public partial class App : System.Windows.Application
         new LocalMachineTranslationProvider(new BundledMachineTranslationProcess(
             Path.Combine(AppContext.BaseDirectory, "machine-translation", "runtime", "python.exe"),
             Path.Combine(AppContext.BaseDirectory, "machine-translation", "machine_translation_worker.py"),
-            MachineTranslationModelPaths.Resolve(AppContext.BaseDirectory), workerTimeout: TimeSpan.FromSeconds(10), keepAlive: true),
+            MachineTranslationModelPaths.Resolve(AppContext.BaseDirectory), workerTimeout: TimeSpan.FromSeconds(10), keepAlive: true,
+            startupTimeout: TimeSpan.FromSeconds(60)),
             LiveTranslationAcceptanceTrace.RecordIntegrityFailure,
             supportsCommonLanguages: MachineTranslationModelPaths.IsCommonLanguageModel(MachineTranslationModelPaths.Resolve(AppContext.BaseDirectory)),
             onProtectedFailure: LiveTranslationAcceptanceTrace.RecordProtectedFailure);
@@ -3033,6 +3124,13 @@ public partial class App : System.Windows.Application
     {
         settings.Validate();
         var previous = _settings;
+        if (settings.Provider == "DeepSeek" && settings.HasExplicitProviderChoice)
+            _modelNetworkPolicy.EnableDeepSeek();
+        else
+        {
+            _modelNetworkPolicy.UseLocal();
+            if (previous?.Provider == "DeepSeek") _overlayTranslationOperations.CancelPending();
+        }
         if (AppInterfaceLanguage.IsOnlyInterfaceChange(_settings, settings))
         {
             _settings = settings;
@@ -3040,7 +3138,8 @@ public partial class App : System.Windows.Application
                 AppInterfaceLanguage.UpdateTray(existingMenu.Items, settings.InterfaceLanguage);
             return;
         }
-        if (previous is not null && (previous.LiveTranslationProvider != settings.LiveTranslationProvider
+        if (previous is not null && (previous.Provider != settings.Provider
+            || previous.LiveTranslationProvider != settings.LiveTranslationProvider
             || previous.TranslationTargetLanguage != settings.TranslationTargetLanguage
             || previous.ShowLiveTranslationStopControl != settings.ShowLiveTranslationStopControl
             || previous.ShowLiveTranslationInRecordings != settings.ShowLiveTranslationInRecordings

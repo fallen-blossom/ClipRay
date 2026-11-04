@@ -58,9 +58,10 @@ public sealed record LocalLmtOptions(
             ? AppContext.BaseDirectory
             : Path.GetFullPath(installRootOverride);
         var workspaceRoot = WorkspaceLocator.TryFind(installRoot);
+        installRoot = LocalPathPolicy.RequireLocal(installRoot);
         // An explicit selection must survive a missing file so readiness can report
         // that failure instead of silently running a different model.
-        var model = !string.IsNullOrWhiteSpace(configuredModelPath) ? configuredModelPath : FirstExisting(
+        var model = !string.IsNullOrWhiteSpace(configuredModelPath) ? LocalPathPolicy.RequireLocal(configuredModelPath) : FirstExisting(
             Environment.GetEnvironmentVariable("CLIPRAY_LMT_MODEL_PATH"),
             Path.Combine(installRoot, "models", "local-lmt", "LMT-60-0.6B.Q4_K_M.gguf"),
             workspaceRoot is null ? null : Path.Combine(workspaceRoot, "artifacts", "models", "NiuTrans-LMT-60-0.6B", "LMT-60-0.6B.Q4_K_M.gguf"),
@@ -74,11 +75,12 @@ public sealed record LocalLmtOptions(
         return new LocalLmtOptions(
             model ?? string.Empty,
             cli ?? string.Empty,
-            ExpectedModelSha256: LocalLmtModelCatalog.ExpectedSha256For(model));
+            ExpectedModelSha256: LocalLmtModelCatalog.ExpectedSha256For(
+                !string.IsNullOrWhiteSpace(configuredModelPath) ? configuredModelPath : model));
     }
 
     private static string? FirstExisting(params string?[] candidates) => candidates.FirstOrDefault(static candidate =>
-        !string.IsNullOrWhiteSpace(candidate) && File.Exists(candidate));
+        !string.IsNullOrWhiteSpace(candidate) && ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(LocalPathPolicy.RequireLocal(candidate)));
 }
 
 public sealed record LocalLmtModelDescriptor(string FileName, string DisplayName, string Sha256);
@@ -120,7 +122,7 @@ public static class LocalLmtModelCatalog
                 ? "NiuTrans-LMT-60-0.6B"
                 : "NiuTrans-LMT-60-1.7B";
             var path = Path.Combine(workspaceRoot, "artifacts", "models", folderName, model.FileName);
-            return new LocalLmtDevelopmentModelOption(model.DisplayName, path, File.Exists(path));
+            return new LocalLmtDevelopmentModelOption(model.DisplayName, path, ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(path));
         }).ToArray();
 
     public static IReadOnlyList<LocalLmtDevelopmentModelOption> ResolveProviderModels(
@@ -137,7 +139,7 @@ public static class LocalLmtModelCatalog
         foreach (var model in DevelopmentModels)
         {
             var installedPath = Path.Combine(installedRoot, "models", "local-lmt", model.FileName);
-            if (File.Exists(installedPath))
+            if (ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(installedPath))
             {
                 options.Add(new LocalLmtDevelopmentModelOption(model.DisplayName, installedPath, IsInstalled: true));
                 continue;
@@ -510,13 +512,15 @@ public static class LocalLmtArtifactVerifier
 {
     public static string Sha256File(string path)
     {
+        path = LocalPathPolicy.RequireLocal(path);
         using var stream = File.OpenRead(path);
         return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
     }
 
     public static bool IsVerified(LocalLmtOptions options) =>
-        File.Exists(options.ModelPath) &&
-        File.Exists(options.LlamaCliPath) &&
+        !string.IsNullOrWhiteSpace(options.ModelPath) && !string.IsNullOrWhiteSpace(options.LlamaCliPath) &&
+        ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(LocalPathPolicy.RequireLocal(options.ModelPath)) &&
+        ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(LocalPathPolicy.RequireLocal(options.LlamaCliPath)) &&
         !string.IsNullOrWhiteSpace(options.ExpectedModelSha256) &&
         string.Equals(Sha256File(options.ModelPath), options.ExpectedModelSha256, StringComparison.OrdinalIgnoreCase);
 
@@ -524,9 +528,12 @@ public static class LocalLmtArtifactVerifier
         Task.Run(async () =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!File.Exists(options.ModelPath) || !File.Exists(options.LlamaCliPath)
+            if (string.IsNullOrWhiteSpace(options.ModelPath) || string.IsNullOrWhiteSpace(options.LlamaCliPath)) return false;
+            var modelPath = LocalPathPolicy.RequireLocal(options.ModelPath);
+            var cliPath = LocalPathPolicy.RequireLocal(options.LlamaCliPath);
+            if (!ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(modelPath) || !ClipRay.App.Infrastructure.LocalPathPolicy.FileExists(cliPath)
                 || string.IsNullOrWhiteSpace(options.ExpectedModelSha256)) return false;
-            await using var stream = new FileStream(options.ModelPath, FileMode.Open, FileAccess.Read,
+            await using var stream = new FileStream(modelPath, FileMode.Open, FileAccess.Read,
                 FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
             var hash = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
@@ -775,21 +782,21 @@ public sealed class LocalTranslationProvider : IDisposable
 
     private string BuildSessionArguments(bool vulkan = true)
     {
-        var arguments = $"--model \"{_options.ModelPath}\" --conversation --escape --no-display-prompt --no-warmup --simple-io --log-disable --temp 0 --ctx-size 4096 --predict 256 --reasoning-budget 0";
+        var arguments = $"--offline --model \"{_options.ModelPath}\" --conversation --escape --no-display-prompt --no-warmup --simple-io --log-disable --temp 0 --ctx-size 4096 --predict 256 --reasoning-budget 0";
         if (vulkan) arguments += " --gpu-layers 99";
         return arguments;
     }
 
     private string BuildFileOneShotArguments(bool vulkan = true, int predict = 256)
     {
-        var arguments = $"--model \"{_options.ModelPath}\" --no-conversation --single-turn --escape --no-display-prompt --no-warmup --simple-io --log-disable --temp 0 --ctx-size 4096 --predict {predict} --reasoning-budget 0";
+        var arguments = $"--offline --model \"{_options.ModelPath}\" --no-conversation --single-turn --escape --no-display-prompt --no-warmup --simple-io --log-disable --temp 0 --ctx-size 4096 --predict {predict} --reasoning-budget 0";
         if (vulkan) arguments += " --gpu-layers 99";
         return arguments;
     }
 
     private string BuildBatchSessionArguments(bool vulkan = true)
     {
-        var arguments = $"--model \"{_options.ModelPath}\" --conversation --escape --no-display-prompt --no-warmup --simple-io --log-disable --temp 0 --ctx-size 4096 --predict 256 --reasoning-budget 0";
+        var arguments = $"--offline --model \"{_options.ModelPath}\" --conversation --escape --no-display-prompt --no-warmup --simple-io --log-disable --temp 0 --ctx-size 4096 --predict 256 --reasoning-budget 0";
         if (vulkan) arguments += " --gpu-layers 99";
         return arguments;
     }

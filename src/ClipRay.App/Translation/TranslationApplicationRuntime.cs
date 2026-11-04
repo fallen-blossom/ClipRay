@@ -3,12 +3,16 @@ using System.IO;
 using ClipRay.App.Ocr;
 using ClipRay.App.Security;
 using ClipRay.App.Settings;
+using ClipRay.App.Overlay;
+using ClipRay.Core.Geometry;
+using ClipRay.App.Infrastructure;
 
 namespace ClipRay.App.Translation;
 
 public sealed class TranslationApplicationRuntime : IDisposable
 {
     private readonly AppSettings _settings;
+    private readonly ModelNetworkAccessPolicy _networkPolicy = new();
     private readonly ICredentialVault _vault;
     private readonly OcrService _ocr;
     private readonly OcrService _machineOcr;
@@ -28,12 +32,14 @@ public sealed class TranslationApplicationRuntime : IDisposable
         _ocr = new OcrService();
         _machineOcr = OcrService.CreateForCommonMachine();
         _local = new LocalTranslationProvider(LocalLmtOptions.Discover(settings.LocalLmtModelPath, installRoot));
-        _deepSeek = new DeepSeekTranslationProvider(vault);
+        if (settings.Provider == "DeepSeek" && settings.HasExplicitProviderChoice) _networkPolicy.EnableDeepSeek();
+        _deepSeek = new DeepSeekTranslationProvider(vault, networkPolicy: _networkPolicy);
         var root = installRoot ?? AppContext.BaseDirectory;
         _machine = new LocalMachineTranslationProvider(new BundledMachineTranslationProcess(
             Path.Combine(root, "machine-translation", "runtime", "python.exe"),
             Path.Combine(root, "machine-translation", "machine_translation_worker.py"),
-            MachineTranslationModelPaths.Resolve(root), workerTimeout: TimeSpan.FromSeconds(10), keepAlive: true),
+            MachineTranslationModelPaths.Resolve(root), workerTimeout: TimeSpan.FromSeconds(10), keepAlive: true,
+            startupTimeout: TimeSpan.FromSeconds(60)),
             supportsCommonLanguages: MachineTranslationModelPaths.IsCommonLanguageModel(MachineTranslationModelPaths.Resolve(root)));
         _orchestrator = new TranslationApplicationOrchestrator(
             (bitmap, token) => _ocr.RecognizeAsync(bitmap, token),
@@ -52,7 +58,8 @@ public sealed class TranslationApplicationRuntime : IDisposable
             source,
             route,
             targetLanguage,
-            static blocks => blocks,
+            blocks => SelectionCapturePolicy.ConstrainToSelection(blocks,
+                new PixelRect(0, 0, source.Width, source.Height), new PixelRect(0, 0, source.Width, source.Height)),
             cancellationToken);
 
     public Task<ApplicationTranslationOutcome> ExecuteAsync(
@@ -65,7 +72,8 @@ public sealed class TranslationApplicationRuntime : IDisposable
     public Task<ApplicationTranslationOutcome> ExecuteMachineWithCommonOcrProbeAsync(
         Bitmap source, string targetLanguage, CancellationToken cancellationToken) =>
         _machineOrchestrator.ExecuteAsync(source, TranslationRouteKind.Machine, targetLanguage,
-            static blocks => blocks, cancellationToken);
+            blocks => SelectionCapturePolicy.ConstrainToSelection(blocks,
+                new PixelRect(0, 0, source.Width, source.Height), new PixelRect(0, 0, source.Width, source.Height)), cancellationToken);
 
     public TranslationRouteKind ConfiguredDeepSeekRoute =>
         TranslationRouteKind.DeepSeekFlash;
@@ -113,6 +121,7 @@ public sealed class TranslationApplicationRuntime : IDisposable
 
     public void Dispose()
     {
+        _networkPolicy.Dispose();
         (_machine as IDisposable)?.Dispose();
         _local.Dispose();
         _ocr.Dispose();

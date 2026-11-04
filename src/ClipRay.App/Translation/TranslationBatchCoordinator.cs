@@ -41,12 +41,13 @@ internal static class TranslationBatchCoordinator
     public static Task<IReadOnlyList<TranslationResult>> TranslateAsync(
         IReadOnlyList<TranslationBlock> blocks,
         Func<IReadOnlyList<TranslationBlock>, CancellationToken, Task<TranslationBatchAttempt>> attempt,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<TranslationBlock, TranslationResult>? completed = null)
     {
         ArgumentNullException.ThrowIfNull(blocks);
         ArgumentNullException.ThrowIfNull(attempt);
         var budget = new AttemptBudget();
-        return TranslateRangeAsync(blocks, attempt, depth: 0, budget, cancellationToken);
+        return TranslateRangeAsync(blocks, attempt, depth: 0, budget, cancellationToken, completed);
     }
 
     private static async Task<IReadOnlyList<TranslationResult>> TranslateRangeAsync(
@@ -54,7 +55,8 @@ internal static class TranslationBatchCoordinator
         Func<IReadOnlyList<TranslationBlock>, CancellationToken, Task<TranslationBatchAttempt>> attempt,
         int depth,
         AttemptBudget budget,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<TranslationBlock, TranslationResult>? completed)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!budget.TryTake())
@@ -63,6 +65,12 @@ internal static class TranslationBatchCoordinator
         }
 
         var outcome = await attempt(blocks, cancellationToken).ConfigureAwait(false);
+        // Publish validated items before visiting another recursive sibling. A
+        // later cancellation must not discard work already returned by transport.
+        for (var index = 0; index < blocks.Count; index++)
+        {
+            if (outcome.Results[index].IsSuccess) completed?.Invoke(blocks[index], outcome.Results[index]);
+        }
         budget.Observe(outcome.FailureKind);
         if (!outcome.IsRecoverableStructural
             || blocks.Count <= 1
@@ -74,9 +82,9 @@ internal static class TranslationBatchCoordinator
         var midpoint = blocks.Count / 2;
         var leftBlocks = blocks.Take(midpoint).ToArray();
         var rightBlocks = blocks.Skip(midpoint).ToArray();
-        var left = await TranslateRangeAsync(leftBlocks, attempt, depth + 1, budget, cancellationToken)
+        var left = await TranslateRangeAsync(leftBlocks, attempt, depth + 1, budget, cancellationToken, completed)
             .ConfigureAwait(false);
-        var right = await TranslateRangeAsync(rightBlocks, attempt, depth + 1, budget, cancellationToken)
+        var right = await TranslateRangeAsync(rightBlocks, attempt, depth + 1, budget, cancellationToken, completed)
             .ConfigureAwait(false);
         return left.Concat(right).ToArray();
     }

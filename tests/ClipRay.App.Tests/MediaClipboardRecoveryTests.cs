@@ -270,7 +270,12 @@ internal static class MediaClipboardRecoveryTests
                     AssertFile(data, item.Path);
                     if (prepared.Image is not null)
                     {
-                        Check(ReferenceEquals(prepared.Image, data.GetImage()), "Publication decoded a new image");
+                        var copiedImage = data.GetImage();
+                        Check(copiedImage is { IsFrozen: true }
+                            && copiedImage.Format == prepared.Image.Format
+                            && copiedImage.DpiX == prepared.Image.DpiX && copiedImage.DpiY == prepared.Image.DpiY
+                            && ReadBgra(copiedImage).SequenceEqual(ReadBgra(prepared.Image)),
+                            "Publication changed the prepared pixels, format or DPI while the file was locked");
                         Check(prepared.Image.PixelWidth == 9 && prepared.Image.PixelHeight == 13, "Worker image dimensions changed");
                         Check(data.GetData(MediaClipboardDataFactory.PngFormat) is MemoryStream { Length: > 0 }, "Prepared PNG bytes are absent");
                     }

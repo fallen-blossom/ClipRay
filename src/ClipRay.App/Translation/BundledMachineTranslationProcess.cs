@@ -12,12 +12,15 @@ public sealed class BundledMachineTranslationProcess(
     string modelPath,
     TimeSpan? workerTimeout = null,
     bool keepAlive = false,
-    string? gpuLibraryDirectory = null) : IMachineTranslationProcess, IDisposable, IAsyncDisposable
+    string? gpuLibraryDirectory = null,
+    TimeSpan? startupTimeout = null) : IMachineTranslationProcess, IDisposable, IAsyncDisposable
 {
-    private readonly string? _gpuLibraryDirectory = gpuLibraryDirectory is null ? null : Path.GetFullPath(gpuLibraryDirectory);
-    private readonly string _pythonPath = Path.GetFullPath(pythonPath);
-    private readonly string _workerPath = Path.GetFullPath(workerPath);
-    private readonly string _modelPath = Path.GetFullPath(modelPath);
+    private readonly TimeSpan? _startupTimeout = startupTimeout is null || startupTimeout > TimeSpan.Zero
+        ? startupTimeout : throw new ArgumentOutOfRangeException(nameof(startupTimeout));
+    private readonly string? _gpuLibraryDirectory = gpuLibraryDirectory is null ? null : LocalPathPolicy.RequireLocal(gpuLibraryDirectory);
+    private readonly string _pythonPath = LocalPathPolicy.RequireLocal(pythonPath);
+    private readonly string _workerPath = LocalPathPolicy.RequireLocal(workerPath);
+    private readonly string _modelPath = LocalPathPolicy.RequireLocal(modelPath);
     private readonly TimeSpan _workerTimeout = workerTimeout is null ? TimeSpan.FromMinutes(2)
         : workerTimeout.Value > TimeSpan.Zero ? workerTimeout.Value
         : throw new ArgumentOutOfRangeException(nameof(workerTimeout));
@@ -56,6 +59,7 @@ public sealed class BundledMachineTranslationProcess(
         EnsureRequiredPath(_pythonPath);
         EnsureRequiredPath(_workerPath);
         EnsureRequiredPath(_modelPath);
+        MachineTranslationModelPaths.ValidateLocalFiles(_modelPath);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(_workerTimeout);
         var workerToken = timeout.Token;
@@ -124,7 +128,7 @@ public sealed class BundledMachineTranslationProcess(
         MachineTranslationProcessRequest request, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(_workerTimeout);
+        timeout.CancelAfter(_startupTimeout ?? _workerTimeout);
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -134,6 +138,7 @@ public sealed class BundledMachineTranslationProcess(
                 EnsureRequiredPath(_pythonPath);
                 EnsureRequiredPath(_workerPath);
                 EnsureRequiredPath(_modelPath);
+                MachineTranslationModelPaths.ValidateLocalFiles(_modelPath);
                 var utf8 = new UTF8Encoding(false, true);
                 var info = new ProcessStartInfo(_pythonPath)
                 {
@@ -151,7 +156,25 @@ public sealed class BundledMachineTranslationProcess(
                 ProcessStartCount++;
                 _child = TranslationChildLifetime.Own(_persistentProcess,
                     _persistentProcess.StandardError.BaseStream.CopyToAsync(Stream.Null));
+                if (_startupTimeout is not null)
+                {
+                    // First inference may initialize lazy device libraries or
+                    // fall back to CPU. Verify that owner before the short
+                    // interactive request budget begins; never send user text
+                    // as the bootstrap request.
+                    var warmup = JsonSerializer.Serialize(new MachineTranslationProcessRequest("en", "zh", ["Ready."]),
+                        new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+                    await WriteRequestAsync(_persistentProcess, warmup, timeout.Token).ConfigureAwait(false);
+                    var readyLine = await _persistentProcess.StandardOutput.ReadLineAsync(timeout.Token).ConfigureAwait(false);
+                    var ready = string.IsNullOrWhiteSpace(readyLine) ? null : JsonSerializer.Deserialize<WorkerResponse>(readyLine,
+                        new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    ThrowStartupFailure(ready);
+                    if (ready?.Texts is not { Count: 1 } || string.IsNullOrWhiteSpace(ready.Texts[0]))
+                        throw new InvalidOperationException("machine-worker-startup-invalid-response");
+                    LastBackendStatus = ready.Backend;
+                }
             }
+            timeout.CancelAfter(_workerTimeout);
             var process = _persistentProcess;
             var payload = JsonSerializer.Serialize(request, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
             await WriteRequestAsync(process, payload, timeout.Token).ConfigureAwait(false);
@@ -184,7 +207,8 @@ public sealed class BundledMachineTranslationProcess(
                 backend.Verified ? $"{backend.Device} / {backend.ComputeType}" : null, backend.FallbackReason);
         // Older workers expose only current global status, which cannot identify
         // the backend that produced a cached text. Do not infer per-text evidence.
-        return new(response.Texts, TextEvidence: response.TextBackends?.Select(Describe).ToArray());
+        return new(response.Texts, TextEvidence: response.TextBackends?.Select(Describe).ToArray(),
+            TextAlignments: response.TextAlignments);
     }
     private async Task ResetWorkerAsync()
     {
@@ -206,6 +230,7 @@ public sealed class BundledMachineTranslationProcess(
 
     private static void EnsureRequiredPath(string path)
     {
+        path = LocalPathPolicy.RequireLocal(path);
         if (!File.Exists(path) && !Directory.Exists(path))
             throw new FileNotFoundException("Bundled machine translation component is unavailable.");
     }
@@ -236,7 +261,8 @@ public sealed class BundledMachineTranslationProcess(
     }
 
     private sealed record WorkerResponse(IReadOnlyList<string> Texts, MachineTranslationBackendStatus? Backend,
-        string? Error = null, IReadOnlyList<MachineTranslationBackendStatus?>? TextBackends = null);
+        string? Error = null, IReadOnlyList<MachineTranslationBackendStatus?>? TextBackends = null,
+        IReadOnlyList<IReadOnlyList<TranslationTextAlignment>>? TextAlignments = null);
 }
 
 public sealed record MachineTranslationBackendStatus(string Device, string ComputeType, bool Verified,

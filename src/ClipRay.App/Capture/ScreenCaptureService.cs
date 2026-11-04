@@ -124,10 +124,10 @@ internal static class WindowsGraphicsScreenCapture
         var sample = await frameReady.Task
             .WaitAsync(TimeSpan.FromSeconds(2), cancellationToken)
             .ConfigureAwait(false);
-        return ToCapturedFrame(sample, monitorBounds.Location);
+        return ToCapturedFrame(sample, monitorBounds.Location, source.SystemBorderRequired);
     }
 
-    private static CapturedFrame ToCapturedFrame(VideoRecordingSample sample, Point origin)
+    private static CapturedFrame ToCapturedFrame(VideoRecordingSample sample, Point origin, bool systemBorderRequired)
     {
         var bitmap = new Bitmap(sample.Width, sample.Height, PixelFormat.Format32bppPArgb);
         var bitmapData = bitmap.LockBits(
@@ -161,6 +161,6 @@ internal static class WindowsGraphicsScreenCapture
         return new CapturedFrame(
             bitmap,
             new Rectangle(origin, bitmap.Size),
-            hasSystemCaptureFeedback: true);
+            hasSystemCaptureFeedback: systemBorderRequired);
     }
 }

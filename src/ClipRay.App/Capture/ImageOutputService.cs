@@ -16,7 +16,11 @@ public enum OutputArtifactKind
 }
 
 public sealed record ImageDeliveryOutcome(string Path, bool ClipboardRequested, bool ClipboardCopied,
-    string? DiagnosticFailure = null, string? ClipboardFailure = null);
+    string? DiagnosticFailure = null, string? ClipboardFailure = null, bool ClipboardPersistenceConfirmed = true)
+{
+    public ClipboardPublicationState ClipboardState => !ClipboardCopied ? ClipboardPublicationState.NotPublished
+        : ClipboardPersistenceConfirmed ? ClipboardPublicationState.Persisted : ClipboardPublicationState.Published;
+}
 
 public sealed class ImageOutputService
 {
@@ -47,7 +51,7 @@ public sealed class ImageOutputService
         OutputArtifactKind kind = OutputArtifactKind.Screenshot,
         Action<System.Windows.Media.Imaging.BitmapSource>? clipboard = null)
     {
-        _outputRoot = Path.GetFullPath(outputRoot);
+        _outputRoot = LocalPathPolicy.RequireLocal(outputRoot);
         _kind = kind;
         _copyToClipboard = copyToClipboard;
         _clipboard = clipboard;
@@ -62,7 +66,7 @@ public sealed class ImageOutputService
         string? diagnosticFailure = null;
         try { diagnostics?.RecordSaveInput(bitmap.Size); }
         catch { diagnosticFailure = "diagnostic-unavailable"; }
-        var folder = Path.Combine(_outputRoot, timestamp.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+        var folder = LocalPathPolicy.RequireLocal(Path.Combine(_outputRoot, timestamp.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)));
         Directory.CreateDirectory(folder);
         using var outputLease = CompletedOutputStore.EnterDirectory(folder);
 
@@ -71,7 +75,7 @@ public sealed class ImageOutputService
         for (var suffix = 0; ; suffix++)
         {
             var suffixText = suffix == 0 ? string.Empty : $"_{suffix + 1}";
-            var path = Path.Combine(folder, $"{fileName}{suffixText}.png");
+            var path = LocalPathPolicy.RequireLocal(Path.Combine(folder, $"{fileName}{suffixText}.png"));
             FileStream stream;
             try
             {
@@ -162,6 +166,7 @@ public sealed class ImageOutputService
     private ImageDeliveryOutcome Deliver(PreparedImage prepared,Func<bool>? canPublish = null)
     {
         var copied = false;
+        var persistenceConfirmed = false;
         var clipboardFailure = prepared.Failure;
         if (_copyToClipboard && canPublish is not null)
         {
@@ -175,10 +180,16 @@ public sealed class ImageOutputService
                 if (_clipboard is not null) _clipboard(source);
                 else MediaClipboardPublisher.Publish(MediaClipboardDataFactory.CreateImage(source, prepared.Saved.Path, prepared.Png, prepared.Dib));
                 copied = true;
+                persistenceConfirmed = true;
+            }
+            catch (ClipboardPersistenceException)
+            {
+                copied = true;
+                clipboardFailure = "clipboard-persistence-unconfirmed";
             }
             catch { clipboardFailure = "clipboard-unavailable"; }
         }
-        return new(prepared.Saved.Path, _copyToClipboard, copied, prepared.Saved.DiagnosticFailure, clipboardFailure);
+        return new(prepared.Saved.Path, _copyToClipboard, copied, prepared.Saved.DiagnosticFailure, clipboardFailure, persistenceConfirmed);
     }
 
     public bool TryCopySavedFile(Bitmap bitmap, string path)

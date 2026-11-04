@@ -113,9 +113,10 @@ public sealed class CleanupService
                     foreach (var file in Directory.GetFiles(directory))
                     {
                         var kind = CompletedRecordingName.IsMatch(Path.GetFileName(file)) ? CleanupFileKind.CompletedRecording : CleanupFileKind.CompletedImage;
-                        if (!IsOwnedCompletedFile(Path.GetFileName(file), target.FileKinds)
-                            || !_completed.TryGetEligible(file,kind,plan.CutoffUtc,out var receipt))
-                        { observations?.Add(new(file,"skipped","unknown-incomplete-recent-or-changed")); continue; }
+                        if (!IsOwnedCompletedFile(Path.GetFileName(file), target.FileKinds))
+                        { observations?.Add(new(file,"skipped","outside-completed-output-contract")); continue; }
+                        if (!_completed.TryGetEligible(file,kind,plan.CutoffUtc,out var receipt,out var reason))
+                        { observations?.Add(new(file,"skipped",reason)); continue; }
                         candidates.Add(new(Path.GetFullPath(target.RootDirectory),Path.GetFullPath(file),receipt!));
                     }
                 }

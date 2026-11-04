@@ -25,9 +25,17 @@ public sealed record OcrWordEvidence(string EngineId, string ModelId, string? Sc
 public sealed record OcrWord(string Text, PixelRect Bounds, OcrWordEvidence? Evidence = null)
 {
     public bool IsDetectedLine { get; init; }
+    public IReadOnlyList<OcrWord> RecognitionWords { get; init; } = [];
 }
 
-public sealed record OcrTextBlock(string Text, PixelRect Bounds, IReadOnlyList<OcrWord> Words);
+public sealed record OcrTextBlock(string Text, PixelRect Bounds, IReadOnlyList<OcrWord> Words)
+{
+    public string? PrimaryRecognitionText { get; init; }
+    public IReadOnlyList<OcrWord> PrimaryRecognitionWords { get; init; } = [];
+    public string? WhitespaceRepair { get; init; }
+    // Capture-relative user boundary; original detector evidence remains intact.
+    public PixelRect? SelectionBounds { get; init; }
+}
 
 public sealed record OcrRecognitionResult(bool IsSuccess, IReadOnlyList<OcrTextBlock> Blocks, string Status);
 
@@ -54,16 +62,17 @@ public sealed class OcrService : IDisposable, IAsyncDisposable
         return _runtime ??= _runtimeFactory(); } } }
 
     public OcrService() : this(static () => new FastFirstOcrRuntime(
-        new ScriptSupplementalOcrRuntime(
-            new RapidOcrRuntime(),
-            new RapidOcrRuntime(useKoreanSupplement: true),
-            ScriptSupplementalOcr.ContainsHangul),
-        new WindowsOcrRuntime())) { }
+        new CommonScriptOcrRuntime(includeKorean: true),
+        new FastFirstOcrRuntime(new ScriptSupplementalOcrRuntime(
+                new RapidOcrRuntime(),
+                new RapidOcrRuntime(useKoreanSupplement: true),
+                ScriptSupplementalOcr.ContainsHangul),
+            new WindowsOcrRuntime()))) { }
 
     public OcrService(Func<IOcrRuntime> runtimeFactory, string? successStatus = null, TimeProvider? clock=null, TimeSpan? idleTimeout=null)
     {
         _runtimeFactory = runtimeFactory;
-        _successStatus = successStatus ?? "Local OCR completed (multilingual PP-OCRv6 with Korean PP-OCRv5 supplement; Windows OCR fallback).";
+        _successStatus = successStatus ?? "Local OCR completed (shared multilingual line detection; PP-OCRv6/Korean and Windows fallback).";
         _clock = clock ?? TimeProvider.System;
         _idleTimeout = idleTimeout ?? TimeSpan.FromMinutes(15);
         if (_idleTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(idleTimeout));
@@ -77,7 +86,7 @@ public sealed class OcrService : IDisposable, IAsyncDisposable
                 english ?? new WindowsOcrRuntime("en-US", englishOnly: true),
                 fallback ?? new RapidOcrRuntime(useLatinModel: true));
             return english is null && fallback is null
-                ? new CommonScriptOcrRuntime()
+                ? new CommonScriptOcrRuntime(includeKorean: true)
                 : primary;
         }, "Local common-script OCR completed (shared line detection and script recognition).");
 
@@ -100,18 +109,43 @@ public sealed class OcrService : IDisposable, IAsyncDisposable
         using var admission = _lifetime.Enter();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
         cancellationToken = linked.Token;
+        var phase = System.Diagnostics.Stopwatch.StartNew();
         using var owned = new Bitmap(bitmap);
+        var copyMilliseconds = phase.Elapsed.TotalMilliseconds;
+        phase.Restart();
         await _runtimeUse.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var serviceWaitMilliseconds = phase.Elapsed.TotalMilliseconds;
         var clock = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             var plan = OcrPreprocessingPlan.Create(owned.Width, owned.Height);
+            phase.Restart();
             using var prepared = plan.CreatePreparedBitmap(owned);
+            var prepareMilliseconds = phase.Elapsed.TotalMilliseconds;
+            phase.Restart();
             var words = await Runtime.RecognizeAsync(prepared, cancellationToken).ConfigureAwait(false);
-            var restored = words.Select(word => word with { Bounds = plan.Restore(word.Bounds) }).ToArray();
+            var runtimeMilliseconds = phase.Elapsed.TotalMilliseconds;
+            phase.Restart();
+            OcrWord RestoreWord(OcrWord word) => word with { Bounds = plan.Restore(word.Bounds),
+                RecognitionWords = word.RecognitionWords.Select(RestoreWord).ToArray() };
+            var restored = words.Select(RestoreWord).ToArray();
             var blocks = OcrBlockGrouping.GroupWords(restored);
+            if (OcrStyleGeometryRefiner.NeedsRefinement(owned, blocks))
+            {
+                try
+                {
+                    var geometry = await new WindowsOcrRuntime("en-US")
+                        .RecognizeAsync(owned, cancellationToken).ConfigureAwait(false);
+                    blocks = OcrStyleGeometryRefiner.Refine(blocks, geometry);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch { /* Optional style geometry must never discard primary text. */ }
+            }
             try { observe?.Invoke(new(owned.Width,owned.Height,plan.Scale,prepared.Width,prepared.Height,
-                words.Select(w => new OcrLineTrace(w.Bounds,w.IsDetectedLine,w.Evidence?.EngineId,w.Evidence?.ModelId,w.Evidence?.RawScore,w.Text.Length)).ToArray(),blocks.Count,clock.ElapsedMilliseconds)); } catch { }
+                words.Select(w => new OcrLineTrace(w.Bounds,w.IsDetectedLine,w.Evidence?.EngineId,w.Evidence?.ModelId,w.Evidence?.RawScore,w.Text.Length)).ToArray(),blocks.Count,clock.ElapsedMilliseconds)
+                { CopyMilliseconds = copyMilliseconds, ServiceWaitMilliseconds = serviceWaitMilliseconds,
+                    PrepareMilliseconds = prepareMilliseconds, RuntimeMilliseconds = runtimeMilliseconds,
+                    GroupMilliseconds = phase.Elapsed.TotalMilliseconds }); } catch { }
             return new OcrRecognitionResult(true, blocks, _successStatus);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -209,7 +243,14 @@ public static class OcrBlockGrouping
             var top = sorted.Min(static word => word.Bounds.Top);
             var right = sorted.Max(static word => word.Bounds.Right);
             var bottom = sorted.Max(static word => word.Bounds.Bottom);
-            return new OcrTextBlock(JoinLine(sorted), new PixelRect(left, top, right - left, bottom - top), sorted);
+            var parent = sorted.Length == 1 && sorted[0].IsDetectedLine && sorted[0].RecognitionWords.Count > 0
+                ? sorted[0] : null;
+            return new OcrTextBlock(JoinLine(sorted), new PixelRect(left, top, right - left, bottom - top),
+                parent?.RecognitionWords ?? sorted)
+            {
+                PrimaryRecognitionText = parent?.Text,
+                PrimaryRecognitionWords = parent is null ? [] : [parent],
+            };
         }).OrderBy(static block => block.Bounds.Top).ThenBy(static block => block.Bounds.Left).ToArray();
     }
 

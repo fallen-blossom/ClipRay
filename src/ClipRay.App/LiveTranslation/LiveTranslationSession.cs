@@ -23,12 +23,14 @@ public sealed record LiveTranslationFrame(
     string ErrorCategory = "none")
 {
     public IReadOnlyList<VisualTextRegion> SourceRegions { get; init; } = [];
+    public IReadOnlyList<VisualTextRegion>? ExpectedLayoutRegions { get; init; }
     public LiveTranslationViewportResultState ResultState { get; init; } = LiveTranslationViewportResultState.Ready;
     public int ExpectedLayoutCount { get; init; }
     public int RejectedLayoutCount { get; init; }
     public int ExpectedPrimaryLayoutCount { get; init; }
     public double ExpectedPrimaryLayoutArea { get; init; }
     public LiveTranslationWorkIdentity? WorkIdentity { get; init; }
+    public LiveTranslationRegionWork? RegionWork { get; init; }
     public static LiveTranslationFrame Empty(string route) => new(route, "empty", []);
 
     public static LiveTranslationFrame FromOutcome(TranslationRouteKind route, ApplicationTranslationOutcome outcome)
@@ -38,6 +40,12 @@ public sealed record LiveTranslationFrame(
         return new(route.ToString(), outcome.Status, outcome.LayoutItems, error)
         {
             SourceRegions = outcome.Regions,
+            ExpectedLayoutRegions = outcome.Regions.Zip(outcome.Results)
+                .Where(static pair => !pair.Second.IsSuccess
+                    || pair.Second.Status != "machine-preserved"
+                        && !string.IsNullOrWhiteSpace(pair.Second.Text)
+                        && !string.Equals(pair.First.SourceText.Trim(), pair.Second.Text.Trim(), StringComparison.Ordinal))
+                .Select(static pair => pair.First).ToArray(),
             ExpectedLayoutCount = expected,
             RejectedLayoutCount = outcome.LayoutRejections?.Count ?? 0,
             ExpectedPrimaryLayoutCount = TranslationAcceptancePolicy.ExpectedPrimaryLayoutCount(outcome),
@@ -100,6 +108,7 @@ public sealed class LiveTranslationSession : IDisposable
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly TimeProvider _timeProvider;
     private readonly bool _validateLayoutRegions;
+    private readonly bool _scheduleRegions;
     private readonly TimeSpan _staleWorkerCancelTimeout;
     private readonly CancellationTokenSource _stopSource = new();
     private int _started;
@@ -111,6 +120,11 @@ public sealed class LiveTranslationSession : IDisposable
     private long _viewportGeneration;
     private long _displayRevision;
     private long _appliedDisplayGeneration;
+    private readonly object _presentationGate = new();
+    private LiveTranslationFrameReadyEventArgs? _pendingDisplay;
+    private long _lastDisplayAttemptAt;
+    private bool _displayRetryRequested;
+    private static readonly TimeSpan DisplayAcknowledgementTimeout = TimeSpan.FromMilliseconds(500);
 
     public LiveTranslationSession(
         Rectangle region,
@@ -121,7 +135,8 @@ public sealed class LiveTranslationSession : IDisposable
         bool validateLayoutRegions = false,
         TimeSpan? staleWorkerCancelTimeout = null,
         TimeProvider? timeProvider = null,
-        Func<Bitmap, CancellationToken, Task<OcrRecognitionResult>>? verifySource = null)
+        Func<Bitmap, CancellationToken, Task<OcrRecognitionResult>>? verifySource = null,
+        bool scheduleRegions = false)
     {
         if (region.Width <= 0 || region.Height <= 0) throw new ArgumentOutOfRangeException(nameof(region));
         _region = region;
@@ -132,6 +147,7 @@ public sealed class LiveTranslationSession : IDisposable
         _timeProvider = timeProvider ?? TimeProvider.System;
         _delay = delay ?? ((duration, token) => Task.Delay(duration, _timeProvider, token));
         _validateLayoutRegions = validateLayoutRegions;
+        _scheduleRegions = scheduleRegions;
         _staleWorkerCancelTimeout = staleWorkerCancelTimeout ?? TimeSpan.FromSeconds(2);
         if (_staleWorkerCancelTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(staleWorkerCancelTimeout));
@@ -148,6 +164,9 @@ public sealed class LiveTranslationSession : IDisposable
     internal long AppliedDisplayGeneration => Volatile.Read(ref _appliedDisplayGeneration);
     public bool CanPresent(LiveTranslationFrameReadyEventArgs frame) =>
         CanInvalidateDisplay(frame.Generation)
+        && IsCurrentDisplayCandidate(frame);
+    private bool IsCurrentDisplayCandidate(LiveTranslationFrameReadyEventArgs frame) =>
+        Volatile.Read(ref _disposed) == 0 && !_stopSource.IsCancellationRequested
         && (frame.RetainedDisplayRevision is { } revision
             ? revision == Volatile.Read(ref _displayRevision) : frame.Generation == Generation)
         && frame.PresentationViewportGeneration == ViewportGeneration;
@@ -158,9 +177,96 @@ public sealed class LiveTranslationSession : IDisposable
     {
         // Called only after the actual UI replacement/clear succeeds. Publishing
         // a candidate, including one whose Apply fails, cannot retire a fallback.
-        long previous;
-        do { previous = Volatile.Read(ref _appliedDisplayGeneration); if (generation <= previous) return; }
-        while (Interlocked.CompareExchange(ref _appliedDisplayGeneration, generation, previous) != previous);
+        lock (_presentationGate)
+        {
+            long previous;
+            do { previous = Volatile.Read(ref _appliedDisplayGeneration); if (generation <= previous) return; }
+            while (Interlocked.CompareExchange(ref _appliedDisplayGeneration, generation, previous) != previous);
+            if (_pendingDisplay is { } pending && generation > pending.Generation)
+            {
+                _pendingDisplay = null;
+                _displayRetryRequested = false;
+            }
+        }
+    }
+    internal void MarkDisplayPresented(long generation)
+    {
+        LiveTranslationFrame applied;
+        lock (_presentationGate)
+        {
+            if (_pendingDisplay is not { } pending || pending.Generation != generation
+                || generation > AppliedDisplayGeneration || !IsCurrentDisplayCandidate(pending)) return;
+            applied = pending.Frame;
+            _pendingDisplay = null;
+            _displayRetryRequested = false;
+        }
+        ReportStatus(applied.ResultState == LiveTranslationViewportResultState.Ready
+                ? "已更新 · 等待画面变化" : "已更新可用区域 · 未完成区域稍后重试");
+    }
+    internal void ReportDisplayNotApplied(LiveTranslationFrameReadyEventArgs frame)
+    {
+        lock (_presentationGate)
+        {
+            // A late failed callback must not revive a superseded source/frame.
+            if (_pendingDisplay?.Generation != frame.Generation || !IsCurrentDisplayCandidate(frame)) return;
+            _displayRetryRequested = true;
+        }
+    }
+
+    private void PublishDisplayCandidate(LiveTranslationFrameReadyEventArgs frame)
+    {
+        lock (_presentationGate)
+        {
+            if (!CanPresent(frame)) return;
+            _pendingDisplay = frame;
+            _lastDisplayAttemptAt = _timeProvider.GetTimestamp();
+            _displayRetryRequested = false;
+        }
+        NotifyDisplayCandidate(frame);
+    }
+
+    private void RetryDisplayIfDue()
+    {
+        LiveTranslationFrameReadyEventArgs frame;
+        lock (_presentationGate)
+        {
+            if (_pendingDisplay is not { } pending || !IsCurrentDisplayCandidate(pending)) return;
+            if (!_displayRetryRequested && _timeProvider.GetElapsedTime(_lastDisplayAttemptAt)
+                < DisplayAcknowledgementTimeout) return;
+            // Apply can succeed before the asynchronous render acknowledgement.
+            // Preserve that Apply watermark (old clears stay retired), and give
+            // its failed/missing render a fresh attempt generation instead.
+            frame = pending.Generation <= AppliedDisplayGeneration
+                ? new(pending.Frame, Interlocked.Increment(ref _generation),
+                    pending.PresentationViewportGeneration, pending.RetainedDisplayRevision)
+                : pending;
+            _pendingDisplay = frame;
+            _lastDisplayAttemptAt = _timeProvider.GetTimestamp();
+            _displayRetryRequested = false;
+        }
+        // Before Apply, duplicate queued attempts share the same generation and
+        // become ineligible as soon as one successful Apply advances the display.
+        NotifyDisplayCandidate(frame);
+    }
+
+    private void DiscardDisplayCandidate()
+    {
+        lock (_presentationGate)
+        {
+            _pendingDisplay = null;
+            _displayRetryRequested = false;
+        }
+    }
+
+    private void NotifyDisplayCandidate(LiveTranslationFrameReadyEventArgs frame)
+    {
+        try { FrameReady?.Invoke(this, frame); }
+        catch
+        {
+            // UI publication is a display failure, not an OCR/translation failure.
+            // Keep the valid layout and retry against the next current capture.
+            ReportDisplayNotApplied(frame);
+        }
     }
     public string Status { get; private set; } = "等待开始";
     public string LastErrorCategory { get; private set; } = "none";
@@ -182,20 +288,21 @@ public sealed class LiveTranslationSession : IDisposable
             return;
         }
         byte[]? previousHash = null;
-        byte[]? displayedHash = null;
+        byte[]? translatedHash = null;
         SetState(LiveTranslationSessionState.Running);
         try
         {
             while (!token.IsCancellationRequested)
             {
-                var generation = Interlocked.Increment(ref _generation);
                 try
                 {
                     using var bitmap = _capture(_region);
                     var hash = HashPixels(bitmap);
                     if (previousHash is null || !hash.AsSpan().SequenceEqual(previousHash))
                     {
-                        if (displayedHash is null || !hash.AsSpan().SequenceEqual(displayedHash))
+                        DiscardDisplayCandidate();
+                        var generation = Interlocked.Increment(ref _generation);
+                        if (translatedHash is null || !hash.AsSpan().SequenceEqual(translatedHash))
                             FrameInvalidated?.Invoke(this, EventArgs.Empty);
                         ReportStatus(_route == TranslationRouteKind.Machine ? "正在识别并机翻…" : "正在识别并翻译…");
                         var frameCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -279,15 +386,16 @@ public sealed class LiveTranslationSession : IDisposable
                             if (!LiveTranslationViewportResultPolicy.CanPresent(frame.ResultState))
                                 throw new LiveTranslationPipelineException(
                                     frame.ErrorCategory == "none" ? "viewport-result-failed" : frame.ErrorCategory);
-                            displayedHash = hash;
+                            translatedHash = hash;
                             previousHash = hash;
                             LastErrorCategory = frame.ErrorCategory;
-                            ReportStatus(frame.ErrorCategory == "none" ? "已更新 · 等待画面变化"
-                                : "部分翻译完成 · 未成功区域保留原文，稍后重试");
+                            ReportStatus("翻译完成 · 等待显示");
                             if (!token.IsCancellationRequested && generation == Volatile.Read(ref _generation))
-                                FrameReady?.Invoke(this, new LiveTranslationFrameReadyEventArgs(frame, generation));
+                                PublishDisplayCandidate(new LiveTranslationFrameReadyEventArgs(frame, generation, ViewportGeneration));
                         }
                     }
+                    else if (translatedHash is not null && hash.AsSpan().SequenceEqual(translatedHash))
+                        RetryDisplayIfDue();
 
                     await _delay(
                         LiveTranslationRefreshPolicy.NextDelay(_route, LastErrorCategory == "none" ? 0 : 1),
@@ -330,14 +438,18 @@ public sealed class LiveTranslationSession : IDisposable
         LiveTranslationPixelSnapshot? processedSource = null;
         var processedRegions = new List<VisualTextRegion>();
         var layoutCache = new LiveTranslationLayoutCache();
+        var regionScheduler = new LiveTranslationRegionScheduler();
         var stabilityGate = new LiveTranslationStabilityGate();
         var startedAt = _timeProvider.GetTimestamp();
         long ElapsedMilliseconds() => (long)_timeProvider.GetElapsedTime(startedAt).TotalMilliseconds;
         var partialRetry = new LiveTranslationPartialRetryPolicy(_timeProvider);
+        // These are current valid translated candidates, including when Apply or
+        // render failed. Only the UI ACK APIs advance actual display state.
         var displayed = LiveTranslationRegionWitness.Empty;
         LiveTranslationFrame? displayedFrame = null;
         var retryPartialViewport = false;
         var retryChangedText = false;
+        var retryClippedRegion = false;
         long? ambiguousCaretStartedAt = null;
         const long ambiguousCaretMaximumWaitMilliseconds = 750;
         long lastSemanticAttemptAt = -10_000;
@@ -348,7 +460,10 @@ public sealed class LiveTranslationSession : IDisposable
         long lastSemanticBackingPublishedAt = -10_000;
         var pendingSemanticBackingRefresh = false;
         var displayGate = new object();
-        Task<OcrRecognitionResult>? semanticOwner = null;
+        Task<LiveTranslationSemanticEvidence?>? semanticOwner = null;
+        Task? semanticCleanupOwner = null;
+        byte[]? semanticSourceHash = null;
+        CancellationTokenSource? semanticCancellation = null;
         using var watchdog = new LiveTranslationDisplayWatchdog(_timeProvider, current =>
         {
             lock (displayGate)
@@ -377,6 +492,14 @@ public sealed class LiveTranslationSession : IDisposable
                     using var bitmap = new Bitmap(captured);
                     var hash = source.FullHash();
                     var sourceHash = Convert.ToHexString(hash);
+                    if (previousHash is not null && hash.AsSpan().SequenceEqual(previousHash))
+                    {
+                        lock (displayGate)
+                        {
+                            if (ReferenceEquals(displayed.RetainUnchanged(source), displayed))
+                                RetryDisplayIfDue();
+                        }
+                    }
                     if (_verifySource is not null && processedSource is not null
                         && previousHash is not null && !hash.AsSpan().SequenceEqual(previousHash))
                     {
@@ -445,7 +568,8 @@ public sealed class LiveTranslationSession : IDisposable
                             retryPartialViewport = false;
                         }
                         var semanticPlan = LiveTranslationChangePlanner.Analyze(
-                            processedSource, source, processedRegions);
+                            processedSource, source, evidence is null ? processedRegions
+                                : processedRegions.Concat(evidence.CurrentRegions).ToArray());
                         await ProcessFrameAsync(bitmap, source, hash, semanticPlan).ConfigureAwait(false);
                         continue;
                     }
@@ -619,6 +743,15 @@ public sealed class LiveTranslationSession : IDisposable
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         finally
         {
+            try { semanticCancellation?.Cancel(); }
+            catch (ObjectDisposedException) { /* Completed owner disposed its own cancellation source. */ }
+            if (semanticCleanupOwner is { IsCompleted: false })
+            {
+                // Let a semaphore waiter/cooperative verifier release ownership
+                // before the next session starts, without waiting for native OCR.
+                await Task.WhenAny(semanticCleanupOwner, Task.Delay(50)).ConfigureAwait(false);
+                if (!semanticCleanupOwner.IsCompleted) LiveTranslationWorkerRegistry.Register(semanticCleanupOwner);
+            }
             if (State != LiveTranslationSessionState.StoppedAfterConsecutiveFailures)
                 SetState(LiveTranslationSessionState.Stopped);
         }
@@ -627,55 +760,70 @@ public sealed class LiveTranslationSession : IDisposable
             Bitmap bitmap, bool force = false)
         {
             if (_verifySource is null) return (false, null);
-            if (semanticOwner is { IsCompleted: false }) return (true, null);
-            var now = ElapsedMilliseconds();
-            if (!force && now - lastSemanticAttemptAt < semanticMinimumIntervalMilliseconds)
-                return (false, null);
-            lastSemanticAttemptAt = now;
-            var owned = new Bitmap(bitmap);
-            var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-            Task<OcrRecognitionResult> recognizing;
-            try
+            var requestedHash = new LiveTranslationPixelSnapshot(bitmap).FullHash();
+            if (semanticOwner is null)
             {
-                recognizing = Task.Run(() => _verifySource(owned, cancellation.Token), cancellation.Token);
-                semanticOwner = recognizing;
+                var now = ElapsedMilliseconds();
+                if (!force && now - lastSemanticAttemptAt < semanticMinimumIntervalMilliseconds)
+                    return (false, null);
+                lastSemanticAttemptAt = now;
+                var owned = new Bitmap(bitmap);
+                var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+                var resourcesReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                semanticCancellation = cancellation;
+                semanticSourceHash = requestedHash;
+                // A 300ms observation budget is not a 300ms execution budget.
+                // Keep one recognition alive through gate queueing/native OCR;
+                // cancel only when the session stops. Conversion owns its bitmap.
+                semanticOwner = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var result = await _verifySource(owned, cancellation.Token).ConfigureAwait(false);
+                        cancellation.Token.ThrowIfCancellationRequested();
+                        return LiveTranslationSemanticEvidence.FromRecognition(result, owned);
+                    }
+                    finally
+                    {
+                        Exception? cleanupFailure = null;
+                        try { owned.Dispose(); } catch (Exception error) { cleanupFailure = error; }
+                        try { cancellation.Dispose(); }
+                        catch (Exception error) { cleanupFailure = cleanupFailure is null ? error : new AggregateException(cleanupFailure, error); }
+                        if (cleanupFailure is null) resourcesReleased.TrySetResult();
+                        else
+                        {
+                            resourcesReleased.TrySetException(cleanupFailure);
+                            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupFailure).Throw();
+                        }
+                    }
+                });
+                semanticCleanupOwner = LiveTranslationWorkerRegistry.ObserveCleanupAsync(semanticOwner, resourcesReleased.Task);
+                LiveTranslationWorkerRegistry.Register(semanticCleanupOwner);
             }
-            catch
-            {
-                owned.Dispose();
-                cancellation.Dispose();
-                return (true, null);
-            }
+            var recognizing = semanticOwner;
+            var samePixels = requestedHash.AsSpan().SequenceEqual(semanticSourceHash);
+            if (!samePixels && !recognizing.IsCompleted) return (true, null);
             try
             {
                 var result = await recognizing.WaitAsync(TimeSpan.FromMilliseconds(300), _timeProvider, token).ConfigureAwait(false);
                 token.ThrowIfCancellationRequested();
-                return (true, LiveTranslationSemanticEvidence.FromRecognition(result, owned));
+                semanticOwner = null;
+                // Delayed OCR belongs to the pixels it actually read. Never use
+                // it as a witness for the latest changed capture.
+                return (true, samePixels ? result : null);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
                 throw;
             }
-            catch
+            catch (TimeoutException)
             {
                 return (true, null);
             }
-            finally
+            catch
             {
-                if (recognizing.IsCompleted)
-                { owned.Dispose(); cancellation.Dispose(); }
-                else
-                {
-                    cancellation.Cancel();
-                    var cleanup = recognizing.ContinueWith(task =>
-                    {
-                        _ = task.Exception;
-                        owned.Dispose();
-                        cancellation.Dispose();
-                    }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously,
-                        TaskScheduler.Default);
-                    LiveTranslationWorkerRegistry.Register(cleanup);
-                }
+                semanticOwner = null;
+                return (true, null);
             }
         }
 
@@ -712,12 +860,21 @@ public sealed class LiveTranslationSession : IDisposable
             var firstViewport = processedSource is null;
             if (firstViewport)
                 Interlocked.Increment(ref _viewportGeneration);
-            else if (changePlan.IsViewportReplacement)
+            else if (changePlan.IsViewportReplacement && !_scheduleRegions)
                 InvalidateViewport(source);
 
-            // Correctness first: every accepted change rebuilds the latest complete
-            // selection. The semantic request cache keeps unchanged text inexpensive.
-            IReadOnlyList<Rectangle> windows = [new Rectangle(0, 0, bitmap.Width, bitmap.Height)];
+            // One crop owns one worker and one source version. Unprocessed windows
+            // stay dirty in processedSource and are selected on the next capture.
+            // No region can grow an unbounded queue behind the OCR semaphore.
+            var fullWindow = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+            var selectedWindow = _scheduleRegions && !firstViewport
+                && !retryPartialViewport && !retryClippedRegion && changePlan.Windows.Count > 0
+                ? regionScheduler.Select(changePlan.Windows, processedRegions)
+                : fullWindow;
+            IReadOnlyList<Rectangle> windows = [selectedWindow];
+            var regional = selectedWindow != fullWindow;
+            var regionWork = new LiveTranslationRegionWork(selectedWindow,
+                Convert.ToHexString(source.Hash(selectedWindow)));
             var identity = new LiveTranslationWorkIdentity(
                 Interlocked.Increment(ref _captureId),
                 Interlocked.Increment(ref _pipelineId),
@@ -726,7 +883,8 @@ public sealed class LiveTranslationSession : IDisposable
             // Display generation changes only when the display changes or stops.
             ReportStatus("正在识别并机翻…");
             var workerCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-            var workerBitmap = new Bitmap(bitmap);
+            var workerBitmap = regional
+                ? bitmap.Clone(selectedWindow, PixelFormat.Format32bppArgb) : new Bitmap(bitmap);
             var workerBitmapDisposed = 0;
             void DisposeWorkerBitmap()
             {
@@ -735,7 +893,9 @@ public sealed class LiveTranslationSession : IDisposable
             var translating = Task.Run(async () =>
             {
                 using var scope = LiveTranslationWorkContext.Push(identity);
-                return await _translate(workerBitmap, workerCancellation.Token).ConfigureAwait(false);
+                var frame = await _translate(workerBitmap, workerCancellation.Token).ConfigureAwait(false);
+                return regional ? LiveTranslationFrameCoordinates.Offset(frame,
+                    selectedWindow.X, selectedWindow.Y) : frame;
             }, workerCancellation.Token);
             var detachedWorker = false;
             Diagnostic?.Invoke(this, new("pipeline_started", identity,
@@ -768,10 +928,14 @@ public sealed class LiveTranslationSession : IDisposable
                             .ConfigureAwait(false)).Evidence;
                         probeEvidence = (await ReadSemanticEvidenceAsync(probe, force: true)
                             .ConfigureAwait(false)).Evidence;
-                        replacesViewport = workerSourceEvidence is null || probeEvidence is null
-                            || !probeEvidence.SameSourceStableGeometry(workerSourceEvidence, source, probeSource);
+                        // Queue timeout/failure is unknown, never evidence that
+                        // the worker source was replaced. Extra OCR candidates in
+                        // a video also cannot retire unrelated stable paragraphs.
+                        replacesViewport = workerSourceEvidence is not null && probeEvidence is not null
+                            && probeEvidence.ConfirmsViewportReplacement(workerSourceEvidence);
                         ReportCaptureDecision(new(replacesViewport ? "semantic_viewport_changed"
-                            : "semantic_motion_during_worker", Interlocked.Read(ref _observationId),
+                            : workerSourceEvidence is null || probeEvidence is null
+                                ? "semantic_unknown_during_worker" : "semantic_motion_during_worker", Interlocked.Read(ref _observationId),
                             Convert.ToHexString(probeSource.FullHash())));
                     }
                     if (!probePlan.IsIncidentalChange)
@@ -828,8 +992,31 @@ public sealed class LiveTranslationSession : IDisposable
                     return;
                 }
 
+                if (regional && processedSource is not null
+                    && LiveTranslationRegionScheduler.TouchesInteriorCropEdge(completed,
+                        selectedWindow, source.Width, source.Height)
+                    && processedSource.ChangedTiles(source, ignoreBackgroundShifts: true)
+                        .Any(tile => !selectedWindow.Contains(tile)))
+                {
+                    // A line ending at an internal crop edge cannot certify the
+                    // unseen suffix. Keep the baseline and retry a full selected
+                    // viewport once, serially, rather than publishing half a line.
+                    retryClippedRegion = true;
+                    previousHash = null;
+                    Diagnostic?.Invoke(this, new("pipeline_completed", identity,
+                        LiveTranslationViewportResultState.Pending, errorCategory: "crop-edge-incomplete"));
+                    ReportStatus("正在补全区域边缘的文字…");
+                    return;
+                }
+
+                // The retained entries carry their own source pixels, so this does
+                // not relabel an old translation with this crop's source version.
+                if (regional && displayedFrame is not null)
+                    completed = LiveTranslationRegionScheduler.Merge(completed, displayedFrame,
+                        displayed.RetainUnchanged(source).Items, selectedWindow);
                 var candidateCache = layoutCache.Fork();
-                completed = candidateCache.Update(completed, windows) with { WorkIdentity = identity };
+                completed = candidateCache.Update(completed, windows) with
+                { WorkIdentity = identity, RegionWork = regionWork };
                 using var currentBitmap = Capture(out var current);
                 if (completed.SourceRegions.Count == 0 && completed.LayoutItems.Count == 0
                     && completed.ExpectedLayoutCount == 0 && completed.ErrorCategory == "Scope:partial-or-failed")
@@ -890,16 +1077,23 @@ public sealed class LiveTranslationSession : IDisposable
                     InvalidateViewport(current);
                     Diagnostic?.Invoke(this, new("pipeline_completed", identity,
                         LiveTranslationViewportResultState.Stale, commit.Metrics));
-                    processedSource = source;
+                    // A rejected crop cannot advance sibling source versions.
+                    if (!regional) processedSource = source;
                     previousHash = null;
                     return;
                 }
 
                 var resultState = commit.ResultState;
+                var nextProcessedSource = regional && processedSource is not null
+                    ? processedSource.UpdateRegions(source, windows) : source;
+                var remainingPlan = LiveTranslationChangePlanner.Analyze(nextProcessedSource, source, completed.SourceRegions);
+                var hasPendingRegionalWork = regional && remainingPlan.Windows.Count > 0 && !remainingPlan.IsIncidentalChange;
+                var viewportResultState = hasPendingRegionalWork && resultState == LiveTranslationViewportResultState.Ready
+                    ? LiveTranslationViewportResultState.AcceptablePartial : resultState;
                 var resultError = commit.Quarantined.Count > 0 && completed.ErrorCategory == "none"
                     ? "layout-quarantined" : completed.ErrorCategory;
                 Diagnostic?.Invoke(this, new("pipeline_completed", identity,
-                    resultState, commit.Metrics, resultError, commit.Quarantined));
+                    viewportResultState, commit.Metrics, resultError, commit.Quarantined));
                 if (!LiveTranslationViewportResultPolicy.CanPresent(resultState))
                     throw new LiveTranslationPipelineException(
                         completed.ErrorCategory == "none" ? "viewport-result-failed" : completed.ErrorCategory);
@@ -916,13 +1110,15 @@ public sealed class LiveTranslationSession : IDisposable
                         LayoutItems = displayed.Items,
                         RejectedLayoutCount = commit.Metrics.RejectedLayouts,
                         ErrorCategory = resultError,
-                        ResultState = resultState,
+                        ResultState = viewportResultState,
+                        Status = hasPendingRegionalWork ? "region-pending" : completed.Status,
                         WorkIdentity = identity,
                     };
                     processedRegions.Clear();
                     processedRegions.AddRange(completed.SourceRegions);
-                    processedSource = source;
-                    previousHash = sourceHash;
+                    processedSource = nextProcessedSource;
+                    previousHash = processedSource.FullHash();
+                    retryClippedRegion = false;
                     retryPartialViewport = resultState == LiveTranslationViewportResultState.AcceptablePartial;
                     retryChangedText = false;
                     if (retryPartialViewport)
@@ -935,12 +1131,10 @@ public sealed class LiveTranslationSession : IDisposable
                     else
                         partialRetry.Reset();
                     LastErrorCategory = resultError;
-                    ReportStatus(resultState == LiveTranslationViewportResultState.Ready
-                        ? "已更新 · 等待画面变化"
-                        : "已更新可用区域 · 未完成区域稍后重试");
+                    ReportStatus(hasPendingRegionalWork ? "部分区域已翻译 · 正在补全剩余区域" : "翻译完成 · 等待显示");
                     var presentationGeneration = Interlocked.Increment(ref _generation);
                     if (!token.IsCancellationRequested && identity.ViewportGeneration == ViewportGeneration)
-                        FrameReady?.Invoke(this, new(displayedFrame, presentationGeneration));
+                        PublishDisplayCandidate(new(displayedFrame, presentationGeneration));
                 }
             }
             finally
@@ -996,6 +1190,7 @@ public sealed class LiveTranslationSession : IDisposable
                 }
                 displayed = LiveTranslationRegionWitness.Empty;
                 displayedFrame = null;
+                DiscardDisplayCandidate();
                 Interlocked.Increment(ref _displayRevision);
                 Interlocked.Increment(ref _generation);
                 FrameInvalidated?.Invoke(this, EventArgs.Empty);
@@ -1060,7 +1255,11 @@ public sealed class LiveTranslationSession : IDisposable
                 var generation = Interlocked.Increment(ref _generation);
                 if (displayedFrame is null)
                 {
-                    if (displayed.Count == 0) FrameInvalidated?.Invoke(this, EventArgs.Empty);
+                    if (displayed.Count == 0)
+                    {
+                        DiscardDisplayCandidate();
+                        FrameInvalidated?.Invoke(this, EventArgs.Empty);
+                    }
                     return;
                 }
                 var metrics = LiveTranslationViewportCommitPolicy.Measure(
@@ -1072,13 +1271,14 @@ public sealed class LiveTranslationSession : IDisposable
                 {
                     displayed = LiveTranslationRegionWitness.Empty;
                     displayedFrame = null;
+                    DiscardDisplayCandidate();
                     FrameInvalidated?.Invoke(this, EventArgs.Empty);
                     return;
                 }
                 if (!token.IsCancellationRequested)
                 {
                     displayedFrame = displayedFrame with { LayoutItems = displayed.Items, ResultState = state };
-                    FrameReady?.Invoke(this, new(displayedFrame, generation, ViewportGeneration, revision));
+                    PublishDisplayCandidate(new(displayedFrame, generation, ViewportGeneration, revision));
                 }
             }
         }
@@ -1086,6 +1286,7 @@ public sealed class LiveTranslationSession : IDisposable
     public void Stop()
     {
         Interlocked.Increment(ref _generation);
+        DiscardDisplayCandidate();
         if (!_stopSource.IsCancellationRequested) _stopSource.Cancel();
     }
 
@@ -1145,20 +1346,36 @@ public sealed class LiveTranslationSession : IDisposable
 internal static class LiveTranslationWorkerRegistry
 {
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Task, byte> Workers = new();
-    internal static bool HasUnresolvedWorker => !Workers.IsEmpty;
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<Exception> CleanupFailures = new();
+    internal static bool HasUnresolvedWorker => !Workers.IsEmpty || !CleanupFailures.IsEmpty;
+    // Business cancellation/failure is observed after the native call returns.
+    // Only physical resource cleanup determines retirement success.
+    internal static async Task ObserveCleanupAsync(Task work, Task resourcesReleased)
+    {
+        try { await work.ConfigureAwait(false); }
+        catch { /* The pipeline owns business status; its resources still must finish cleanup. */ }
+        await resourcesReleased.ConfigureAwait(false);
+    }
     internal static async Task DrainAsync()
     {
         while (!Workers.IsEmpty)
         {
-            await Task.WhenAll(Workers.Keys).ConfigureAwait(false);
+            try { await Task.WhenAll(Workers.Keys).ConfigureAwait(false); }
+            catch { /* Registration records actual cleanup failures before removing ownership. */ }
             await Task.Yield();
         }
+        if (!CleanupFailures.IsEmpty) throw new AggregateException("live-worker-cleanup-failed", CleanupFailures);
     }
 
     internal static void Register(Task worker)
     {
         if (!Workers.TryAdd(worker, 0)) return;
-        _ = worker.ContinueWith(static task => { _ = task.Exception; Workers.TryRemove(task, out _); },
+        _ = worker.ContinueWith(static task => {
+            if (task.Exception is { } error)
+                foreach (var failure in error.Flatten().InnerExceptions) CleanupFailures.Enqueue(failure);
+            else if (task.IsCanceled) CleanupFailures.Enqueue(new TaskCanceledException(task));
+            Workers.TryRemove(task, out _);
+        },
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 }
